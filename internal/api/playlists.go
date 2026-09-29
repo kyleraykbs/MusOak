@@ -16,6 +16,7 @@ type playlistResponse struct {
 	ID         string          `json:"id"`
 	Name       string          `json:"name"`
 	TrackCount int             `json:"trackCount"`
+	DurationMs int64           `json:"durationMs"`
 	ArtworkURL string          `json:"artworkUrl,omitempty"`
 	CreatedAt  string          `json:"createdAt"`
 	UpdatedAt  string          `json:"updatedAt"`
@@ -85,6 +86,7 @@ func playlistSummary(playlist *store.Playlist) playlistResponse {
 		ID:         playlist.ID.String(),
 		Name:       playlist.Name,
 		TrackCount: playlist.TrackCount,
+		DurationMs: playlist.DurationMs,
 		CreatedAt:  playlist.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
 		UpdatedAt:  playlist.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
 	}

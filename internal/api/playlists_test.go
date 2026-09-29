@@ -110,6 +110,9 @@ func TestPlaylistFlow(t *testing.T) {
 	if listing.Playlists[0].TrackCount != 2 {
 		t.Errorf("trackCount = %d, want 2", listing.Playlists[0].TrackCount)
 	}
+	if listing.Playlists[0].DurationMs != 360_000 {
+		t.Errorf("durationMs = %d, want 360000", listing.Playlists[0].DurationMs)
+	}
 
 	// Delete.
 	if rec := c.do(http.MethodDelete, "/api/v1/me/playlists/"+playlist.ID, token, nil); rec.Code != http.StatusNoContent {

@@ -54,9 +54,11 @@ type Playlist struct {
 	ArtworkURL string
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
-	// TrackCount is filled in by PlaylistsForUser, so a listing needs no
-	// second query per playlist.
+	// TrackCount and DurationMs are filled in by PlaylistsForUser, so a listing
+	// needs no second query per playlist: how long the playlist is is what the
+	// client shows beside its name.
 	TrackCount int
+	DurationMs int64
 }
 
 // PlaylistItem is one entry of a playlist.
@@ -139,7 +141,9 @@ func (d *DB) Playlist(ctx context.Context, id uuid.UUID) (*Playlist, error) {
 func (d *DB) PlaylistsForUser(ctx context.Context, userID uuid.UUID) ([]Playlist, error) {
 	rows, err := d.db.QueryContext(ctx, `
 		SELECT p.id, p.user_id, p.name, p.artwork_url, p.created_at, p.updated_at,
-		       (SELECT COUNT(*) FROM playlist_items i WHERE i.playlist_id = p.id)
+		       (SELECT COUNT(*) FROM playlist_items i WHERE i.playlist_id = p.id),
+		       (SELECT COALESCE(SUM(t.duration_ms), 0) FROM playlist_items i
+			JOIN tracks t ON t.id = i.track_id WHERE i.playlist_id = p.id)
 		FROM playlists p
 		WHERE p.user_id = ?
 		ORDER BY p.created_at DESC`, userID.String())
@@ -156,7 +160,7 @@ func (d *DB) PlaylistsForUser(ctx context.Context, userID uuid.UUID) ([]Playlist
 			created, updated int64
 		)
 		if err := rows.Scan(&idStr, &userIDStr, &playlist.Name, &playlist.ArtworkURL,
-			&created, &updated, &playlist.TrackCount); err != nil {
+			&created, &updated, &playlist.TrackCount, &playlist.DurationMs); err != nil {
 			return nil, mapErr(err)
 		}
 		var err2 error
