@@ -14,12 +14,12 @@ import (
 )
 
 func main() {
-	configPath := flag.String("config", "", "path to config file (default: $XDG_CONFIG_HOME/prismusic/config.json)")
+	configPath := flag.String("config", "", "path to config file (default: $PRISMUSIC_CONFIG, else $XDG_CONFIG_HOME/prismusic/config.json)")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
-	cfg, err := config.Load(*configPath)
+	cfg, err := config.Load(config.ResolvePath(*configPath))
 	if err != nil {
 		logger.Error("invalid config", "error", err)
 		os.Exit(1)

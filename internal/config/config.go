@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 const appName = "prismusic"
@@ -132,6 +133,19 @@ func DefaultCacheDir() string {
 		return ""
 	}
 	return filepath.Join(dir, appName)
+}
+
+// ConfigEnvVar points at a configuration file, for deployments that install
+// one system-wide (the NixOS module does). An explicit --config still wins.
+const ConfigEnvVar = "PRISMUSIC_CONFIG"
+
+// ResolvePath decides which configuration file to load: the explicit flag, then
+// the environment, then the per-user XDG location.
+func ResolvePath(explicit string) string {
+	if strings.TrimSpace(explicit) != "" {
+		return explicit
+	}
+	return strings.TrimSpace(os.Getenv(ConfigEnvVar))
 }
 
 // Load reads the configuration from path. An empty path selects DefaultPath();

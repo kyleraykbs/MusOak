@@ -17,7 +17,7 @@ import (
 )
 
 func main() {
-	configPath := flag.String("config", "", "path to config file (default: $XDG_CONFIG_HOME/prismusic/config.json)")
+	configPath := flag.String("config", "", "path to config file (default: $PRISMUSIC_CONFIG, else $XDG_CONFIG_HOME/prismusic/config.json)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: prism [--config FILE] <command> [arguments]\n\n")
 		flag.PrintDefaults()
@@ -26,7 +26,7 @@ func main() {
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
-	cfg, err := config.Load(*configPath)
+	cfg, err := config.Load(config.ResolvePath(*configPath))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
