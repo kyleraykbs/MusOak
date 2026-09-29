@@ -54,3 +54,23 @@
 - Decision: `listenTogether.readyTimeoutSeconds = 0` disables the timeout entirely (the track starts once every member is ready).
 - Why: least surprising for a listening party; a broken member stalls only if the host explicitly asked for no timeout.
 - Reversible: yes
+
+## [2026-09-28] One config file, two locations
+- Decision: `--config` > `$PRISMUSIC_CONFIG` > `$XDG_CONFIG_HOME/prismusic/config.json`. The NixOS CLI module drops `/etc/prismusic/config.json` and sets the env var; the home-manager module writes the XDG file, which wins for that user.
+- Why: NixOS cannot write into user homes, and a client should follow the user's own configuration when it exists.
+- Reversible: yes
+
+## [2026-09-28] Rate limits and media quota live in config
+- Decision: `rateLimit.{searchPerMinute,loginPerMinute}` (per client, IP-keyed, 0 disables) and `media.quotaMB` (0 = unlimited, LRU eviction by last serve).
+- Why: the plan asks for both; making them configurable keeps a LAN-only setup from paying for them.
+- Reversible: yes
+
+## [2026-09-28] The middleware stack is composed once
+- Decision: `Server.Serve(ctx, listener)` is the only place that serves, and it always uses `handler()` (rate limits → auth → routes). `Run` and the CLI's embedded server both go through it.
+- Why: the very first curl sweep caught the daemon serving the bare router, so authentication and rate limits were skipped over a real socket while the tests (using `Handler`) passed. A socket-level regression test now covers it.
+- Reversible: no (this is a correctness invariant)
+
+## [2026-09-28] Leaving the last member out of a room is a success
+- Decision: `rooms.Manager.Leave` closes a room whose last member left and returns no error; the API answers 204.
+- Why: the leave itself succeeded; reporting 404 made the curl sweep (and any client) treat a normal action as a failure.
+- Reversible: yes
