@@ -138,6 +138,21 @@ func TestStatusLine(t *testing.T) {
 	if !strings.Contains(idle, "[0/0]") {
 		t.Errorf("idle line = %q, want an empty position", idle)
 	}
+	if !strings.Contains(idle, "--:--/--:--") {
+		t.Errorf("idle line = %q, want unknown times", idle)
+	}
+
+	// A track loaded but not yet played shows 0:00, not "unknown".
+	fresh := formatStatus(status{position: 0, count: 2, title: "Song", durationMs: 25_000, volume: 50})
+	if !strings.Contains(fresh, "0:00/0:25") {
+		t.Errorf("fresh line = %q, want 0:00/0:25", fresh)
+	}
+
+	// Before mpv knows the duration, only the duration is unknown.
+	loading := formatStatus(status{position: 0, count: 2, title: "Song", volume: 50})
+	if !strings.Contains(loading, "0:00/--:--") {
+		t.Errorf("loading line = %q, want 0:00/--:--", loading)
+	}
 
 	withMessage := formatStatus(status{position: 0, count: 3, title: "Song", volume: 10, message: "next track is still downloading"})
 	if !strings.Contains(withMessage, "next track is still downloading") {

@@ -387,13 +387,31 @@ func formatStatus(s status) string {
 	if s.position < 0 {
 		index = 0
 	}
+
+	// A loaded track at position zero is "0:00"; only an empty player is
+	// "--:--". The duration stays "--:--" until mpv reports it.
+	where, length := "--:--", "--:--"
+	if s.position >= 0 {
+		where = formatStatusTime(s.positionMs)
+		if s.durationMs > 0 {
+			length = formatDuration(s.durationMs)
+		}
+	}
+
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s [%d/%d] %-44s %s/%s  vol [%s] %3d%%",
 		marker, index, s.count, truncate(s.title, 44),
-		formatDuration(s.positionMs), formatDuration(s.durationMs),
-		volumeBar(s.volume), s.volume)
+		where, length, volumeBar(s.volume), s.volume)
 	if s.message != "" {
 		fmt.Fprintf(&b, "  %s", s.message)
 	}
 	return b.String()
+}
+
+// formatStatusTime renders a playback time, where zero is a real position.
+func formatStatusTime(ms int64) string {
+	if ms <= 0 {
+		return "0:00"
+	}
+	return formatDuration(ms)
 }
