@@ -71,17 +71,18 @@ paths:
       tags: [library]
       summary: An entity's artwork
       description: |
-        Serves the cover for a track, album or artist. The image is fetched from
-        the provider once and cached on disk, so clients never talk to the
-        provider CDNs themselves and a cover is downloaded once for the whole
-        household. Responses carry a strong ETag and a long cache lifetime;
-        artwork that the providers have not supplied yet answers 404.
+        Serves the cover for a track, album, artist or playlist, or a user's
+        icon. A provider's image is fetched once and cached on disk, so
+        clients never talk to the provider CDNs themselves and a cover is
+        downloaded once for the whole household. Responses carry a strong ETag
+        and a long cache lifetime; artwork that has not been supplied yet
+        answers 404.
       operationId: getArtwork
       parameters:
         - name: kind
           in: path
           required: true
-          schema: { type: string, enum: [track, album, artist] }
+          schema: { type: string, enum: [track, album, artist, playlist, user] }
         - name: artworkId
           in: path
           required: true
@@ -352,6 +353,34 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Me" }
+    patch:
+      tags: [auth]
+      summary: Change your display name
+      description: |
+        A plain text field on the account: the UI saves it or discards it, and
+        no password is involved.
+      operationId: updateMe
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [displayName]
+              properties:
+                displayName: { type: string }
+      responses:
+        "200":
+          description: The updated account.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user]
+                properties:
+                  user: { $ref: "#/components/schemas/Profile" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
 
   /api/v1/me/favorites:
     get:
@@ -672,6 +701,592 @@ paths:
               schema: { $ref: "#/components/schemas/PlaylistDetail" }
         "400": { $ref: "#/components/responses/BadRequest" }
 
+  /api/v1/uploads:
+    get:
+      tags: [library]
+      summary: List your uploads
+      description: The Manage tab's own list; everything the caller has contributed.
+      operationId: listUploads
+      responses:
+        "200":
+          description: The caller's uploads.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [uploads]
+                properties:
+                  uploads:
+                    type: array
+                    items: { $ref: "#/components/schemas/Upload" }
+    post:
+      tags: [library]
+      summary: Upload a song
+      description: |
+        Stores a file as a user-sourced variant, visible to every user and
+        ranked first in search. `associateTrackId` names the canonical track it
+        becomes a source of; the empty string means No Association, in which
+        case a track of its own is created. Associating never clobbers the
+        upload's own metadata: the variant keeps the title, artists and album
+        sent here.
+      operationId: createUpload
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [filename, contentType, data, title, artists]
+              properties:
+                filename: { type: string }
+                contentType: { type: string, example: audio/ogg }
+                data:
+                  type: string
+                  description: The audio file, base64 encoded; 64 MiB decoded at most.
+                title: { type: string }
+                artists: { type: array, items: { type: string } }
+                album: { type: string }
+                durationMs: { type: integer, format: int64 }
+                artworkData:
+                  type: string
+                  description: The cover image, base64 encoded.
+                artworkContentType: { type: string, example: image/jpeg }
+                associateTrackId:
+                  type: string
+                  description: |
+                    The track to become a source of, or "" for No Association
+                    (a track of its own is created).
+      responses:
+        "201":
+          description: The upload.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [upload]
+                properties:
+                  upload: { $ref: "#/components/schemas/Upload" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "413":
+          description: The decoded file is larger than the limit.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/uploads/all:
+    get:
+      tags: [library]
+      summary: List every user's uploads
+      description: The Manage tab lists the caller's own; this one is for admin and inspection.
+      operationId: listAllUploads
+      responses:
+        "200":
+          description: Every upload.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [uploads]
+                properties:
+                  uploads:
+                    type: array
+                    items: { $ref: "#/components/schemas/Upload" }
+
+  /api/v1/uploads/{uploadId}:
+    patch:
+      tags: [library]
+      summary: Change an upload's association
+      description: |
+        Points the upload at another canonical track, or at none. The upload's
+        own title, artists and album are left as they are.
+      operationId: patchUpload
+      parameters: [{ $ref: "#/components/parameters/UploadID" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [associateTrackId]
+              properties:
+                associateTrackId:
+                  type: string
+                  description: The track to become a source of, or "" to dissociate.
+      responses:
+        "200":
+          description: The upload.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [upload]
+                properties:
+                  upload: { $ref: "#/components/schemas/Upload" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [library]
+      summary: Remove an upload
+      operationId: deleteUpload
+      parameters: [{ $ref: "#/components/parameters/UploadID" }]
+      responses:
+        "204": { description: Gone. }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/tracks/{trackId}/sources:
+    get:
+      tags: [library]
+      summary: Every source of a track
+      description: |
+        The renditions a listener can pick between: official sources first,
+        then user uploads, each group ordered by net votes (up minus down)
+        descending and then by provider ranking. Exactly one entry carries
+        `default: true` — the caller's saved preference when there is one,
+        otherwise the first in order — unless the track has no sources at all.
+      operationId: listTrackSources
+      parameters: [{ $ref: "#/components/parameters/TrackID" }]
+      responses:
+        "200":
+          description: The sources, and the caller's saved preference.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sources, preferredVariantId]
+                properties:
+                  sources:
+                    type: array
+                    items: { $ref: "#/components/schemas/TrackSource" }
+                  preferredVariantId:
+                    type: string
+                    description: The saved preference, "" when there is none (always for guests).
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/variants/{variantId}/vote:
+    post:
+      tags: [library]
+      summary: Vote on a source
+      description: |
+        One vote per user per variant: a new value replaces the old one and `0`
+        withdraws it. Votes reshape the default ordering for everyone.
+      operationId: voteVariant
+      parameters: [{ $ref: "#/components/parameters/VariantID" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [value]
+              properties:
+                value: { type: integer, enum: [1, -1, 0] }
+      responses:
+        "204": { description: Recorded. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/me/tracks/{trackId}/preference:
+    put:
+      tags: [auth]
+      summary: Save your preferred source for a song
+      description: |
+        The chosen rendition wins over the default ordering when this caller
+        plays the song, and `GET /api/v1/tracks/{trackId}/sources` reports it
+        as `preferredVariantId`.
+      operationId: setTrackPreference
+      parameters: [{ $ref: "#/components/parameters/TrackID" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [variantId]
+              properties:
+                variantId: { type: string, format: uuid }
+      responses:
+        "204": { description: Saved. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/me/icon:
+    post:
+      tags: [auth]
+      summary: Set your icon
+      description: |
+        Stores an image as the caller's icon, replacing any they had. It is
+        kept where other artwork is cached, so serving it afterwards is the
+        same path as any other cover, and the account's `iconUrl` points at it.
+      operationId: setMeIcon
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [data, contentType]
+              properties:
+                data:
+                  type: string
+                  description: The image, base64 encoded.
+                contentType:
+                  type: string
+                  description: One of image/png, image/jpeg, image/webp, image/gif, image/avif.
+      responses:
+        "200":
+          description: The updated account.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user]
+                properties:
+                  user: { $ref: "#/components/schemas/Profile" }
+        "400":
+          description: The image is empty, not base64, or not a type this serves.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "413":
+          description: The image is larger than the limit.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/me/password:
+    post:
+      tags: [auth]
+      summary: Change your password
+      operationId: changeMyPassword
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [currentPassword, newPassword]
+              properties:
+                currentPassword: { type: string, format: password }
+                newPassword: { type: string, format: password }
+      responses:
+        "204": { description: Changed. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401":
+          description: The current password is wrong, or no one is logged in.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/me/username:
+    post:
+      tags: [auth]
+      summary: Change your username
+      description: |
+        The password proves it is you, so the UI asks for it in a confirm
+        dialog before the rename.
+      operationId: changeMyUsername
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password, username]
+              properties:
+                password: { type: string, format: password }
+                username: { type: string }
+      responses:
+        "200":
+          description: The updated account.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user]
+                properties:
+                  user: { $ref: "#/components/schemas/Profile" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401":
+          description: The password is wrong, or no one is logged in.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: The username is taken.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/users:
+    get:
+      tags: [auth]
+      summary: Search everyone
+      description: |
+        Finds accounts by name. Each entry carries what the caller's
+        relationship to them is; `online` is derived from `lastPlayedAt`, which
+        counts as online for five minutes.
+      operationId: searchUsers
+      parameters: [{ $ref: "#/components/parameters/SearchQuery" }]
+      responses:
+        "200":
+          description: Matching accounts.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [users]
+                properties:
+                  users:
+                    type: array
+                    items: { $ref: "#/components/schemas/UserProfile" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/users/{userId}:
+    get:
+      tags: [auth]
+      summary: One person's page
+      description: |
+        What the friend page is built from: the account, their public
+        playlists, their favourites and what they played recently, plus
+        everything they have ever shared with the caller.
+      operationId: getUser
+      parameters: [{ $ref: "#/components/parameters/UserID" }]
+      responses:
+        "200":
+          description: The account and its lists.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user, publicPlaylists, favorites, recent, shared]
+                properties:
+                  user: { $ref: "#/components/schemas/UserProfile" }
+                  publicPlaylists:
+                    type: array
+                    items: { $ref: "#/components/schemas/Playlist" }
+                  favorites:
+                    type: array
+                    items: { $ref: "#/components/schemas/Track" }
+                  recent:
+                    type: array
+                    items: { $ref: "#/components/schemas/Track" }
+                  shared:
+                    type: array
+                    description: Everything this person has ever shared with the caller.
+                    items: { $ref: "#/components/schemas/Share" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/users/{userId}/playback:
+    get:
+      tags: [auth]
+      summary: What they are playing (listen along)
+      description: |
+        The playback document this person saved for themselves — the queue, the
+        song and the timestamp — with their user id on it. The client replays
+        it locally and keeps following by polling every couple of seconds.
+        Someone who is neither them nor their friend gets 403.
+      operationId: getUserPlayback
+      parameters: [{ $ref: "#/components/parameters/UserID" }]
+      responses:
+        "200":
+          description: |
+            Their playback document, or just the user id when nothing is
+            stored.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserPlayback" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: Not friends with this person.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/me/friends:
+    get:
+      tags: [auth]
+      summary: Your friends and the pending requests
+      operationId: listFriends
+      responses:
+        "200":
+          description: Accepted friends, then the requests in each direction.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [friends, incoming, outgoing]
+                properties:
+                  friends:
+                    type: array
+                    items: { $ref: "#/components/schemas/UserProfile" }
+                  incoming:
+                    type: array
+                    description: Requests others sent you.
+                    items: { $ref: "#/components/schemas/UserProfile" }
+                  outgoing:
+                    type: array
+                    description: Requests you sent.
+                    items: { $ref: "#/components/schemas/UserProfile" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [auth]
+      summary: Send a friend request
+      operationId: addFriend
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username]
+              properties:
+                username: { type: string }
+      responses:
+        "201":
+          description: The requested account.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user]
+                properties:
+                  user: { $ref: "#/components/schemas/UserProfile" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: No account by that name.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/me/friends/{userId}/accept:
+    post:
+      tags: [auth]
+      summary: Accept a friend request
+      operationId: acceptFriend
+      parameters: [{ $ref: "#/components/parameters/UserID" }]
+      responses:
+        "204": { description: Friends. }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/me/friends/{userId}:
+    delete:
+      tags: [auth]
+      summary: Unfriend someone, or decline their request
+      operationId: removeFriend
+      parameters: [{ $ref: "#/components/parameters/UserID" }]
+      responses:
+        "204": { description: Gone. }
+
+  /api/v1/me/friends/{userId}/ignore:
+    post:
+      tags: [auth]
+      summary: Ignore someone
+      description: Ignored people's shares never create notifications.
+      operationId: ignoreUser
+      parameters: [{ $ref: "#/components/parameters/UserID" }]
+      responses:
+        "204": { description: Ignored. }
+    delete:
+      tags: [auth]
+      summary: Stop ignoring someone
+      operationId: unignoreUser
+      parameters: [{ $ref: "#/components/parameters/UserID" }]
+      responses:
+        "204": { description: Not ignored anymore. }
+
+  /api/v1/me/shares:
+    get:
+      tags: [auth]
+      summary: Everything shared with you (and by you)
+      description: Every share touching the caller, in both directions, newest first.
+      operationId: listShares
+      responses:
+        "200":
+          description: The shares.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [shares]
+                properties:
+                  shares:
+                    type: array
+                    items: { $ref: "#/components/schemas/Share" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [auth]
+      summary: Share a song, or invite someone to a room
+      description: |
+        One song to one friend with `trackId`, or a room invitation with
+        `roomId`. Either way the recipient gets a notification, unless they
+        ignore the sender.
+      operationId: createShare
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [userId]
+              properties:
+                userId: { type: string, format: uuid }
+                trackId:
+                  type: string
+                  format: uuid
+                  description: The song to share.
+                roomId:
+                  type: string
+                  description: The room to invite them to.
+      responses:
+        "201":
+          description: The share.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [share]
+                properties:
+                  share: { $ref: "#/components/schemas/Share" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/me/notifications:
+    get:
+      tags: [auth]
+      summary: Your notifications
+      operationId: listNotifications
+      responses:
+        "200":
+          description: Every notification, and how many are unread.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [notifications, unread]
+                properties:
+                  notifications:
+                    type: array
+                    items: { $ref: "#/components/schemas/Notification" }
+                  unread: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/me/notifications/read:
+    post:
+      tags: [auth]
+      summary: Mark every notification read
+      operationId: markNotificationsRead
+      responses:
+        "204": { description: Read. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
   /api/v1/radio:
     post:
       tags: [library]
@@ -977,6 +1592,9 @@ paths:
                   type: string
                   enum: [host, everyone]
                   default: everyone
+                password:
+                  type: string
+                  description: Optional; joining the room then requires it.
       responses:
         "201":
           description: The room and the caller's member id.
@@ -1004,12 +1622,26 @@ paths:
       summary: Join a room
       operationId: joinRoom
       parameters: [{ $ref: "#/components/parameters/RoomID" }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                password:
+                  type: string
+                  description: The room's password, when it has one.
       responses:
         "200":
           description: The room and the caller's member id.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/RoomEnvelope" }
+        "403":
+          description: The password is wrong.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "404": { $ref: "#/components/responses/NotFound" }
 
   /api/v1/rooms/{roomId}/leave:
@@ -1025,8 +1657,12 @@ paths:
   /api/v1/rooms/{roomId}/queue:
     post:
       tags: [rooms]
-      summary: Add a track to the queue
-      description: An idle room starts playing as soon as it is queued.
+      summary: Add a track to your queue
+      description: |
+        The track goes on the caller's own queue. The fair master queue — what
+        the room actually plays — recomputes and reaches everyone on the room
+        channel; an idle room starts playing as soon as there is anything to
+        play.
       operationId: queueTrack
       parameters: [{ $ref: "#/components/parameters/RoomID" }]
       requestBody:
@@ -1046,11 +1682,31 @@ paths:
               schema: { $ref: "#/components/schemas/Room" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [rooms]
+      summary: Clear your queue
+      description: |
+        Drops every entry of the caller's own queue (the host may clear any
+        member's). The master queue recomputes and reaches everyone on the
+        room channel.
+      operationId: clearQueue
+      parameters:
+        - { $ref: "#/components/parameters/RoomID" }
+        - name: memberId
+          in: query
+          description: Whose queue to clear; the host's only, defaults to the caller's own.
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/RoomState" }
+        "403": { $ref: "#/components/responses/Forbidden" }
 
   /api/v1/rooms/{roomId}/queue/{itemId}:
     delete:
       tags: [rooms]
       summary: Remove a queued entry
+      description: |
+        The entry leaves its owner's queue — the caller's own, or any member's
+        when the host asks — and the master queue recomputes.
       operationId: removeQueueItem
       parameters:
         - { $ref: "#/components/parameters/RoomID" }
@@ -1071,6 +1727,9 @@ paths:
     post:
       tags: [rooms]
       summary: Reorder the queue
+      description: |
+        Reorders the caller's own queue (the host may reorder any member's),
+        and the master queue recomputes from the new order.
       operationId: reorderQueue
       parameters: [{ $ref: "#/components/parameters/RoomID" }]
       requestBody:
@@ -1275,6 +1934,16 @@ components:
       in: path
       required: true
       schema: { type: string, format: uuid }
+    UploadID:
+      name: uploadId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    UserID:
+      name: userId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
 
   headers:
     ETag:
@@ -1468,6 +2137,17 @@ components:
           type: boolean
           description: True when the server allows anonymous reading.
         user: { $ref: "#/components/schemas/User" }
+        username:
+          type: string
+          description: The caller's own name; only when authenticated.
+        displayName:
+          type: string
+          description: The caller's display name; only when authenticated.
+        iconUrl:
+          type: string
+          description: |
+            Path on this server for the caller's icon, empty until one is set;
+            only when authenticated.
         requireLogin: { type: boolean }
         registrationOpen: { type: boolean }
 
@@ -1691,6 +2371,7 @@ components:
         id: { type: string, format: uuid }
         name: { type: string }
         trackCount: { type: integer }
+        durationMs: { type: integer, format: int64 }
         artworkUrl:
           type: string
           description: |
@@ -1792,9 +2473,25 @@ components:
         name: { type: string }
         host: { type: string }
         controls: { type: string, enum: [host, everyone] }
+        hasPassword:
+          type: boolean
+          description: Whether joining requires a password.
         createdAtMs: { type: integer, format: int64 }
         members: { type: array, items: { $ref: "#/components/schemas/RoomMember" } }
+        memberCount: { type: integer }
         queue: { type: array, items: { $ref: "#/components/schemas/QueueItem" } }
+        queues:
+          type: object
+          description: Each member's own queue, by member id.
+          additionalProperties:
+            type: array
+            items: { $ref: "#/components/schemas/QueueItem" }
+        masterQueue:
+          type: array
+          description: |
+            The fair mix the room actually plays: round-robin across the
+            members in join order, one track each pass.
+          items: { $ref: "#/components/schemas/QueueItem" }
         current: { $ref: "#/components/schemas/RoomPlayback" }
         serverNowMs: { type: integer, format: int64 }
         skip: { $ref: "#/components/schemas/SkipRules" }
@@ -1807,3 +2504,180 @@ components:
         memberId:
           type: string
           description: This caller's member id, for guests to send as X-Member-Id.
+
+    Profile:
+      type: object
+      required: [id, username, displayName, iconUrl]
+      properties:
+        id: { type: string, format: uuid }
+        username: { type: string }
+        displayName: { type: string }
+        iconUrl:
+          type: string
+          description: |
+            Path on this server for the icon, empty until one is set; then it
+            is `/api/v1/artwork/user/{userId}`.
+
+    UserProfile:
+      allOf:
+        - $ref: "#/components/schemas/Profile"
+        - type: object
+          required: [online, lastPlayedAt, listening, relationship]
+          properties:
+            online:
+              type: boolean
+              description: Whether they played something within the last five minutes.
+            lastPlayedAt:
+              type: string
+              format: date-time
+              nullable: true
+              description: When they last played something; null when they never have.
+            listening:
+              allOf: [{ $ref: "#/components/schemas/PlaybackDocument" }]
+              nullable: true
+              description: What they are listening to, as their client's playback document; null when idle.
+            relationship:
+              type: string
+              enum: [friend, pending-in, pending-out, none, ignored]
+
+    PlaybackDocument:
+      type: object
+      description: |
+        What a client was last playing: the queue, the song and the timestamp.
+        The server stores the document as it arrives and does not interpret it;
+        these are the keys this client convention fills in.
+      properties:
+        queue:
+          type: array
+          description: The saved queue; entries are the client's own, each carrying its track id.
+          items:
+            type: object
+            required: [trackId]
+            additionalProperties: true
+            properties:
+              trackId: { type: string, format: uuid }
+        currentTrackId: { type: string, format: uuid }
+        positionMs: { type: integer, format: int64 }
+        paused: { type: boolean }
+        savedAt:
+          type: integer
+          format: int64
+          description: When the document was saved, milliseconds since the epoch.
+
+    UserPlayback:
+      allOf:
+        - $ref: "#/components/schemas/PlaybackDocument"
+        - type: object
+          required: [userId]
+          properties:
+            userId: { type: string, format: uuid }
+
+    Uploader:
+      type: object
+      description: The user who uploaded a source.
+      required: [userId, username, displayName]
+      properties:
+        userId: { type: string, format: uuid }
+        username: { type: string }
+        displayName: { type: string }
+
+    Upload:
+      type: object
+      required: [id, trackId, variantId, title, artists, album, durationMs, uploader, official, associateTrackId, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        trackId:
+          type: string
+          format: uuid
+          description: The canonical track this is a source of.
+        variantId:
+          type: string
+          format: uuid
+          description: The user-source variant this upload is.
+        title: { type: string }
+        artists: { type: array, items: { type: string } }
+        album: { type: string }
+        durationMs: { type: integer, format: int64 }
+        artworkUrl:
+          type: string
+          description: Path on this server for the cover, absent when none is known.
+        uploader: { $ref: "#/components/schemas/Uploader" }
+        official:
+          type: boolean
+          description: Always false; an upload is a user source.
+        associateTrackId:
+          type: string
+          description: |
+            The association as the client set it: the track id, or "" for No
+            Association. It equals `trackId` when the upload is associated.
+        createdAt: { type: string, format: date-time }
+
+    TrackSource:
+      type: object
+      required: [variantId, provider, title, artists, album, durationMs, downloadable, mediaState, official, uploader, upvotes, downvotes, myVote, default]
+      properties:
+        variantId: { type: string, format: uuid }
+        provider: { type: string, example: ytmusic }
+        title: { type: string }
+        artists: { type: array, items: { type: string } }
+        album: { type: string }
+        durationMs: { type: integer, format: int64 }
+        downloadable:
+          type: boolean
+          description: Whether its audio can be fetched at all.
+        mediaState:
+          type: string
+          enum: [none, downloading, ready, failed]
+        official:
+          type: boolean
+          description: False for user uploads.
+        uploader:
+          allOf: [{ $ref: "#/components/schemas/Uploader" }]
+          nullable: true
+          description: The uploading user; null unless this is a user upload with a known uploader.
+        upvotes: { type: integer }
+        downvotes: { type: integer }
+        myVote:
+          type: integer
+          enum: [1, -1, 0]
+          description: This caller's vote; 0 when they have none, always for guests.
+        default:
+          type: boolean
+          description: The source played by default; exactly one per track, unless it has no sources.
+
+    Share:
+      type: object
+      required: [id, from, to, trackId, roomId, track, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        from: { $ref: "#/components/schemas/UserProfile" }
+        to: { $ref: "#/components/schemas/UserProfile" }
+        trackId:
+          type: string
+          format: uuid
+          nullable: true
+          description: The shared song; null on a room invitation.
+        roomId:
+          type: string
+          nullable: true
+          description: The room the recipient was invited to; null on a song share.
+        track:
+          allOf: [{ $ref: "#/components/schemas/Track" }]
+          nullable: true
+          description: The shared song itself; null on a room invitation.
+        createdAt: { type: string, format: date-time }
+
+    Notification:
+      type: object
+      required: [id, kind, from, trackId, roomId, createdAt, read]
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [share, room-invite] }
+        from:
+          allOf: [{ $ref: "#/components/schemas/UserProfile" }]
+          nullable: true
+          description: Who caused it; null when the sender's account is gone.
+        trackId: { type: string, format: uuid, nullable: true }
+        roomId: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+        read: { type: boolean }
