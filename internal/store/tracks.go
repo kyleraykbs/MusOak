@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 	"time"
 
@@ -163,6 +164,25 @@ func (d *DB) CandidateTracks(ctx context.Context, durationMs, toleranceMs int64,
 		tracks = append(tracks, *t)
 	}
 	return tracks, mapErr(rows.Err())
+}
+
+// DeleteTrack removes a canonical track that no rendition points at any more.
+// It refuses to delete a track that still has variants, so a merge can never
+// take the surviving renditions with it.
+func (d *DB) DeleteTrack(ctx context.Context, id uuid.UUID) error {
+	var variants int
+	if err := d.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM variants WHERE track_id = ?`, id.String()).Scan(&variants); err != nil {
+		return mapErr(err)
+	}
+	if variants > 0 {
+		return fmt.Errorf("%w: track %s still has %d variants", ErrConflict, id, variants)
+	}
+	res, err := d.db.ExecContext(ctx, `DELETE FROM tracks WHERE id = ?`, id.String())
+	if err != nil {
+		return mapErr(err)
+	}
+	return rowsAffectedOrNotFound(res)
 }
 
 // defaultCandidateLimit bounds how many tracks a match attempt scores.

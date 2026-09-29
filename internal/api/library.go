@@ -68,11 +68,14 @@ func (s *Server) handleLibraryImport(w http.ResponseWriter, r *http.Request) {
 
 	response := importResponse{Imported: make([]importedTrack, 0, len(variants)), Failures: failures}
 	for _, variant := range variants {
-		track, err := s.store.Track(r.Context(), variant.TrackID)
+		// An imported file joins the canonical library: it is matched against
+		// existing tracks exactly like a provider hit would be.
+		track, err := s.matcher.Adopt(r.Context(), variant.ID)
 		if err != nil {
-			writeStoreError(w, err, "imported variant lost its track")
+			writeStoreError(w, err, "import failed")
 			return
 		}
+		variant.TrackID = track.ID
 		trackResponse, err := s.buildTrack(r.Context(), *track)
 		if err != nil {
 			writeStoreError(w, err, "import failed")

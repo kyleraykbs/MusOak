@@ -101,6 +101,8 @@ type TrackRepo interface {
 	// same recording, or that have no known duration. A non-positive
 	// durationMs means "no duration filter".
 	CandidateTracks(ctx context.Context, durationMs, toleranceMs int64, limit int) ([]Track, error)
+	// DeleteTrack removes a canonical track nothing points at any more.
+	DeleteTrack(ctx context.Context, id uuid.UUID) error
 	SetTrackDuration(ctx context.Context, id uuid.UUID, durationMs int64) error
 	TrackArtists(ctx context.Context, id uuid.UUID) ([]Artist, error)
 	SetTrackArtists(ctx context.Context, id uuid.UUID, names []string) error

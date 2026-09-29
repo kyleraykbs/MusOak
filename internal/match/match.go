@@ -60,6 +60,10 @@ type Candidate struct {
 
 // Score returns the similarity of two candidates in [0,1]. Identical ISRCs
 // short-circuit to 1; durations that cannot be the same recording return 0.
+//
+// Only the signals both sides actually carry are weighed: an untagged local
+// file must still be able to match its track on title and duration alone,
+// while two tracks that both name their artist and album are held to them.
 func Score(a, b Candidate) float64 {
 	if a.ISRC != "" && b.ISRC != "" && strings.EqualFold(strings.TrimSpace(a.ISRC), strings.TrimSpace(b.ISRC)) {
 		return 1
@@ -67,10 +71,31 @@ func Score(a, b Candidate) float64 {
 	if a.DurationMs > 0 && b.DurationMs > 0 && absDiff(a.DurationMs, b.DurationMs) > DurationToleranceMs {
 		return 0
 	}
-	return weightTitle*titleSimilarity(a.Title, b.Title) +
-		weightArtists*artistSimilarity(a.Artists, b.Artists) +
-		weightAlbum*albumSimilarity(a.Album, b.Album) +
-		weightDuration*durationSimilarity(a.DurationMs, b.DurationMs)
+
+	titleA, titleB := NormalizeTitle(a.Title), NormalizeTitle(b.Title)
+	signals := []struct {
+		weight float64
+		value  float64
+		known  bool
+	}{
+		{weightTitle, titleSimilarity(a.Title, b.Title), titleA != "" && titleB != ""},
+		{weightArtists, artistSimilarity(a.Artists, b.Artists), len(artistSet(a.Artists)) > 0 && len(artistSet(b.Artists)) > 0},
+		{weightAlbum, albumSimilarity(a.Album, b.Album), NormalizeTitle(a.Album) != "" && NormalizeTitle(b.Album) != ""},
+		{weightDuration, durationSimilarity(a.DurationMs, b.DurationMs), a.DurationMs > 0 && b.DurationMs > 0},
+	}
+
+	var totalWeight, weighted float64
+	for _, signal := range signals {
+		if !signal.known {
+			continue
+		}
+		totalWeight += signal.weight
+		weighted += signal.weight * signal.value
+	}
+	if totalWeight == 0 {
+		return 0
+	}
+	return weighted / totalWeight
 }
 
 func titleSimilarity(a, b string) float64 {
@@ -323,6 +348,85 @@ func (m *Matcher) shape(ctx context.Context, track store.Track) (Candidate, erro
 		shape.Album = albums[0].Title
 	}
 	return shape, nil
+}
+
+// Adopt matches a freshly imported rendition against the existing library and
+// re-points it at the canonical track it belongs to. The throwaway track the
+// import created is removed once nothing points at it, so importing the same
+// song twice does not leave two canonical tracks behind.
+func (m *Matcher) Adopt(ctx context.Context, variantID uuid.UUID) (*store.Track, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	variant, err := m.db.Variant(ctx, variantID)
+	if err != nil {
+		return nil, err
+	}
+	track, err := m.db.Track(ctx, variant.TrackID)
+	if err != nil {
+		return nil, err
+	}
+
+	candidates, err := m.db.CandidateTracks(ctx, variant.DurationMs, DurationToleranceMs, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	want := Candidate{
+		Title:      variant.Title,
+		Artists:    variant.Artists,
+		Album:      variant.Album,
+		DurationMs: variant.DurationMs,
+		ISRC:       variant.ISRC,
+	}
+
+	var (
+		best      *store.Track
+		bestScore float64
+	)
+	for i := range candidates {
+		candidate := &candidates[i]
+		if candidate.ID == track.ID {
+			continue
+		}
+		shape, err := m.shape(ctx, *candidate)
+		if err != nil {
+			return nil, err
+		}
+		if score := Score(shape, want); score > bestScore {
+			best, bestScore = candidate, score
+		}
+	}
+	if best == nil || bestScore < m.threshold {
+		return track, nil
+	}
+
+	if err := m.db.SetVariantTrack(ctx, variant.ID, best.ID); err != nil {
+		return nil, err
+	}
+	// The canonical track learns whatever its first rendition could not tell it.
+	if artists, err := m.db.TrackArtists(ctx, best.ID); err == nil && len(artists) == 0 && len(variant.Artists) > 0 {
+		if err := m.db.SetTrackArtists(ctx, best.ID, variant.Artists); err != nil {
+			return nil, err
+		}
+	}
+	if albums, err := m.db.TrackAlbums(ctx, best.ID); err == nil && len(albums) == 0 && variant.Album != "" {
+		if err := m.db.SetTrackAlbums(ctx, best.ID, []string{variant.Album}); err != nil {
+			return nil, err
+		}
+	}
+	if best.DurationMs == 0 && variant.DurationMs > 0 {
+		if err := m.db.SetTrackDuration(ctx, best.ID, variant.DurationMs); err != nil {
+			m.logger.Warn("match: set track duration", "track", best.ID, "error", err)
+		}
+	}
+	if err := m.db.DeleteTrack(ctx, track.ID); err != nil && !errors.Is(err, store.ErrConflict) {
+		return nil, err
+	}
+
+	m.logger.Info("adopted imported rendition",
+		"track", best.ID, "variant", variant.ID, "score", bestScore)
+	return m.db.Track(ctx, best.ID)
 }
 
 // Group merges a fan-out search into canonical tracks, persisting every hit as
