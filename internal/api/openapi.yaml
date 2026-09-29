@@ -647,6 +647,68 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
+  /api/v1/playlists/search:
+    get:
+      tags: [library]
+      summary: Search playlists across the providers
+      description: |
+        Playlist hits from every provider that can browse them. A playlist
+        belongs to one provider: two services offering a list of the same name
+        are different playlists with different tracks, so they are never merged.
+        Hits are recorded, so their covers come from this server and a sync can
+        be asked for later by id.
+      operationId: searchProviderPlaylists
+      parameters:
+        - { $ref: "#/components/parameters/SearchQuery" }
+        - { $ref: "#/components/parameters/SearchLimit" }
+      responses:
+        "200":
+          description: Provider playlists, with the providers that failed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [query, playlists]
+                properties:
+                  query: { type: string }
+                  playlists:
+                    type: array
+                    items: { $ref: "#/components/schemas/ProviderPlaylist" }
+                  providerErrors:
+                    type: array
+                    items: { $ref: "#/components/schemas/ProviderProblem" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/v1/playlists/{playlistId}/sync:
+    post:
+      tags: [library]
+      summary: Sync a provider playlist into the library
+      description: |
+        Fetches the playlist's tracks from its provider, matches every one into
+        the canonical library, and records them in playlist order. Playing or
+        importing the playlist needs this: the returned tracks carry the ids a
+        user playlist is built from. Syncing twice replaces the tracklist rather
+        than duplicating it.
+      operationId: syncProviderPlaylist
+      parameters: [{ $ref: "#/components/parameters/PlaylistID" }]
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SyncRequest" }
+      responses:
+        "200":
+          description: The playlist and its tracks, in playlist order.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderPlaylistSyncResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: The playlist belongs to a provider that was not selected.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /api/v1/albums/search:
     get:
       tags: [library]
@@ -1373,6 +1435,48 @@ components:
               provider: { type: string }
               error: { type: string }
         playlist: { $ref: "#/components/schemas/Playlist" }
+
+    ProviderPlaylist:
+      type: object
+      required: [id, provider, title, trackCount, synced]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: This library's id for the playlist, not the provider's.
+        provider: { type: string }
+        title: { type: string }
+        owner:
+          type: string
+          description: Who the playlist belongs to on the provider.
+        description: { type: string }
+        trackCount:
+          type: integer
+          description: |
+            How many tracks the playlist has. A search hit may report zero when
+            the provider does not say; syncing fills it in.
+        artworkUrl:
+          type: string
+          description: Path on this server for the cover.
+        synced:
+          type: boolean
+          description: Whether the tracklist has been pulled in already.
+
+    ProviderPlaylistSyncResult:
+      type: object
+      required: [playlist, added, tracks]
+      properties:
+        playlist: { $ref: "#/components/schemas/ProviderPlaylist" }
+        added:
+          type: integer
+          description: Entries that were not in the playlist before this sync.
+        tracks:
+          type: array
+          description: The playlist's tracks, in playlist order.
+          items: { $ref: "#/components/schemas/Track" }
+        providerErrors:
+          type: array
+          items: { $ref: "#/components/schemas/ProviderProblem" }
 
     Album:
       type: object

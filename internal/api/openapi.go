@@ -47,6 +47,8 @@ func (s *Server) routeTable() []route {
 		{"GET /api/v1/albums/search", s.handleAlbumSearch},
 		{"GET /api/v1/albums/{albumId}", s.handleAlbum},
 		{"POST /api/v1/albums/{albumId}/sync", s.handleAlbumSync},
+		{"GET /api/v1/playlists/search", s.handlePlaylistSearch},
+		{"POST /api/v1/playlists/{playlistId}/sync", s.handlePlaylistSync},
 		{"GET /api/v1/artists/search", s.handleArtistSearch},
 		{"GET /api/v1/artists/{artistId}", s.handleArtist},
 		{"POST /api/v1/artists/{artistId}/sync", s.handleArtistSync},

@@ -9,6 +9,8 @@
 #   album  BROWSE_ID
 #   artist BROWSE_ID
 #   radio  VIDEO_ID [LIMIT]
+#   playlists QUERY [LIMIT]
+#   playlist  BROWSE_ID
 #
 # Every command prints one JSON document on stdout.
 import json
@@ -71,6 +73,14 @@ def album_of(item):
     if isinstance(album, dict):
         return album.get("name", "") or ""
     return album or ""
+
+
+def owner_of(item):
+    """Playlist authors arrive as a string when searched and a dict when fetched."""
+    author = item.get("author")
+    if isinstance(author, dict):
+        return author.get("name", "") or ""
+    return author or ""
 
 
 def song(item):
@@ -155,6 +165,38 @@ def radio(yt, video_id, limit):
     return [track for track in tracks if track["id"] and track["id"] != video_id]
 
 
+def playlists(yt, query, limit):
+    # Search answers in whole pages (20, 40, ...), so trim to the asked-for size.
+    raw = (yt.search(query, filter="playlists", limit=limit) or [])[:limit]
+    return [
+        {
+            "id": item.get("browseId", "") or "",
+            "title": item.get("title", "") or "",
+            "owner": owner_of(item),
+            "description": item.get("description", "") or "",
+            "trackCount": int(item.get("itemCount") or 0),
+            "artworkUrl": artwork_of(item),
+        }
+        for item in raw
+        if item.get("browseId")
+    ]
+
+
+def playlist(yt, browse_id):
+    # limit=None fetches the whole tracklist; the default stops at 100.
+    raw = yt.get_playlist(browse_id, limit=None) or {}
+    tracks = [song(track) for track in (raw.get("tracks") or []) if track.get("videoId")]
+    return {
+        "id": browse_id,
+        "title": raw.get("title", "") or "",
+        "owner": owner_of(raw),
+        "description": raw.get("description", "") or "",
+        "trackCount": int(raw.get("trackCount") or len(tracks)),
+        "artworkUrl": artwork_of(raw),
+        "tracks": tracks,
+    }
+
+
 def main(argv):
     if len(argv) < 2:
         raise SystemExit("usage: ytmusic.py <command> ...")
@@ -179,6 +221,15 @@ def main(argv):
             raise SystemExit("usage: radio VIDEO_ID [LIMIT]")
         limit = int(argv[3]) if len(argv) > 3 else 25
         result = radio(yt, argv[2], limit)
+    elif command == "playlists":
+        if len(argv) < 3:
+            raise SystemExit("usage: playlists QUERY [LIMIT]")
+        limit = int(argv[3]) if len(argv) > 3 else 20
+        result = playlists(yt, argv[2], limit)
+    elif command == "playlist":
+        if len(argv) < 3:
+            raise SystemExit("usage: playlist BROWSE_ID")
+        result = playlist(yt, argv[2])
     else:
         raise SystemExit(f"unknown command: {command}")
 

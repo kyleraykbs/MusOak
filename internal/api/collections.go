@@ -388,7 +388,8 @@ func (s *Server) providersKnown(w http.ResponseWriter, providers []string) bool 
 
 func writeLibraryError(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, library.ErrNoAlbum), errors.Is(err, library.ErrNoArtist), errors.Is(err, store.ErrNotFound):
+	case errors.Is(err, library.ErrNoAlbum), errors.Is(err, library.ErrNoArtist),
+		errors.Is(err, library.ErrNoPlaylist), errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, library.ErrNoSources):
 		writeError(w, http.StatusConflict, err.Error())

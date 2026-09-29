@@ -23,6 +23,9 @@ type fakeProvider struct {
 	artists  []provider.Artist
 	byArtist map[string][]provider.Album
 
+	playlists      []provider.Playlist
+	playlistDetail map[string]*provider.PlaylistDetail
+
 	searchErr error
 	albumErr  error
 	artistErr error
@@ -33,7 +36,9 @@ type fakeProvider struct {
 
 func (f *fakeProvider) Name() string { return f.name }
 func (f *fakeProvider) Capabilities() provider.Caps {
-	return provider.Caps{Search: true, Download: true, SearchAlbums: true, SearchArtists: true}
+	return provider.Caps{
+		Search: true, Download: true, SearchAlbums: true, SearchArtists: true, Playlists: true,
+	}
 }
 
 func (f *fakeProvider) Search(ctx context.Context, q string, opts provider.SearchOpts) ([]provider.Track, error) {
@@ -73,6 +78,24 @@ func (f *fakeProvider) ArtistAlbums(ctx context.Context, providerArtistID string
 		return nil, f.artistErr
 	}
 	return f.byArtist[providerArtistID], nil
+}
+
+func (f *fakeProvider) SearchPlaylists(ctx context.Context, q string, opts provider.SearchOpts) ([]provider.Playlist, error) {
+	if f.searchErr != nil {
+		return nil, f.searchErr
+	}
+	return f.playlists, nil
+}
+
+func (f *fakeProvider) Playlist(ctx context.Context, providerPlaylistID string) (*provider.PlaylistDetail, error) {
+	if f.albumErr != nil {
+		return nil, f.albumErr
+	}
+	detail, ok := f.playlistDetail[providerPlaylistID]
+	if !ok {
+		return nil, errors.New("no such playlist")
+	}
+	return detail, nil
 }
 
 func track(id, title string, durationMs int64) provider.Track {
@@ -486,5 +509,171 @@ func TestSearchReportsProviderErrors(t *testing.T) {
 	}
 	if len(problems) != 1 || problems[0].Provider != "ytmusic" {
 		t.Errorf("problems = %+v", problems)
+	}
+}
+
+func TestSearchPlaylistsRecordsEveryProviderHit(t *testing.T) {
+	ytmusic := &fakeProvider{name: "ytmusic", playlists: []provider.Playlist{{
+		ProviderPlaylistID: "PL1",
+		Title:              "Late night",
+		Owner:              "kyle",
+		TrackCount:         12,
+		ArtworkURL:         "https://cdn.example/pl1.jpg",
+	}}}
+	spotify := &fakeProvider{name: "spotify", playlists: []provider.Playlist{{
+		ProviderPlaylistID: "37i9dQ",
+		Title:              "Late night",
+		Owner:              "Spotify",
+	}}}
+	f := newFixture(t, ytmusic, spotify)
+
+	playlists, problems, err := f.service.SearchPlaylists(context.Background(), "late night", 10)
+	if err != nil {
+		t.Fatalf("SearchPlaylists: %v", err)
+	}
+	if len(problems) != 0 {
+		t.Fatalf("problems = %+v", problems)
+	}
+	if len(playlists) != 2 {
+		t.Fatalf("playlists = %d, want 2: a playlist is provider-scoped, never merged", len(playlists))
+	}
+
+	providers := map[string]bool{}
+	for _, playlist := range playlists {
+		providers[playlist.Provider] = true
+		if playlist.ID == uuid.Nil {
+			t.Fatal("a stored playlist needs an id")
+		}
+	}
+	if !providers["ytmusic"] || !providers["spotify"] {
+		t.Fatalf("providers = %v", providers)
+	}
+
+	// Searching again finds the same rows rather than new ones.
+	again, _, err := f.service.SearchPlaylists(context.Background(), "late night", 10)
+	if err != nil {
+		t.Fatalf("second SearchPlaylists: %v", err)
+	}
+	if len(again) != 2 {
+		t.Fatalf("second search returned %d playlists, want 2", len(again))
+	}
+	for i := range again {
+		if again[i].ID != playlists[i].ID {
+			t.Fatalf("playlist %d changed id between searches", i)
+		}
+	}
+}
+
+func TestSearchPlaylistsReportsAProviderThatFailed(t *testing.T) {
+	good := &fakeProvider{name: "ytmusic", playlists: []provider.Playlist{{
+		ProviderPlaylistID: "PL1",
+		Title:              "Works",
+	}}}
+	broken := &fakeProvider{name: "spotify", searchErr: errors.New("token expired")}
+	f := newFixture(t, good, broken)
+
+	playlists, problems, err := f.service.SearchPlaylists(context.Background(), "anything", 10)
+	if err != nil {
+		t.Fatalf("SearchPlaylists: %v", err)
+	}
+	if len(playlists) != 1 {
+		t.Fatalf("playlists = %d, want the one that worked", len(playlists))
+	}
+	if len(problems) != 1 || problems[0].Provider != "spotify" {
+		t.Fatalf("problems = %+v", problems)
+	}
+}
+
+func TestSyncPlaylistMatchesTracksInOrder(t *testing.T) {
+	ytmusic := &fakeProvider{
+		name: "ytmusic",
+		playlists: []provider.Playlist{{
+			ProviderPlaylistID: "PL1",
+			Title:              "Late night",
+		}},
+		playlistDetail: map[string]*provider.PlaylistDetail{
+			"PL1": {
+				Playlist: provider.Playlist{
+					ProviderPlaylistID: "PL1",
+					Title:              "Late night",
+					Owner:              "kyle",
+					TrackCount:         3,
+					ArtworkURL:         "https://cdn.example/pl1.jpg",
+				},
+				Tracks: []provider.Track{
+					track("v1", "First", 200_000),
+					track("v2", "Second", 210_000),
+					track("v3", "Third", 220_000),
+				},
+			},
+		},
+	}
+	f := newFixture(t, ytmusic)
+	ctx := context.Background()
+
+	playlists, _, err := f.service.SearchPlaylists(ctx, "late", 10)
+	if err != nil {
+		t.Fatalf("SearchPlaylists: %v", err)
+	}
+	result, err := f.service.SyncPlaylist(ctx, playlists[0].ID, nil)
+	if err != nil {
+		t.Fatalf("SyncPlaylist: %v", err)
+	}
+	if len(result.Tracks) != 3 {
+		t.Fatalf("tracks = %d, want 3", len(result.Tracks))
+	}
+	for i, want := range []string{"First", "Second", "Third"} {
+		if result.Tracks[i].Title != want {
+			t.Fatalf("track %d = %q, want %q", i, result.Tracks[i].Title, want)
+		}
+	}
+	if result.Playlist.ArtworkURL != "https://cdn.example/pl1.jpg" {
+		t.Fatalf("the sync should take the cover from the playlist itself: %+v", result.Playlist)
+	}
+
+	// The tracks are canonical, so they are reachable by id and by provider.
+	stored, err := f.db.Track(ctx, result.Tracks[0].ID)
+	if err != nil {
+		t.Fatalf("Track: %v", err)
+	}
+	if stored.Title != "First" {
+		t.Fatalf("stored track = %q", stored.Title)
+	}
+
+	// Syncing again replaces the tracklist instead of duplicating it.
+	again, err := f.service.SyncPlaylist(ctx, playlists[0].ID, nil)
+	if err != nil {
+		t.Fatalf("second SyncPlaylist: %v", err)
+	}
+	if len(again.Tracks) != 3 {
+		t.Fatalf("re-sync tracks = %d, want 3", len(again.Tracks))
+	}
+	if again.Added != 0 {
+		t.Fatalf("re-sync added = %d, want 0", again.Added)
+	}
+}
+
+func TestSyncPlaylistRefusesAProviderThePlaylistIsNotFrom(t *testing.T) {
+	ytmusic := &fakeProvider{name: "ytmusic", playlists: []provider.Playlist{{
+		ProviderPlaylistID: "PL1",
+		Title:              "Late night",
+	}}}
+	f := newFixture(t, ytmusic)
+
+	playlists, _, err := f.service.SearchPlaylists(context.Background(), "late", 10)
+	if err != nil {
+		t.Fatalf("SearchPlaylists: %v", err)
+	}
+	_, err = f.service.SyncPlaylist(context.Background(), playlists[0].ID, []string{"spotify"})
+	if !errors.Is(err, ErrNoSources) {
+		t.Fatalf("err = %v, want ErrNoSources", err)
+	}
+}
+
+func TestSyncPlaylistOnAnUnknownPlaylist(t *testing.T) {
+	f := newFixture(t, &fakeProvider{name: "ytmusic"})
+	_, err := f.service.SyncPlaylist(context.Background(), uuid.New(), nil)
+	if !errors.Is(err, ErrNoPlaylist) {
+		t.Fatalf("err = %v, want ErrNoPlaylist", err)
 	}
 }

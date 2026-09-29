@@ -25,6 +25,10 @@ type Caps struct {
 	SearchArtists bool
 	// Radio reports that the provider can build a station from a seed track.
 	Radio bool
+	// Playlists reports that the provider can search its playlists and list
+	// their tracks. A playlist belongs to one provider: two services offering
+	// the same name are different lists, so they are never merged.
+	Playlists bool
 }
 
 // Track is a provider's search hit, before cross-provider matching.
@@ -63,6 +67,25 @@ type Artist struct {
 	ArtworkURL string
 }
 
+// Playlist is a provider's playlist hit.
+type Playlist struct {
+	ProviderPlaylistID string
+	Title              string
+	// Owner is who the playlist belongs to on the provider, which is not the
+	// same as the user here.
+	Owner       string
+	Description string
+	TrackCount  int
+	// ArtworkURL is the best image the provider offers.
+	ArtworkURL string
+}
+
+// PlaylistDetail is a playlist with its tracks, in playlist order.
+type PlaylistDetail struct {
+	Playlist
+	Tracks []Track
+}
+
 // AlbumDetail is an album with its tracklist, in album order.
 type AlbumDetail struct {
 	Album
@@ -81,6 +104,14 @@ type ArtistSearcher interface {
 	SearchArtists(ctx context.Context, q string, opts SearchOpts) ([]Artist, error)
 	// ArtistAlbums lists an artist's albums.
 	ArtistAlbums(ctx context.Context, providerArtistID string) ([]Album, error)
+}
+
+// PlaylistSearcher is implemented by providers that can search their playlists
+// and list what is in one.
+type PlaylistSearcher interface {
+	SearchPlaylists(ctx context.Context, q string, opts SearchOpts) ([]Playlist, error)
+	// Playlist returns the tracks of one provider playlist, in its own order.
+	Playlist(ctx context.Context, providerPlaylistID string) (*PlaylistDetail, error)
 }
 
 // RadioProvider is implemented by providers that can build a station from a
@@ -112,6 +143,8 @@ var (
 	ErrRadioUnsupported = errors.New("provider does not support radio")
 	// ErrNotEnabled means no such provider is registered.
 	ErrNotEnabled = errors.New("provider not enabled")
+	// ErrPlaylistsUnsupported means the provider cannot browse playlists.
+	ErrPlaylistsUnsupported = errors.New("provider does not support playlists")
 )
 
 // Result is one provider's contribution to a fan-out search. A provider that
@@ -127,6 +160,13 @@ type AlbumResult struct {
 	Provider string
 	Albums   []Album
 	Err      error
+}
+
+// PlaylistResult is one provider's contribution to a playlist search.
+type PlaylistResult struct {
+	Provider  string
+	Playlists []Playlist
+	Err       error
 }
 
 // ArtistResult is one provider's contribution to an artist search.
@@ -237,6 +277,10 @@ func (r AlbumResult) IsSearchable() bool { return !errors.Is(r.Err, errNotSearch
 // search, rather than from one that cannot browse artists at all.
 func (r ArtistResult) IsSearchable() bool { return !errors.Is(r.Err, errNotSearchable) }
 
+// IsSearchable reports whether a playlist result came from a provider that ran
+// a search, rather than from one that cannot browse playlists at all.
+func (r PlaylistResult) IsSearchable() bool { return !errors.Is(r.Err, errNotSearchable) }
+
 // Download routes a download to a provider, refusing providers without the
 // capability (Spotify) and unknown names.
 func (r *Registry) Download(ctx context.Context, name, providerTrackID, destPath string) error {
@@ -291,6 +335,47 @@ func (r *Registry) SearchAlbums(ctx context.Context, q string, opts SearchOpts) 
 	}
 	wg.Wait()
 	return results
+}
+
+// SearchPlaylists fans out to the providers that can browse playlists.
+func (r *Registry) SearchPlaylists(ctx context.Context, q string, opts SearchOpts) []PlaylistResult {
+	providers := r.All()
+	results := make([]PlaylistResult, len(providers))
+	var wg sync.WaitGroup
+
+	for i, p := range providers {
+		searcher, ok := p.(PlaylistSearcher)
+		if !ok || !p.Capabilities().Playlists {
+			results[i] = PlaylistResult{Provider: p.Name(), Err: errNotSearchable}
+			continue
+		}
+		wg.Add(1)
+		go func(i int, p Provider, searcher PlaylistSearcher) {
+			defer wg.Done()
+			cctx, cancel := context.WithTimeout(ctx, r.timeout)
+			defer cancel()
+			playlists, err := searcher.SearchPlaylists(cctx, q, opts)
+			if err != nil {
+				r.logger.Warn("provider playlist search failed", "provider", p.Name(), "query", q, "error", err)
+			}
+			results[i] = PlaylistResult{Provider: p.Name(), Playlists: playlists, Err: err}
+		}(i, p, searcher)
+	}
+	wg.Wait()
+	return results
+}
+
+// Playlist lists one provider playlist's tracks.
+func (r *Registry) Playlist(ctx context.Context, name, providerPlaylistID string) (*PlaylistDetail, error) {
+	p, ok := r.Get(name)
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrNotEnabled, name)
+	}
+	searcher, ok := p.(PlaylistSearcher)
+	if !ok || !p.Capabilities().Playlists {
+		return nil, fmt.Errorf("%w: %s", ErrPlaylistsUnsupported, name)
+	}
+	return searcher.Playlist(ctx, providerPlaylistID)
 }
 
 // SearchArtists fans out to the providers that can browse artists.

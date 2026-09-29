@@ -61,6 +61,7 @@ func (p *Provider) Capabilities() provider.Caps {
 		SearchAlbums:  true,
 		SearchArtists: true,
 		Radio:         true,
+		Playlists:     true,
 	}
 }
 
@@ -133,6 +134,72 @@ func (p *Provider) SearchArtists(ctx context.Context, q string, opts provider.Se
 		})
 	}
 	return artists, nil
+}
+
+// SearchPlaylists implements provider.PlaylistSearcher.
+func (p *Provider) SearchPlaylists(ctx context.Context, q string, opts provider.SearchOpts) ([]provider.Playlist, error) {
+	out, err := p.run(ctx, "playlists", q, strconv.Itoa(limitOr(opts.Limit, defaultSearchLimit)))
+	if err != nil {
+		return nil, err
+	}
+	var hits []playlistHit
+	if err := json.Unmarshal(out, &hits); err != nil {
+		return nil, fmt.Errorf("ytmusic playlist search %q: parse helper output: %w", q, err)
+	}
+	playlists := make([]provider.Playlist, 0, len(hits))
+	for _, hit := range hits {
+		if hit.ID == "" || hit.Title == "" {
+			continue
+		}
+		playlists = append(playlists, provider.Playlist{
+			ProviderPlaylistID: hit.ID,
+			Title:              hit.Title,
+			Owner:              hit.Owner,
+			Description:        hit.Description,
+			TrackCount:         hit.TrackCount,
+			ArtworkURL:         hit.ArtworkURL,
+		})
+	}
+	return playlists, nil
+}
+
+// Playlist implements provider.PlaylistSearcher: one playlist's tracks, in the
+// order the playlist has them.
+func (p *Provider) Playlist(ctx context.Context, providerPlaylistID string) (*provider.PlaylistDetail, error) {
+	out, err := p.run(ctx, "playlist", providerPlaylistID)
+	if err != nil {
+		return nil, err
+	}
+	var hit playlistDetailHit
+	if err := json.Unmarshal(out, &hit); err != nil {
+		return nil, fmt.Errorf("ytmusic playlist %s: parse helper output: %w", providerPlaylistID, err)
+	}
+
+	detail := &provider.PlaylistDetail{
+		Playlist: provider.Playlist{
+			ProviderPlaylistID: providerPlaylistID,
+			Title:              hit.Title,
+			Owner:              hit.Owner,
+			Description:        hit.Description,
+			TrackCount:         hit.TrackCount,
+			ArtworkURL:         hit.ArtworkURL,
+		},
+		Tracks: make([]provider.Track, 0, len(hit.Tracks)),
+	}
+	for _, track := range hit.Tracks {
+		if track.ID == "" {
+			continue
+		}
+		detail.Tracks = append(detail.Tracks, provider.Track{
+			ProviderTrackID: track.ID,
+			Title:           track.Title,
+			Artists:         track.Artists,
+			Album:           track.Album,
+			DurationMs:      track.DurationMs,
+			ArtworkURL:      track.ArtworkURL,
+		})
+	}
+	return detail, nil
 }
 
 // Album implements provider.AlbumSearcher: it fetches one album's tracklist.
@@ -302,6 +369,20 @@ type albumHit struct {
 
 type albumDetailHit struct {
 	albumHit
+	Tracks []searchHit `json:"tracks"`
+}
+
+type playlistHit struct {
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Owner       string `json:"owner"`
+	Description string `json:"description"`
+	TrackCount  int    `json:"trackCount"`
+	ArtworkURL  string `json:"artworkUrl"`
+}
+
+type playlistDetailHit struct {
+	playlistHit
 	Tracks []searchHit `json:"tracks"`
 }
 

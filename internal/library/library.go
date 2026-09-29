@@ -1,6 +1,8 @@
 // Package library browses and synchronises the collections that sit above
 // tracks: albums and artists, each of which exists once canonically while its
-// provider releases hang off it as variants.
+// provider releases hang off it as variants. Provider playlists are browsed
+// here too, but they stay provider-scoped: two services offering a playlist of
+// the same name are different lists, so they are never merged.
 //
 // Synchronising means going the other way from a provider: fetching a release's
 // tracklist, matching every track into the canonical library, and attaching the
@@ -34,6 +36,8 @@ var (
 	ErrNoArtist = errors.New("artist not found")
 	// ErrNoSources means the collection has no provider release to sync from.
 	ErrNoSources = errors.New("nothing to sync from: search for it on a provider first")
+	// ErrNoPlaylist means the provider playlist does not exist.
+	ErrNoPlaylist = errors.New("playlist not found")
 )
 
 // ProviderError is one provider's failure during a browse or a sync; the rest
@@ -49,6 +53,7 @@ type Store interface {
 	store.VariantRepo
 	store.AlbumRepo
 	store.ArtistRepo
+	store.ExternalPlaylistRepo
 }
 
 // Service browses and syncs albums and artists.
@@ -91,6 +96,13 @@ type SyncResult struct {
 	Added     int
 	Tracks    []store.Track
 	Errors    []ProviderError
+}
+
+// PlaylistSyncResult reports what syncing a provider playlist did.
+type PlaylistSyncResult struct {
+	Playlist store.ExternalPlaylist
+	Added    int
+	Tracks   []store.Track
 }
 
 // ArtistSyncResult reports what an artist sync did.
@@ -163,6 +175,136 @@ func (s *Service) SearchArtists(ctx context.Context, query string, limit int) ([
 		}
 	}
 	return artists, problems, nil
+}
+
+// SearchPlaylists fans out to the playlist-capable providers and records every
+// hit, so the library can serve its cover and remember what it synced.
+func (s *Service) SearchPlaylists(
+	ctx context.Context, query string, limit int,
+) ([]store.ExternalPlaylist, []ProviderError, error) {
+	results := s.providers.SearchPlaylists(ctx, query, provider.SearchOpts{Limit: limit})
+
+	var (
+		playlists []store.ExternalPlaylist
+		seen      = map[uuid.UUID]bool{}
+		problems  []ProviderError
+	)
+	for _, result := range results {
+		if result.Err != nil {
+			if result.IsSearchable() {
+				problems = append(problems, ProviderError{Provider: result.Provider, Error: result.Err.Error()})
+			}
+			continue
+		}
+		for _, hit := range result.Playlists {
+			stored, _, err := s.db.UpsertExternalPlaylist(ctx, &store.ExternalPlaylist{
+				Provider:           result.Provider,
+				ProviderPlaylistID: hit.ProviderPlaylistID,
+				Title:              hit.Title,
+				Owner:              hit.Owner,
+				Description:        hit.Description,
+				TrackCount:         hit.TrackCount,
+				ArtworkURL:         hit.ArtworkURL,
+			})
+			if err != nil {
+				return nil, problems, fmt.Errorf("store playlist %s/%s: %w",
+					result.Provider, hit.ProviderPlaylistID, err)
+			}
+			if seen[stored.ID] {
+				continue
+			}
+			seen[stored.ID] = true
+			playlists = append(playlists, *stored)
+		}
+	}
+	return playlists, problems, nil
+}
+
+// GetPlaylist loads a provider playlist with the tracks synced from it.
+func (s *Service) GetPlaylist(ctx context.Context, playlistID uuid.UUID) (*store.ExternalPlaylist, []store.Track, error) {
+	playlist, err := s.db.ExternalPlaylist(ctx, playlistID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, nil, fmt.Errorf("%w: %s", ErrNoPlaylist, playlistID)
+		}
+		return nil, nil, err
+	}
+	tracks, err := s.db.ExternalPlaylistTracks(ctx, playlistID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return playlist, tracks, nil
+}
+
+// SyncPlaylist pulls a provider playlist's tracks into the canonical library,
+// in the playlist's own order, and returns them. Syncing twice is harmless: the
+// tracklist is replaced, not appended to.
+func (s *Service) SyncPlaylist(
+	ctx context.Context, playlistID uuid.UUID, providers []string,
+) (*PlaylistSyncResult, error) {
+	playlist, err := s.db.ExternalPlaylist(ctx, playlistID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, fmt.Errorf("%w: %s", ErrNoPlaylist, playlistID)
+		}
+		return nil, err
+	}
+	if len(providers) > 0 && !containsString(providers, playlist.Provider) {
+		return nil, fmt.Errorf("%w: %s", ErrNoSources, playlist.Title)
+	}
+
+	detail, err := s.providers.Playlist(ctx, playlist.Provider, playlist.ProviderPlaylistID)
+	if err != nil {
+		return nil, fmt.Errorf("sync playlist %s: %w", playlist.Title, err)
+	}
+
+	// The playlist's own metadata is fresher than the search hit's.
+	if _, _, err := s.db.UpsertExternalPlaylist(ctx, &store.ExternalPlaylist{
+		Provider:           playlist.Provider,
+		ProviderPlaylistID: playlist.ProviderPlaylistID,
+		Title:              detail.Title,
+		Owner:              detail.Owner,
+		Description:        detail.Description,
+		TrackCount:         detail.TrackCount,
+		ArtworkURL:         detail.ArtworkURL,
+	}); err != nil {
+		return nil, err
+	}
+
+	ids := make([]uuid.UUID, 0, len(detail.Tracks))
+	for _, hit := range detail.Tracks {
+		track, _, err := s.matcher.Attach(ctx, playlist.Provider, hit)
+		if err != nil {
+			return nil, fmt.Errorf("match %s/%s: %w", playlist.Provider, hit.ProviderTrackID, err)
+		}
+		ids = append(ids, track.ID)
+	}
+
+	added, err := s.db.SetExternalPlaylistTracks(ctx, playlistID, ids)
+	if err != nil {
+		return nil, err
+	}
+	tracks, err := s.db.ExternalPlaylistTracks(ctx, playlistID)
+	if err != nil {
+		return nil, err
+	}
+	stored, err := s.db.ExternalPlaylist(ctx, playlistID)
+	if err != nil {
+		return nil, err
+	}
+
+	s.logger.Info("playlist synced", "playlist", playlistID, "provider", playlist.Provider,
+		"tracks", len(tracks), "added", added)
+	return &PlaylistSyncResult{Playlist: *stored, Added: added, Tracks: tracks}, nil
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 // GetAlbum loads an album with its credits, releases and tracks.

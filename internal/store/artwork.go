@@ -26,15 +26,16 @@ type ArtworkKind string
 
 // The kinds of artwork the library holds.
 const (
-	ArtworkTrack  ArtworkKind = "track"
-	ArtworkAlbum  ArtworkKind = "album"
-	ArtworkArtist ArtworkKind = "artist"
+	ArtworkTrack    ArtworkKind = "track"
+	ArtworkAlbum    ArtworkKind = "album"
+	ArtworkArtist   ArtworkKind = "artist"
+	ArtworkPlaylist ArtworkKind = "playlist"
 )
 
 // Valid reports whether kind is one of the known kinds.
 func (k ArtworkKind) Valid() bool {
 	switch k {
-	case ArtworkTrack, ArtworkAlbum, ArtworkArtist:
+	case ArtworkTrack, ArtworkAlbum, ArtworkArtist, ArtworkPlaylist:
 		return true
 	}
 	return false
@@ -104,6 +105,11 @@ func (d *DB) ArtistArtwork(ctx context.Context, id uuid.UUID) (string, error) {
 	return d.artworkOf(ctx, "artists", id)
 }
 
+// ExternalPlaylistArtwork returns the recorded image for a provider playlist.
+func (d *DB) ExternalPlaylistArtwork(ctx context.Context, id uuid.UUID) (string, error) {
+	return d.artworkOf(ctx, "external_playlists", id)
+}
+
 // EntityArtwork returns the recorded image location for any entity.
 func (d *DB) EntityArtwork(ctx context.Context, kind ArtworkKind, id uuid.UUID) (string, error) {
 	switch kind {
@@ -113,6 +119,8 @@ func (d *DB) EntityArtwork(ctx context.Context, kind ArtworkKind, id uuid.UUID) 
 		return d.AlbumArtwork(ctx, id)
 	case ArtworkArtist:
 		return d.ArtistArtwork(ctx, id)
+	case ArtworkPlaylist:
+		return d.ExternalPlaylistArtwork(ctx, id)
 	}
 	return "", ErrNotFound
 }
@@ -178,6 +186,8 @@ func (d *DB) ArtworkSources(ctx context.Context, kind ArtworkKind, id uuid.UUID,
 		query = `SELECT provider, artwork_url FROM album_variants WHERE album_id = ? AND artwork_url <> ''`
 	case ArtworkArtist:
 		query = `SELECT provider, artwork_url FROM artist_variants WHERE artist_id = ? AND artwork_url <> ''`
+	case ArtworkPlaylist:
+		query = `SELECT provider, artwork_url FROM external_playlists WHERE id = ? AND artwork_url <> ''`
 	default:
 		return nil, ErrNotFound
 	}

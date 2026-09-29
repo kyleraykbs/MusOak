@@ -79,6 +79,7 @@ func (p *Provider) Capabilities() provider.Caps {
 		SearchAlbums:  true,
 		SearchArtists: true,
 		Radio:         true,
+		Playlists:     true,
 	}
 }
 
@@ -232,6 +233,121 @@ func (p *Provider) SearchArtists(ctx context.Context, q string, opts provider.Se
 		})
 	}
 	return artists, nil
+}
+
+// SearchPlaylists implements provider.PlaylistSearcher: playlists are metadata
+// here too, so a playlist's tracks still play through matched renditions.
+func (p *Provider) SearchPlaylists(ctx context.Context, q string, opts provider.SearchOpts) ([]provider.Playlist, error) {
+	var page struct {
+		Playlists struct {
+			Items []struct {
+				ID          string         `json:"id"`
+				Name        string         `json:"name"`
+				Description string         `json:"description"`
+				Images      []spotifyImage `json:"images"`
+				Tracks      struct {
+					Total int `json:"total"`
+				} `json:"tracks"`
+				Owner struct {
+					DisplayName string `json:"display_name"`
+				} `json:"owner"`
+			} `json:"items"`
+		} `json:"playlists"`
+	}
+	if err := p.searchInto(ctx, q, "playlist", opts.Limit, &page); err != nil {
+		return nil, err
+	}
+	playlists := make([]provider.Playlist, 0, len(page.Playlists.Items))
+	for _, item := range page.Playlists.Items {
+		if item.ID == "" || item.Name == "" {
+			continue
+		}
+		playlists = append(playlists, provider.Playlist{
+			ProviderPlaylistID: item.ID,
+			Title:              item.Name,
+			Owner:              item.Owner.DisplayName,
+			Description:        item.Description,
+			TrackCount:         item.Tracks.Total,
+			ArtworkURL:         bestImage(item.Images),
+		})
+	}
+	return playlists, nil
+}
+
+// Playlist implements provider.PlaylistSearcher.
+func (p *Provider) Playlist(ctx context.Context, providerPlaylistID string) (*provider.PlaylistDetail, error) {
+	var playlist struct {
+		ID          string         `json:"id"`
+		Name        string         `json:"name"`
+		Description string         `json:"description"`
+		Images      []spotifyImage `json:"images"`
+		Tracks      struct {
+			Total int `json:"total"`
+		} `json:"tracks"`
+		Owner struct {
+			DisplayName string `json:"display_name"`
+		} `json:"owner"`
+	}
+	if err := p.get(ctx, "/playlists/"+providerPlaylistID, &playlist); err != nil {
+		return nil, err
+	}
+
+	var page struct {
+		Items []struct {
+			Track struct {
+				ID         string `json:"id"`
+				Name       string `json:"name"`
+				DurationMs int64  `json:"duration_ms"`
+				Album      struct {
+					Name   string         `json:"name"`
+					Images []spotifyImage `json:"images"`
+				} `json:"album"`
+				Artists []struct {
+					Name string `json:"name"`
+				} `json:"artists"`
+			} `json:"track"`
+		} `json:"items"`
+	}
+	if err := p.get(ctx, "/playlists/"+providerPlaylistID+"/tracks?limit=100", &page); err != nil {
+		return nil, err
+	}
+
+	detail := &provider.PlaylistDetail{
+		Playlist: provider.Playlist{
+			ProviderPlaylistID: providerPlaylistID,
+			Title:              playlist.Name,
+			Owner:              playlist.Owner.DisplayName,
+			Description:        playlist.Description,
+			TrackCount:         playlist.Tracks.Total,
+			ArtworkURL:         bestImage(playlist.Images),
+		},
+		Tracks: make([]provider.Track, 0, len(page.Items)),
+	}
+	for _, entry := range page.Items {
+		item := entry.Track
+		if item.ID == "" {
+			continue // a local file or a removed track
+		}
+		artists := make([]string, 0, len(item.Artists))
+		for _, artist := range item.Artists {
+			if artist.Name != "" {
+				artists = append(artists, artist.Name)
+			}
+		}
+		artwork := bestImage(item.Album.Images)
+		if artwork == "" {
+			artwork = detail.ArtworkURL
+		}
+		detail.Tracks = append(detail.Tracks, provider.Track{
+			ProviderTrackID: item.ID,
+			Title:           item.Name,
+			Artists:         artists,
+			Album:           item.Album.Name,
+			DurationMs:      item.DurationMs,
+			ArtworkURL:      artwork,
+		})
+	}
+	return detail, nil
 }
 
 // Album implements provider.AlbumSearcher.
