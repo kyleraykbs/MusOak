@@ -1,0 +1,6 @@
+.go/
+result
+result-*
+dist/
+*.opus
+!testdata/**
