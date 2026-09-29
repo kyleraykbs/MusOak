@@ -128,7 +128,7 @@ the client; a missing file at the last location is not an error (defaults apply)
 | `listen` | `":8080"` | HTTP listen address (`prism serve` uses it too). |
 | `storageDir` | `$XDG_DATA_HOME/prismusic` | Database and `media/` live here. |
 | `requireLogin` | `false` | Reject anonymous requests outright. When false, anonymous callers are guests with read/playback access and no personal data. |
-| `registrationOpen` | `true` | Whether `/auth/register` accepts new accounts. |
+| `registrationOpen` | `true` | Whether `/auth/register` accepts new accounts. Passwords have no length rule beyond being non-empty: what makes guessing expensive is argon2id (64 MiB, 3 passes) plus `rateLimit.loginPerMinute`. |
 | `providers.ytmusic.enabled` | `true` | YouTube Music: search and download. |
 | `providers.spotify.enabled` | `false` | Spotify: metadata only (audio is DRM-protected). |
 | `providers.spotify.clientId` / `clientSecret` | `""` | Spotify application credentials. Keep the secret out of the Nix store; use `services.prismusicd.configFile`. |

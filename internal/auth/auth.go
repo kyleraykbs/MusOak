@@ -37,8 +37,10 @@ const (
 	argonSaltLen   = 16
 )
 
-// minPasswordLen is the shortest accepted password.
-const minPasswordLen = 8
+// minPasswordLen is the shortest accepted password. A password only has to be
+// non-empty: length policy belongs to whoever runs the server, and the cost of
+// guessing is argon2id plus the login rate limit, not a minimum.
+const minPasswordLen = 1
 
 var (
 	// ErrRegistrationClosed means registrationOpen is false.
@@ -232,7 +234,7 @@ func validateCredentials(username, password string) error {
 		return fmt.Errorf("%w: username must be 3-32 characters of letters, digits, dot, dash or underscore", ErrInvalidInput)
 	}
 	if len(password) < minPasswordLen {
-		return fmt.Errorf("%w: password must be at least %d characters", ErrInvalidInput, minPasswordLen)
+		return fmt.Errorf("%w: password is required", ErrInvalidInput)
 	}
 	return nil
 }

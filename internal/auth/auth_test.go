@@ -118,7 +118,7 @@ func TestRegisterValidation(t *testing.T) {
 	cases := map[string][2]string{
 		"username too short": {"ab", "hunter2hunter2"},
 		"username bad chars": {"not allowed!", "hunter2hunter2"},
-		"password too short": {"kyle", "short"},
+		"password empty":     {"kyle", ""},
 	}
 	for name, creds := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -126,6 +126,14 @@ func TestRegisterValidation(t *testing.T) {
 				t.Fatalf("err = %v, want ErrInvalidInput", err)
 			}
 		})
+	}
+
+	// Any non-empty password is accepted: one character is enough.
+	if _, _, err := svc.Register(ctx, "one-char", "x"); err != nil {
+		t.Fatalf("a one-character password was refused: %v", err)
+	}
+	if _, token, err := svc.Login(ctx, "one-char", "x"); err != nil || token == "" {
+		t.Fatalf("logging in with a one-character password: %v", err)
 	}
 
 	if _, _, err := svc.Register(ctx, "kyle", "hunter2hunter2"); err != nil {
