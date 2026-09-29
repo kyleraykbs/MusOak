@@ -1,9 +1,12 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"strings"
+
+	"github.com/google/uuid"
 
 	"codeberg.org/kyleraykbs/prismusic/internal/provider"
 )
@@ -22,6 +25,9 @@ type searchResponse struct {
 type searchGroup struct {
 	Track    trackResponse     `json:"track"`
 	Variants []variantResponse `json:"variants"`
+	// UserUpload marks a group of user-uploaded songs, which the response
+	// lists above provider results.
+	UserUpload bool `json:"userUpload,omitempty"`
 }
 
 // providerProblem reports one provider's failure without failing the search.
@@ -55,6 +61,14 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := searchResponse{Query: query, Groups: make([]searchGroup, 0, len(groups))}
+	// Matching user uploads surface above provider results: what the
+	// household uploaded itself comes first.
+	uploads, err := s.userUploadGroups(r.Context(), query, limit)
+	if err != nil {
+		writeStoreError(w, err, "search failed")
+		return
+	}
+	response.Groups = append(response.Groups, uploads...)
 	for _, group := range groups {
 		track, err := s.buildTrack(r.Context(), group.Track)
 		if err != nil {
@@ -75,6 +89,37 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+// userUploadGroups shapes the matching user uploads into search groups, one
+// per canonical track, so several uploads of the same song stay together.
+func (s *Server) userUploadGroups(ctx context.Context, query string, limit int) ([]searchGroup, error) {
+	uploads, err := s.store.SearchUploads(ctx, query, limit)
+	if err != nil || len(uploads) == 0 {
+		return nil, err
+	}
+
+	groups := make([]searchGroup, 0, len(uploads))
+	at := make(map[uuid.UUID]int, len(uploads))
+	for i := range uploads {
+		upload := &uploads[i]
+		slot, seen := at[upload.Variant.TrackID]
+		if !seen {
+			track, err := s.store.Track(ctx, upload.Variant.TrackID)
+			if err != nil {
+				return nil, err
+			}
+			built, err := s.buildTrack(ctx, *track)
+			if err != nil {
+				return nil, err
+			}
+			groups = append(groups, searchGroup{Track: built, UserUpload: true})
+			slot = len(groups) - 1
+			at[upload.Variant.TrackID] = slot
+		}
+		groups[slot].Variants = append(groups[slot].Variants, s.buildVariant(ctx, upload.Variant))
+	}
+	return groups, nil
 }
 
 // intParam reads a bounded integer query parameter.
