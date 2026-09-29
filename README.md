@@ -249,6 +249,32 @@ masters have different intros) and is always zero today. Discord voice needs its
 own library and a process outside this repository; the boundary is
 `pkg/client`.
 
+## Testing it yourself
+
+```sh
+nix develop                       # go, mpv, ffmpeg, yt-dlp, python3+ytmusicapi, curl, jq
+go test ./...                     # unit + integration (drives real mpv, real ffmpeg)
+go test -tags live ./internal/provider/ytmusic/   # downloads a real track from YT Music
+
+# Standalone: no daemon, the CLI runs its own server in-process.
+nix run .#prism -- search "Never Gonna Give You Up"
+nix run .#prism -- queue add 0
+PRISM_MPV_ARGS="--ao=null --no-video" nix run .#prism -- play   # headless playback
+
+# Server + client, then the whole REST API with curl.
+nix run .#prismusicd -- --config /tmp/config.json &
+scripts/api-smoke.sh http://127.0.0.1:8080        # 57 checks, exits non-zero on failure
+
+# Listen together with two clients (two terminals, separate cache dirs).
+prism room create --name party
+prism room queue add 0
+prism room join <room-id>          # plays along; the second client joins mid-track
+```
+
+The Nix packages are wrapped with the tooling they need, so `nix run` works from
+a bare shell. A binary built by hand needs `python3`+`ytmusicapi`, `yt-dlp`,
+`ffmpeg` and (for the CLI) `mpv` on `PATH`; the server logs what is missing.
+
 ## Development
 
 ```sh

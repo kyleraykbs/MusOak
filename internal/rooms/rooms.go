@@ -306,24 +306,39 @@ func (m *Manager) Get(roomID string) (*Snapshot, error) {
 	return m.snapshotLocked(room), nil
 }
 
-// Join adds a member (or refreshes an existing one) and returns the room.
+// Join adds a member (or refreshes an existing one) and returns the room. A
+// member arriving while a track is preparing or playing is given a rendition of
+// that track, so joining mid-track still means playing along.
 func (m *Manager) Join(roomID string, member Member) (*Snapshot, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	room, err := m.roomLocked(roomID)
 	if err != nil {
+		m.mu.Unlock()
 		return nil, err
 	}
-	if _, exists := room.members[member.ID]; !exists {
+	_, known := room.members[member.ID]
+	if !known {
 		room.order = append(room.order, member.ID)
 	}
 	member.JoinedAtMs = m.nowMsLocked()
 	room.members[member.ID] = &member
 
 	m.publishLocked(room, EventMemberJoined, map[string]any{"member": member})
+
+	var prepareItem string
+	if room.current != nil && room.current.variants[member.ID] == uuid.Nil {
+		prepareItem = room.current.item.ID
+	}
 	m.maybeStartLocked(room) // a new member must not block an already-ready room
-	return m.snapshotLocked(room), nil
+	snapshot := m.snapshotLocked(room)
+	m.mu.Unlock()
+
+	if prepareItem != "" {
+		// Assignment can need a provider search, so it happens off the lock.
+		go m.prepare(roomID, prepareItem)
+	}
+	return snapshot, nil
 }
 
 // Leave removes a member. A room without members is closed; a room without its

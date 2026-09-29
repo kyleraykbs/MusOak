@@ -416,6 +416,10 @@ func (a *App) cmdRoom(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
+		// The host is in the room too, so remember it like a join does.
+		if err := a.state.saveRoom(room.RoomID, room.MemberID); err != nil {
+			return err
+		}
 		a.printf("room %s (%s) created\n", room.RoomID, *controls)
 		return nil
 	case "join":
@@ -531,11 +535,11 @@ func (a *App) roomControl(ctx context.Context, args []string) error {
 
 // roomJoin follows a room with mpv until the context ends.
 func (a *App) roomJoin(ctx context.Context, roomID string) error {
-	if err := a.state.saveRoom(roomID); err != nil {
-		return err
-	}
 	room, err := a.client.JoinRoom(ctx, roomID)
 	if err != nil {
+		return err
+	}
+	if err := a.state.saveRoom(roomID, room.MemberID); err != nil {
 		return err
 	}
 

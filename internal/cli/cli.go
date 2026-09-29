@@ -54,7 +54,7 @@ func New(cfg *config.Config, logger *slog.Logger, out io.Writer) (*App, error) {
 
 	app := &App{cfg: cfg, logger: logger, cache: cache, state: state, out: out}
 	if serverURL := strings.TrimSpace(cfg.Client.ServerURL); serverURL != "" {
-		app.client = client.New(serverURL, client.WithToken(state.Token))
+		app.client = client.New(serverURL, client.WithToken(state.Token), client.WithMemberID(state.MemberID))
 		return app, nil
 	}
 
@@ -63,7 +63,7 @@ func New(cfg *config.Config, logger *slog.Logger, out io.Writer) (*App, error) {
 		return nil, err
 	}
 	app.embedded = embedded
-	app.client = client.New("http://"+embedded.addr, client.WithToken(state.Token))
+	app.client = client.New("http://"+embedded.addr, client.WithToken(state.Token), client.WithMemberID(state.MemberID))
 	logger.Debug("prism: running its own server", "address", embedded.addr)
 	return app, nil
 }
@@ -197,13 +197,20 @@ type sessionState struct {
 	LastSearch []queueItem `json:"lastSearch,omitempty"`
 	// RoomID is the room this client last joined.
 	RoomID string `json:"roomId,omitempty"`
+	// MemberID is this client's room identity as a guest. Persisting it keeps
+	// "prism room create" and a later "prism room join" the same member instead
+	// of two.
+	MemberID string `json:"memberId,omitempty"`
 
 	path string
 }
 
-// saveRoom records the room to rejoin.
-func (s *sessionState) saveRoom(roomID string) error {
+// saveRoom records the room to rejoin and the member identity used for it.
+func (s *sessionState) saveRoom(roomID, memberID string) error {
 	s.RoomID = roomID
+	if memberID != "" && s.Token == "" {
+		s.MemberID = memberID
+	}
 	return s.save()
 }
 

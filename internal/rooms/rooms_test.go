@@ -568,6 +568,70 @@ func TestHostOnlyControls(t *testing.T) {
 	}
 }
 
+func TestJoiningDuringPlaybackAssignsARendition(t *testing.T) {
+	f := newFixture(t, nil)
+	ctx := context.Background()
+
+	track, variants := f.trackWithVariants("Song",
+		variantSpec{provider: "local", providerTrackID: "a", durationMs: 300_000, downloadable: true},
+	)
+
+	snapshot, err := f.m.Create("party", ControlsEveryone, Member{ID: "host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.m.Enqueue(ctx, snapshot.ID, "host", track.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.m.Ready(snapshot.ID, "host", track.ID, variants[0].ID, 300_000); err != nil {
+		t.Fatal(err)
+	}
+	if current := f.current(f.get(snapshot.ID)); current.StartedAtMs == 0 {
+		t.Fatal("the track did not start for the host alone")
+	}
+
+	// A member that arrives while the track plays must still be told what to
+	// play, rather than sitting in the room with nothing assigned.
+	events, cancel := f.m.Subscribe()
+	defer cancel()
+
+	if _, err := f.m.Join(snapshot.ID, Member{ID: "late"}); err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case event := <-events:
+			if event.Type != EventTrackPrepared {
+				continue
+			}
+			data, ok := event.Data.(map[string]any)
+			if !ok {
+				continue
+			}
+			assignments, ok := data["variants"].(map[string]uuid.UUID)
+			if !ok {
+				t.Fatalf("track_prepared carried %T, want map[string]uuid.UUID", data["variants"])
+			}
+			assigned, ok := assignments["late"]
+			if !ok {
+				continue // an earlier prepare for the other members
+			}
+			if assigned != variants[0].ID {
+				t.Fatalf("late joiner was assigned %s, want %s", assigned, variants[0].ID)
+			}
+			current := f.current(f.get(snapshot.ID))
+			if current.Variants["late"] != assigned.String() {
+				t.Errorf("the room does not show the late joiner's rendition: %+v", current.Variants)
+			}
+			return
+		case <-deadline:
+			t.Fatal("the late joiner never received a rendition assignment")
+		}
+	}
+}
+
 func TestRoomClosesWhenEverybodyLeaves(t *testing.T) {
 	f := newFixture(t, nil)
 

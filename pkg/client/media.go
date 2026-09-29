@@ -295,8 +295,24 @@ func (p *Participant) prepare(ctx context.Context, data TrackPrepared) error {
 	entry.TrackID = data.Item.TrackID
 	p.remember(data.Item.TrackID, entry)
 
-	_, err = p.room.Ready(ctx, data.Item.TrackID, entry.VariantID, entry.DurationMs)
-	return err
+	if _, err := p.room.Ready(ctx, data.Item.TrackID, entry.VariantID, entry.DurationMs); err != nil {
+		return err
+	}
+
+	// If the room is already playing this track — we joined late, or the server
+	// assigned our rendition after the start — play from the room position.
+	if snapshot, err := p.room.Snapshot(ctx); err == nil && snapshot.Current != nil {
+		current := snapshot.Current
+		if current.Item.TrackID == data.Item.TrackID && current.StartedAtMs != 0 {
+			p.mu.Lock()
+			alreadyPlaying := p.playback != nil && p.playback.trackID == data.Item.TrackID
+			p.mu.Unlock()
+			if !alreadyPlaying {
+				p.adoptSnapshot(ctx, snapshot)
+			}
+		}
+	}
+	return nil
 }
 
 func (p *Participant) start(ctx context.Context, started TrackStarted) error {
