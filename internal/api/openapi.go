@@ -72,6 +72,7 @@ func (s *Server) routeTable() []route {
 		{"GET /api/v1/me/playlists/{playlistId}", s.handlePlaylistGet},
 		{"PATCH /api/v1/me/playlists/{playlistId}", s.handlePlaylistRename},
 		{"DELETE /api/v1/me/playlists/{playlistId}", s.handlePlaylistDelete},
+		{"PUT /api/v1/me/playlists/{playlistId}/artwork", s.handlePlaylistArtwork},
 		{"POST /api/v1/me/playlists/{playlistId}/items", s.handlePlaylistAdd},
 		{"DELETE /api/v1/me/playlists/{playlistId}/items/{position}", s.handlePlaylistRemove},
 		{"POST /api/v1/me/playlists/{playlistId}/reorder", s.handlePlaylistReorder},

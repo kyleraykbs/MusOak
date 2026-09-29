@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
@@ -120,7 +121,16 @@ func (d *DB) EntityArtwork(ctx context.Context, kind ArtworkKind, id uuid.UUID) 
 	case ArtworkArtist:
 		return d.ArtistArtwork(ctx, id)
 	case ArtworkPlaylist:
-		return d.ExternalPlaylistArtwork(ctx, id)
+		// A provider playlist first, then one of our own: the ids are UUIDs
+		// from different tables, so only one of them can match.
+		url, err := d.ExternalPlaylistArtwork(ctx, id)
+		if err == nil {
+			return url, nil
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return "", err
+		}
+		return d.artworkOf(ctx, "playlists", id)
 	}
 	return "", ErrNotFound
 }

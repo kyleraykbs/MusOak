@@ -38,13 +38,22 @@ CREATE TABLE playlist_items (
 CREATE INDEX playlist_items_track_id ON playlist_items(track_id);
 `
 
+// schemaV8 gives a user's playlist a cover of its own, uploaded rather than
+// fetched from a provider.
+const schemaV8 = `
+ALTER TABLE playlists ADD COLUMN artwork_url TEXT NOT NULL DEFAULT '';
+`
+
 // Playlist is one user's ordered list of tracks.
 type Playlist struct {
-	ID        uuid.UUID
-	UserID    uuid.UUID
-	Name      string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID     uuid.UUID
+	UserID uuid.UUID
+	Name   string
+	// ArtworkURL is where the playlist's own cover comes from. An uploaded one
+	// is recorded as "upload:<id>", which the artwork cache serves directly.
+	ArtworkURL string
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 	// TrackCount is filled in by PlaylistsForUser, so a listing needs no
 	// second query per playlist.
 	TrackCount int
@@ -57,8 +66,18 @@ type PlaylistItem struct {
 	AddedAt  time.Time
 }
 
+// SetPlaylistArtwork records where a playlist's cover comes from.
+func (d *DB) SetPlaylistArtwork(ctx context.Context, id uuid.UUID, url string) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE playlists SET artwork_url = ?, updated_at = ? WHERE id = ?`,
+		url, time.Now().UnixMilli(), id.String())
+	return mapErr(err)
+}
+
 // PlaylistRepo stores user playlists.
 type PlaylistRepo interface {
+	// SetPlaylistArtwork records the source of a playlist's own cover.
+	SetPlaylistArtwork(ctx context.Context, id uuid.UUID, url string) error
 	CreatePlaylist(ctx context.Context, p *Playlist) error
 	// Playlist returns a playlist; ErrNotFound covers both "missing" and
 	// "belongs to somebody else".
@@ -99,8 +118,9 @@ func (d *DB) Playlist(ctx context.Context, id uuid.UUID) (*Playlist, error) {
 		created, updated int64
 	)
 	err := d.db.QueryRowContext(ctx, `
-		SELECT id, user_id, name, created_at, updated_at FROM playlists WHERE id = ?`, id.String()).
-		Scan(&idStr, &userID, &playlist.Name, &created, &updated)
+		SELECT id, user_id, name, artwork_url, created_at, updated_at
+		  FROM playlists WHERE id = ?`, id.String()).
+		Scan(&idStr, &userID, &playlist.Name, &playlist.ArtworkURL, &created, &updated)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -118,7 +138,7 @@ func (d *DB) Playlist(ctx context.Context, id uuid.UUID) (*Playlist, error) {
 // PlaylistsForUser lists a user's playlists, newest first, with track counts.
 func (d *DB) PlaylistsForUser(ctx context.Context, userID uuid.UUID) ([]Playlist, error) {
 	rows, err := d.db.QueryContext(ctx, `
-		SELECT p.id, p.user_id, p.name, p.created_at, p.updated_at,
+		SELECT p.id, p.user_id, p.name, p.artwork_url, p.created_at, p.updated_at,
 		       (SELECT COUNT(*) FROM playlist_items i WHERE i.playlist_id = p.id)
 		FROM playlists p
 		WHERE p.user_id = ?
@@ -135,7 +155,8 @@ func (d *DB) PlaylistsForUser(ctx context.Context, userID uuid.UUID) ([]Playlist
 			idStr, userIDStr string
 			created, updated int64
 		)
-		if err := rows.Scan(&idStr, &userIDStr, &playlist.Name, &created, &updated, &playlist.TrackCount); err != nil {
+		if err := rows.Scan(&idStr, &userIDStr, &playlist.Name, &playlist.ArtworkURL,
+			&created, &updated, &playlist.TrackCount); err != nil {
 			return nil, mapErr(err)
 		}
 		var err2 error

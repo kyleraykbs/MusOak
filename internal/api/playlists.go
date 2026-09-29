@@ -1,12 +1,14 @@
 package api
 
 import (
+	"encoding/base64"
 	"errors"
 	"net/http"
 	"strings"
 
 	"github.com/google/uuid"
 
+	"codeberg.org/kyleraykbs/prismusic/internal/artwork"
 	"codeberg.org/kyleraykbs/prismusic/internal/store"
 )
 
@@ -14,9 +16,18 @@ type playlistResponse struct {
 	ID         string          `json:"id"`
 	Name       string          `json:"name"`
 	TrackCount int             `json:"trackCount"`
+	ArtworkURL string          `json:"artworkUrl,omitempty"`
 	CreatedAt  string          `json:"createdAt"`
 	UpdatedAt  string          `json:"updatedAt"`
 	Tracks     []trackResponse `json:"tracks,omitempty"`
+}
+
+// playlistArtworkRequest is an image, base64, with the type it claims to be.
+// A JSON body keeps the upload to the endpoints already here rather than
+// adding multipart parsing for one feature.
+type playlistArtworkRequest struct {
+	Data        string `json:"data"`
+	ContentType string `json:"contentType"`
 }
 
 type playlistItemResponse struct {
@@ -70,14 +81,81 @@ func (s *Server) ownedPlaylist(w http.ResponseWriter, r *http.Request, userID uu
 }
 
 func playlistSummary(playlist *store.Playlist) playlistResponse {
-	return playlistResponse{
+	response := playlistResponse{
 		ID:         playlist.ID.String(),
 		Name:       playlist.Name,
 		TrackCount: playlist.TrackCount,
 		CreatedAt:  playlist.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
 		UpdatedAt:  playlist.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
 	}
+	if playlist.ArtworkURL != "" {
+		response.ArtworkURL = artworkPath(store.ArtworkPlaylist, playlist.ID)
+	}
+	return response
 }
+
+// handlePlaylistArtwork stores a cover for one of the caller's playlists.
+//
+// The image is written where the artwork cache would have put it, and the
+// playlist records "upload:<id>" as its source, so serving it later needs no
+// network and no second copy.
+func (s *Server) handlePlaylistArtwork(w http.ResponseWriter, r *http.Request) {
+	user, ok := s.requireUser(w, r)
+	if !ok {
+		return
+	}
+	playlist, ok := s.ownedPlaylist(w, r, user.ID)
+	if !ok {
+		return
+	}
+	var req playlistArtworkRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	contentType := artwork.ContentType(req.ContentType)
+	extension, known := artwork.ExtensionFor(contentType)
+	if !known {
+		writeError(w, http.StatusBadRequest, "an image is needed: png, jpeg, webp, gif or avif")
+		return
+	}
+	data, err := base64.StdEncoding.DecodeString(req.Data)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "data must be base64")
+		return
+	}
+	if len(data) == 0 {
+		writeError(w, http.StatusBadRequest, "the image is empty")
+		return
+	}
+	if len(data) > maxArtworkBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "the image is too large")
+		return
+	}
+
+	source := uploadSource(playlist.ID)
+	if err := s.artwork.Store(source, data, extension); err != nil {
+		writeStoreError(w, err, "the cover could not be stored")
+		return
+	}
+	if err := s.store.SetPlaylistArtwork(r.Context(), playlist.ID, source); err != nil {
+		writeStoreError(w, err, "the cover could not be recorded")
+		return
+	}
+
+	updated, err := s.store.Playlist(r.Context(), playlist.ID)
+	if err != nil {
+		writeStoreError(w, err, "the cover could not be recorded")
+		return
+	}
+	writeJSON(w, http.StatusOK, playlistSummary(updated))
+}
+
+// uploadSource is the pseudo-URL an uploaded cover is cached under.
+func uploadSource(id uuid.UUID) string { return "upload:" + id.String() }
+
+// maxArtworkBytes bounds an upload; the cache's own limit is for downloads.
+const maxArtworkBytes = 8 << 20
 
 // handlePlaylistList lists the caller's playlists.
 func (s *Server) handlePlaylistList(w http.ResponseWriter, r *http.Request) {

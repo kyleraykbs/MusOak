@@ -109,6 +109,52 @@ func (f *Fetcher) Fetch(ctx context.Context, kind store.ArtworkKind, id uuid.UUI
 	return value.(*Item), nil
 }
 
+// ContentType normalises what a client claims an image is.
+func ContentType(value string) string { return normalizeContentType(value) }
+
+// ExtensionFor reports the file suffix an accepted image type is stored under,
+// and whether the type is one this server serves.
+func ExtensionFor(contentType string) (string, bool) { return extensionFor(contentType) }
+
+// Store writes an image for a source that is not fetched from anywhere, which
+// is what an uploaded cover is. It lands where the cache would have put it, so
+// serving it later is the same code path as any other cover.
+func (f *Fetcher) Store(source string, data []byte, extension string) error {
+	if source == "" || len(data) == 0 {
+		return errors.New("artwork: nothing to store")
+	}
+	// The cache directory is created on first use, as it is for a download.
+	if err := os.MkdirAll(f.dir, 0o755); err != nil {
+		return err
+	}
+	sum := sha256.Sum256([]byte(source))
+	path := filepath.Join(f.dir, hex.EncodeToString(sum[:])+extension)
+
+	tmp, err := os.CreateTemp(f.dir, "upload-*")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = os.Remove(tmp.Name())
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	// Old files under another extension would win over this one.
+	for _, ext := range contentTypes {
+		_ = os.Remove(filepath.Join(f.dir, hex.EncodeToString(sum[:])+ext))
+	}
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return err
+	}
+	f.logger.Info("artwork stored", "source", source, "bytes", len(data))
+	return nil
+}
+
 // cached returns the image for a source URL, downloading it on first use.
 func (f *Fetcher) cached(ctx context.Context, source string) (*Item, error) {
 	sum := sha256.Sum256([]byte(source))

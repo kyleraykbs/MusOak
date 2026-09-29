@@ -570,6 +570,40 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /api/v1/me/playlists/{playlistId}/artwork:
+    put:
+      tags: [playlists]
+      summary: Set a playlist's cover
+      description: |
+        Stores an image as the cover of one of the caller's playlists, replacing
+        any it had. The image is kept where other artwork is cached, so serving
+        it afterwards is the same path as any other cover, and the playlist's
+        `artworkUrl` points at it.
+      operationId: setPlaylistArtwork
+      parameters: [{ $ref: "#/components/parameters/PlaylistID" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PlaylistArtwork" }
+      responses:
+        "200":
+          description: The playlist, with its new cover.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Playlist" }
+        "400":
+          description: The image is empty, not base64, or not a type this serves.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "413":
+          description: The image is larger than the limit.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /api/v1/me/playlists/{playlistId}/reorder:
     post:
       tags: [auth]
@@ -1478,6 +1512,17 @@ components:
           type: array
           items: { $ref: "#/components/schemas/ProviderProblem" }
 
+    PlaylistArtwork:
+      type: object
+      required: [data, contentType]
+      properties:
+        data:
+          type: string
+          description: The image, base64 encoded.
+        contentType:
+          type: string
+          description: One of image/png, image/jpeg, image/webp, image/gif, image/avif.
+
     Album:
       type: object
       required: [id, title, artists, trackCount, providers]
@@ -1590,6 +1635,11 @@ components:
         id: { type: string, format: uuid }
         name: { type: string }
         trackCount: { type: integer }
+        artworkUrl:
+          type: string
+          description: |
+            Path on this server for the playlist's cover, when it has one:
+            either the image that was uploaded for it.
         createdAt: { type: string, format: date-time }
         updatedAt: { type: string, format: date-time }
 

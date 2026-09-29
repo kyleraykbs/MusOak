@@ -199,3 +199,90 @@ func TestPlaylistSyncOnAnUnknownPlaylist(t *testing.T) {
 func artworkPathOf(playlistID string) string {
 	return "/api/v1/artwork/playlist/" + playlistID
 }
+
+func TestUploadingAPlaylistCover(t *testing.T) {
+	c := newHTTPTestServer(t, nil)
+	token := c.register("kyle", "hunter2hunter2")
+
+	rec := c.do(http.MethodPost, "/api/v1/me/playlists", token, map[string]string{"name": "With a cover"})
+	if rec.Code != http.StatusCreated && rec.Code != http.StatusOK {
+		t.Fatalf("create playlist = %d: %s", rec.Code, rec.Body.String())
+	}
+	var created playlistResponse
+	c.decode(rec, &created)
+	if created.ArtworkURL != "" {
+		t.Fatalf("a new playlist has no cover yet: %q", created.ArtworkURL)
+	}
+
+	// A one-pixel PNG, which is a real image and small enough to be silly.
+	const pixel = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+	rec = c.do(http.MethodPut, "/api/v1/me/playlists/"+created.ID+"/artwork", token,
+		map[string]string{"data": pixel, "contentType": "image/png"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upload = %d: %s", rec.Code, rec.Body.String())
+	}
+	var updated playlistResponse
+	c.decode(rec, &updated)
+	if updated.ArtworkURL == "" {
+		t.Fatal("the playlist does not point at its new cover")
+	}
+
+	// The playlist lists with the cover, and the image itself is served.
+	rec = c.do(http.MethodGet, "/api/v1/me/playlists", token, nil)
+	var listed struct {
+		Playlists []playlistResponse `json:"playlists"`
+	}
+	c.decode(rec, &listed)
+	if len(listed.Playlists) != 1 || listed.Playlists[0].ArtworkURL == "" {
+		t.Fatalf("playlists = %+v", listed.Playlists)
+	}
+
+	rec = c.do(http.MethodGet, updated.ArtworkURL, "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("artwork = %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); got != "image/png" {
+		t.Errorf("content type = %q", got)
+	}
+	if rec.Body.Len() == 0 {
+		t.Error("the stored image is empty")
+	}
+}
+
+func TestAnUploadMustBeAnImage(t *testing.T) {
+	c := newHTTPTestServer(t, nil)
+	token := c.register("kyle", "hunter2hunter2")
+	rec := c.do(http.MethodPost, "/api/v1/me/playlists", token, map[string]string{"name": "Coverless"})
+	var created playlistResponse
+	c.decode(rec, &created)
+
+	cases := map[string]map[string]string{
+		"not an image": {"data": "aGVsbG8=", "contentType": "text/plain"},
+		"not base64":   {"data": "not base64!!", "contentType": "image/png"},
+		"empty":        {"data": "", "contentType": "image/png"},
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			rec := c.do(http.MethodPut, "/api/v1/me/playlists/"+created.ID+"/artwork", token, body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestAnotherUsersPlaylistCoverCannotBeSet(t *testing.T) {
+	c := newHTTPTestServer(t, nil)
+	owner := c.register("owner", "hunter2hunter2")
+	other := c.register("other", "hunter2hunter2")
+
+	rec := c.do(http.MethodPost, "/api/v1/me/playlists", owner, map[string]string{"name": "Mine"})
+	var created playlistResponse
+	c.decode(rec, &created)
+
+	rec = c.do(http.MethodPut, "/api/v1/me/playlists/"+created.ID+"/artwork", other,
+		map[string]string{"data": "aGVsbG8=", "contentType": "image/png"})
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
