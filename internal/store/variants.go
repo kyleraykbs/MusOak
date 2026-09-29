@@ -154,6 +154,29 @@ func (d *DB) MediaFile(ctx context.Context, variantID uuid.UUID) (*MediaFile, er
 	return &m, nil
 }
 
+// MediaFileBySHA256 finds a finished file by content hash; it is how imports
+// recognise content they already have.
+func (d *DB) MediaFileBySHA256(ctx context.Context, sha256 string) (*MediaFile, error) {
+	var (
+		m        MediaFile
+		variant  string
+		downedAt int64
+	)
+	err := d.db.QueryRowContext(ctx, `
+		SELECT variant_id, path, sha256, duration_ms, bytes, downloaded_at
+		FROM media_files WHERE sha256 = ? LIMIT 1`, sha256).
+		Scan(&variant, &m.Path, &m.SHA256, &m.DurationMs, &m.Bytes, &downedAt)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	var err2 error
+	if m.VariantID, err2 = parseUUID(variant); err2 != nil {
+		return nil, err2
+	}
+	m.DownloadedAt = time.UnixMilli(downedAt).UTC()
+	return &m, nil
+}
+
 // DeleteMediaFile forgets the file record for a variant.
 func (d *DB) DeleteMediaFile(ctx context.Context, variantID uuid.UUID) error {
 	res, err := d.db.ExecContext(ctx,

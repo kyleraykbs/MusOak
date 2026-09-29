@@ -8,13 +8,16 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"codeberg.org/kyleraykbs/prismusic/internal/config"
+	"codeberg.org/kyleraykbs/prismusic/internal/media"
 	"codeberg.org/kyleraykbs/prismusic/internal/provider"
 	"codeberg.org/kyleraykbs/prismusic/internal/provider/ytmusic"
+	"codeberg.org/kyleraykbs/prismusic/internal/store"
 )
 
 // ShutdownTimeout bounds graceful shutdown after the context is cancelled.
@@ -29,21 +32,40 @@ type Server struct {
 	cfg       *config.Config
 	logger    *slog.Logger
 	mux       *http.ServeMux
+	store     *store.DB
 	providers *provider.Registry
+	media     *media.Manager
 }
 
-// New builds the server and the enabled providers.
+// New builds the server: it opens the store and instantiates the enabled
+// providers and the media pipeline.
 func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
+	db, err := store.Open(filepath.Join(cfg.StorageDir, "prismusic.db"))
+	if err != nil {
+		return nil, err
+	}
+
 	s := &Server{
 		cfg:       cfg,
 		logger:    logger,
 		mux:       http.NewServeMux(),
+		store:     db,
 		providers: provider.NewRegistry(logger, ProviderTimeout),
 	}
+	s.media = media.New(filepath.Join(cfg.StorageDir, "media"), db, s.providers, logger)
+
 	s.registerProviders()
 	s.logProviderDeps()
 	s.routes()
 	return s, nil
+}
+
+// Close releases the server's resources.
+func (s *Server) Close() error {
+	if s.store == nil {
+		return nil
+	}
+	return s.store.Close()
 }
 
 // registerProviders instantiates every provider the configuration enables.
@@ -82,6 +104,8 @@ func (s *Server) Handler() http.Handler { return s.mux }
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
+	s.mux.HandleFunc("GET /api/v1/media/{variantId}", s.handleMediaFile)
+	s.mux.HandleFunc("GET /api/v1/media/{variantId}/status", s.handleMediaStatus)
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {

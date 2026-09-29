@@ -116,6 +116,7 @@ type VariantRepo interface {
 type MediaRepo interface {
 	UpsertMediaFile(ctx context.Context, m *MediaFile) error
 	MediaFile(ctx context.Context, variantID uuid.UUID) (*MediaFile, error)
+	MediaFileBySHA256(ctx context.Context, sha256 string) (*MediaFile, error)
 	DeleteMediaFile(ctx context.Context, variantID uuid.UUID) error
 	MediaFiles(ctx context.Context) ([]MediaFile, error)
 }

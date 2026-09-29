@@ -30,6 +30,11 @@ func main() {
 		logger.Error("startup failed", "error", err)
 		os.Exit(1)
 	}
+	defer func() {
+		if err := server.Close(); err != nil {
+			logger.Error("close failed", "error", err)
+		}
+	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
