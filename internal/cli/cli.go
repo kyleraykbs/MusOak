@@ -99,6 +99,12 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return a.cmdFavorites(ctx, rest)
 	case "playlist", "playlists":
 		return a.cmdPlaylist(ctx, rest)
+	case "radio":
+		return a.cmdRadio(ctx, rest)
+	case "album", "albums":
+		return a.cmdAlbum(ctx, rest)
+	case "artist", "artists":
+		return a.cmdArtist(ctx, rest)
 	case "providers":
 		return a.cmdProviders(ctx, rest)
 	case "login":
@@ -133,6 +139,9 @@ Usage:
   prism library import <file|dir>      add local files to the library
   prism fav add|list|rm <track-id|index>
   prism playlist create|list|show|add|rm|reorder|rename|delete|queue|play
+  prism radio <track-id|index>         station from a song, e.g. --providers ytmusic --play
+  prism album search|show|sync|queue|play <...>     albums, with sync between sources
+  prism artist search|show|sync <...>               artists, with sync between sources
   prism providers                      list providers
   prism providers rank <a,b,c>         set your provider preference
   prism login <username> [--register]  log in (password on stdin or --password)
@@ -204,6 +213,10 @@ type sessionState struct {
 	// "prism room create" and a later "prism room join" the same member instead
 	// of two.
 	MemberID string `json:"memberId,omitempty"`
+	// LastAlbums and LastArtists are the previous collection searches, so an
+	// index works there like it does for tracks.
+	LastAlbums  []queueItem `json:"lastAlbums,omitempty"`
+	LastArtists []queueItem `json:"lastArtists,omitempty"`
 
 	path string
 }

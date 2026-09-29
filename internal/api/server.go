@@ -16,11 +16,13 @@ import (
 
 	"codeberg.org/kyleraykbs/prismusic/internal/auth"
 	"codeberg.org/kyleraykbs/prismusic/internal/config"
+	"codeberg.org/kyleraykbs/prismusic/internal/library"
 	"codeberg.org/kyleraykbs/prismusic/internal/match"
 	"codeberg.org/kyleraykbs/prismusic/internal/media"
 	"codeberg.org/kyleraykbs/prismusic/internal/provider"
 	"codeberg.org/kyleraykbs/prismusic/internal/provider/spotify"
 	"codeberg.org/kyleraykbs/prismusic/internal/provider/ytmusic"
+	"codeberg.org/kyleraykbs/prismusic/internal/radio"
 	"codeberg.org/kyleraykbs/prismusic/internal/ranking"
 	"codeberg.org/kyleraykbs/prismusic/internal/rooms"
 	"codeberg.org/kyleraykbs/prismusic/internal/store"
@@ -45,6 +47,8 @@ type Server struct {
 	auth      *auth.Service
 	ranking   *ranking.Service
 	rooms     *rooms.Manager
+	radio     *radio.Service
+	library   *library.Service
 
 	searchLimiter *limiter
 	loginLimiter  *limiter
@@ -71,6 +75,8 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 	s.auth = auth.New(cfg, db, logger)
 	s.ranking = ranking.New(db, cfg.DefaultProviderOrder, logger)
 	s.rooms = rooms.NewManager(cfg, db, s.matcher, s.ranking, logger)
+	s.radio = radio.New(db, s.providers, s.matcher, logger)
+	s.library = library.New(db, s.providers, s.matcher, logger)
 
 	// One search burst may be as wide as a handful of keystrokes; login bursts
 	// stay tight because each attempt costs an argon2id hash.

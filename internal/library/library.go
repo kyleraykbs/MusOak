@@ -1,0 +1,432 @@
+// Package library browses and synchronises the collections that sit above
+// tracks: albums and artists, each of which exists once canonically while its
+// provider releases hang off it as variants.
+//
+// Synchronising means going the other way from a provider: fetching a release's
+// tracklist, matching every track into the canonical library, and attaching the
+// result to the album. That is what makes an album from one source playable
+// through the renditions of another.
+package library
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
+
+	"github.com/google/uuid"
+
+	"codeberg.org/kyleraykbs/prismusic/internal/match"
+	"codeberg.org/kyleraykbs/prismusic/internal/provider"
+	"codeberg.org/kyleraykbs/prismusic/internal/store"
+)
+
+// maxProviderAlbums bounds how many albums one artist sync will pull, so a
+// prolific artist cannot turn a single request into hundreds.
+const maxProviderAlbums = 50
+
+// Errors.
+var (
+	// ErrNoAlbum means the album does not exist.
+	ErrNoAlbum = errors.New("album not found")
+	// ErrNoArtist means the artist does not exist.
+	ErrNoArtist = errors.New("artist not found")
+	// ErrNoSources means the collection has no provider release to sync from.
+	ErrNoSources = errors.New("nothing to sync from: search for it on a provider first")
+)
+
+// ProviderError is one provider's failure during a browse or a sync; the rest
+// of the work still stands.
+type ProviderError struct {
+	Provider string
+	Error    string
+}
+
+// Store is the repository slice the library needs.
+type Store interface {
+	store.TrackRepo
+	store.VariantRepo
+	store.AlbumRepo
+	store.ArtistRepo
+}
+
+// Service browses and syncs albums and artists.
+type Service struct {
+	db        Store
+	providers *provider.Registry
+	matcher   *match.Matcher
+	logger    *slog.Logger
+}
+
+// New returns the service.
+func New(db Store, providers *provider.Registry, matcher *match.Matcher, logger *slog.Logger) *Service {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &Service{db: db, providers: providers, matcher: matcher, logger: logger}
+}
+
+// Album is an album with everything a caller needs to show it.
+type Album struct {
+	Album    store.Album
+	Artists  []store.Artist
+	Variants []store.AlbumVariant
+	Tracks   []store.Track
+	// TrackArtists is the credit list per track, in the same order as Tracks.
+	TrackArtists [][]store.Artist
+}
+
+// Artist is an artist with their provider pages and albums.
+type Artist struct {
+	Artist   store.Artist
+	Variants []store.ArtistVariant
+	Albums   []store.Album
+}
+
+// SyncResult reports what a sync did.
+type SyncResult struct {
+	AlbumID   uuid.UUID
+	Providers []string
+	Added     int
+	Tracks    []store.Track
+	Errors    []ProviderError
+}
+
+// ArtistSyncResult reports what an artist sync did.
+type ArtistSyncResult struct {
+	ArtistID  uuid.UUID
+	Providers []string
+	Albums    []store.Album
+	Added     int
+	Errors    []ProviderError
+}
+
+// SearchAlbums fans out to the album-capable providers and matches every hit
+// into the canonical library, so the same record from two sources is one album.
+func (s *Service) SearchAlbums(ctx context.Context, query string, limit int) ([]store.Album, []ProviderError, error) {
+	results := s.providers.SearchAlbums(ctx, query, provider.SearchOpts{Limit: limit})
+
+	var (
+		albums   []store.Album
+		seen     = map[uuid.UUID]bool{}
+		problems []ProviderError
+	)
+	for _, result := range results {
+		if result.Err != nil {
+			if result.IsSearchable() {
+				problems = append(problems, ProviderError{Provider: result.Provider, Error: result.Err.Error()})
+			}
+			continue
+		}
+		for _, hit := range result.Albums {
+			album, _, _, err := s.matcher.MatchAlbum(ctx, result.Provider, hit)
+			if err != nil {
+				return nil, problems, fmt.Errorf("match %s/%s: %w", result.Provider, hit.ProviderAlbumID, err)
+			}
+			if seen[album.ID] {
+				continue
+			}
+			seen[album.ID] = true
+			albums = append(albums, *album)
+		}
+	}
+	return albums, problems, nil
+}
+
+// SearchArtists fans out to the artist-capable providers.
+func (s *Service) SearchArtists(ctx context.Context, query string, limit int) ([]store.Artist, []ProviderError, error) {
+	results := s.providers.SearchArtists(ctx, query, provider.SearchOpts{Limit: limit})
+
+	var (
+		artists  []store.Artist
+		seen     = map[uuid.UUID]bool{}
+		problems []ProviderError
+	)
+	for _, result := range results {
+		if result.Err != nil {
+			if result.IsSearchable() {
+				problems = append(problems, ProviderError{Provider: result.Provider, Error: result.Err.Error()})
+			}
+			continue
+		}
+		for _, hit := range result.Artists {
+			artist, _, _, err := s.matcher.MatchArtist(ctx, result.Provider, hit)
+			if err != nil {
+				return nil, problems, fmt.Errorf("match %s/%s: %w", result.Provider, hit.ProviderArtistID, err)
+			}
+			if seen[artist.ID] {
+				continue
+			}
+			seen[artist.ID] = true
+			artists = append(artists, *artist)
+		}
+	}
+	return artists, problems, nil
+}
+
+// GetAlbum loads an album with its credits, releases and tracks.
+func (s *Service) GetAlbum(ctx context.Context, albumID uuid.UUID) (*Album, error) {
+	stored, err := s.db.Album(ctx, albumID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, fmt.Errorf("%w: %s", ErrNoAlbum, albumID)
+		}
+		return nil, err
+	}
+
+	out := &Album{Album: *stored}
+	if out.Artists, err = s.db.AlbumArtists(ctx, albumID); err != nil {
+		return nil, err
+	}
+	if out.Variants, err = s.db.AlbumVariants(ctx, albumID); err != nil {
+		return nil, err
+	}
+	if out.Tracks, err = s.db.AlbumTracks(ctx, albumID); err != nil {
+		return nil, err
+	}
+	for _, track := range out.Tracks {
+		artists, err := s.db.TrackArtists(ctx, track.ID)
+		if err != nil {
+			return nil, err
+		}
+		out.TrackArtists = append(out.TrackArtists, artists)
+	}
+	return out, nil
+}
+
+// GetArtist loads an artist with their provider pages and albums.
+func (s *Service) GetArtist(ctx context.Context, artistID uuid.UUID) (*Artist, error) {
+	stored, err := s.db.Artist(ctx, artistID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, fmt.Errorf("%w: %s", ErrNoArtist, artistID)
+		}
+		return nil, err
+	}
+
+	out := &Artist{Artist: *stored}
+	if out.Variants, err = s.db.ArtistVariants(ctx, artistID); err != nil {
+		return nil, err
+	}
+	if out.Albums, err = s.db.AlbumsForArtist(ctx, artistID); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SyncAlbum pulls the tracklists of an album's provider releases into the
+// canonical library. With no providers named it syncs every release it knows;
+// with resolve it also makes sure each track has something playable.
+func (s *Service) SyncAlbum(ctx context.Context, albumID uuid.UUID, providers []string, resolve bool) (*SyncResult, error) {
+	album, err := s.db.Album(ctx, albumID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, fmt.Errorf("%w: %s", ErrNoAlbum, albumID)
+		}
+		return nil, err
+	}
+
+	variants, err := s.db.AlbumVariants(ctx, albumID)
+	if err != nil {
+		return nil, err
+	}
+	selected := selectVariants(variants, providers)
+	if len(selected) == 0 {
+		return nil, fmt.Errorf("%w: %s", ErrNoSources, album.Title)
+	}
+
+	result := &SyncResult{AlbumID: albumID, Providers: providersFor(selected)}
+	for _, variant := range selected {
+		detail, err := s.providers.Album(ctx, variant.Provider, variant.ProviderAlbumID)
+		if err != nil {
+			result.Errors = append(result.Errors, ProviderError{Provider: variant.Provider, Error: err.Error()})
+			continue
+		}
+
+		ids := make([]uuid.UUID, 0, len(detail.Tracks))
+		for _, hit := range detail.Tracks {
+			track, _, err := s.matcher.Attach(ctx, variant.Provider, hit)
+			if err != nil {
+				return nil, fmt.Errorf("match %s/%s: %w", variant.Provider, hit.ProviderTrackID, err)
+			}
+			ids = append(ids, track.ID)
+		}
+		added, err := s.db.AppendAlbumTracks(ctx, albumID, ids)
+		if err != nil {
+			return nil, err
+		}
+		result.Added += added
+		s.logger.Info("album synced", "album", albumID, "provider", variant.Provider,
+			"tracks", len(ids), "added", added)
+	}
+
+	tracks, err := s.db.AlbumTracks(ctx, albumID)
+	if err != nil {
+		return nil, err
+	}
+	result.Tracks = tracks
+
+	// An album found without credits learns them from its own tracklist, so a
+	// bare provider result becomes a properly attributed album.
+	if credits, err := s.db.AlbumArtists(ctx, albumID); err == nil && len(credits) == 0 {
+		for _, track := range tracks {
+			artists, err := s.db.TrackArtists(ctx, track.ID)
+			if err != nil {
+				return nil, err
+			}
+			if len(artists) == 0 {
+				continue
+			}
+			names := make([]string, 0, len(artists))
+			for _, artist := range artists {
+				names = append(names, artist.Name)
+			}
+			if err := s.db.SetAlbumArtists(ctx, albumID, names); err != nil {
+				return nil, err
+			}
+			break
+		}
+	}
+
+	if resolve {
+		for _, track := range tracks {
+			if _, err := s.matcher.Resolve(ctx, track.ID); err != nil && !errors.Is(err, match.ErrNoPlayableVariant) {
+				return nil, err
+			}
+		}
+	}
+	return result, nil
+}
+
+// SyncArtist records an artist's provider pages, then pulls their albums (and,
+// when asked, each album's tracklist) into the canonical library.
+func (s *Service) SyncArtist(ctx context.Context, artistID uuid.UUID, providers []string, syncAlbums, resolve bool) (*ArtistSyncResult, error) {
+	artist, err := s.db.Artist(ctx, artistID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, fmt.Errorf("%w: %s", ErrNoArtist, artistID)
+		}
+		return nil, err
+	}
+
+	variants, err := s.db.ArtistVariants(ctx, artistID)
+	if err != nil {
+		return nil, err
+	}
+	selected := selectArtistVariants(variants, providers)
+	if len(selected) == 0 {
+		return nil, fmt.Errorf("%w: %s", ErrNoSources, artist.Name)
+	}
+
+	result := &ArtistSyncResult{ArtistID: artistID, Providers: artistProviders(selected)}
+
+	// Each provider's albums are fetched in parallel; the database writes below
+	// stay on this goroutine.
+	type fetched struct {
+		provider string
+		albums   []provider.Album
+		err      error
+	}
+	results := make([]fetched, len(selected))
+	var wg sync.WaitGroup
+	for i, variant := range selected {
+		wg.Add(1)
+		go func(i int, variant store.ArtistVariant) {
+			defer wg.Done()
+			albums, err := s.providers.ArtistAlbums(ctx, variant.Provider, variant.ProviderArtistID)
+			results[i] = fetched{provider: variant.Provider, albums: albums, err: err}
+		}(i, variant)
+	}
+	wg.Wait()
+
+	for _, fetched := range results {
+		if fetched.err != nil {
+			result.Errors = append(result.Errors, ProviderError{Provider: fetched.provider, Error: fetched.err.Error()})
+			continue
+		}
+		albums := fetched.albums
+		if len(albums) > maxProviderAlbums {
+			albums = albums[:maxProviderAlbums]
+		}
+		for _, hit := range albums {
+			album, _, _, err := s.matcher.MatchAlbum(ctx, fetched.provider, hit)
+			if err != nil {
+				return nil, fmt.Errorf("match %s/%s: %w", fetched.provider, hit.ProviderAlbumID, err)
+			}
+			if err := s.db.AttachAlbumArtist(ctx, album.ID, artistID); err != nil {
+				return nil, err
+			}
+			result.Albums = append(result.Albums, *album)
+		}
+	}
+
+	if syncAlbums {
+		for _, album := range result.Albums {
+			synced, err := s.SyncAlbum(ctx, album.ID, nil, resolve)
+			if err != nil {
+				result.Errors = append(result.Errors, ProviderError{Provider: album.Title, Error: err.Error()})
+				continue
+			}
+			result.Added += synced.Added
+			result.Errors = append(result.Errors, synced.Errors...)
+		}
+	}
+	return result, nil
+}
+
+// selectVariants keeps the requested providers, or everything when none is
+// named. Order follows the request.
+func selectVariants(variants []store.AlbumVariant, providers []string) []store.AlbumVariant {
+	if len(providers) == 0 {
+		return variants
+	}
+	out := make([]store.AlbumVariant, 0, len(variants))
+	for _, name := range providers {
+		for _, variant := range variants {
+			if variant.Provider == name {
+				out = append(out, variant)
+			}
+		}
+	}
+	return out
+}
+
+func selectArtistVariants(variants []store.ArtistVariant, providers []string) []store.ArtistVariant {
+	if len(providers) == 0 {
+		return variants
+	}
+	out := make([]store.ArtistVariant, 0, len(variants))
+	for _, name := range providers {
+		for _, variant := range variants {
+			if variant.Provider == name {
+				out = append(out, variant)
+			}
+		}
+	}
+	return out
+}
+
+func providersFor(variants []store.AlbumVariant) []string {
+	out := make([]string, 0, len(variants))
+	seen := map[string]bool{}
+	for _, variant := range variants {
+		if !seen[variant.Provider] {
+			seen[variant.Provider] = true
+			out = append(out, variant.Provider)
+		}
+	}
+	return out
+}
+
+func artistProviders(variants []store.ArtistVariant) []string {
+	out := make([]string, 0, len(variants))
+	seen := map[string]bool{}
+	for _, variant := range variants {
+		if !seen[variant.Provider] {
+			seen[variant.Provider] = true
+			out = append(out, variant.Provider)
+		}
+	}
+	return out
+}

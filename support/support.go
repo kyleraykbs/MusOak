@@ -10,13 +10,16 @@ import (
 //go:embed ytmusic/*.py
 var scripts embed.FS
 
-// YTMusicSearchScript returns the YouTube Music search helper source. The
-// provider feeds it to `python3 -` on stdin with the query as argv[1] and the
-// result limit as argv[2].
-func YTMusicSearchScript() (string, error) {
-	b, err := fs.ReadFile(scripts, "ytmusic/search.py")
+// YTMusicScript returns the YouTube Music helper source. The provider feeds it
+// to `python3 -` on stdin and passes the command and its arguments as argv.
+//
+//	search songs|albums|artists QUERY [LIMIT]
+//	album BROWSE_ID
+//	radio VIDEO_ID [LIMIT]
+func YTMusicScript() (string, error) {
+	b, err := fs.ReadFile(scripts, "ytmusic/ytmusic.py")
 	if err != nil {
-		return "", fmt.Errorf("read embedded search script: %w", err)
+		return "", fmt.Errorf("read embedded ytmusic helper: %w", err)
 	}
 	return string(b), nil
 }

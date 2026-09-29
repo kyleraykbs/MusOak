@@ -74,3 +74,18 @@
 - Decision: `rooms.Manager.Leave` closes a room whose last member left and returns no error; the API answers 204.
 - Why: the leave itself succeeded; reporting 404 made the curl sweep (and any client) treat a normal action as a failure.
 - Reversible: yes
+
+## [2026-09-28] Collections: canonical albums and artists with provider variants
+- Decision: an album's identity is (normalised title, normalised primary artist); an artist's is the normalised name. Every provider release hangs off the canonical row as a variant (`album_variants`, `artist_variants`), and an album's tracklist lives in `album_tracks`.
+- Why: the plan wants albums and artists as first-class entities and "sync between sources"; this mirrors how tracks already work, so one album can be played through another source's renditions.
+- Reversible: no (the `albums` table was rebuilt with the new identity in migration 5)
+
+## [2026-09-28] Release editions merge; provider listings are taken at face value
+- Decision: remasters/reissues/deluxe editions of one record share title and primary artist, so they merge into one album with several variants. An artist sync pulls whatever the provider lists, capped at fifty albums.
+- Why: distinguishing editions needs per-edition metadata providers do not agree on; merging matches the plan's "one record, many renditions" model.
+- Reversible: yes
+
+## [2026-09-28] A radio is a playlist
+- Decision: a generated station is saved as a playlist named after the seed (and the providers), unless the caller passes `save: false`. Guests may generate but not save, since playlists belong to an account.
+- Why: makes a station durable, queueable into a room, and testable with the pieces that already exist.
+- Reversible: yes

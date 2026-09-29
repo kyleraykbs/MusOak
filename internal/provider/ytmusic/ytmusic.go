@@ -24,6 +24,9 @@ const Name = "ytmusic"
 
 const (
 	defaultSearchLimit = 20
+	// defaultRadioLimit is how many tracks a station contributes when the
+	// caller does not say.
+	defaultRadioLimit = 25
 	// playerClient is YouTube's web embedded client. The default clients are
 	// routinely blocked with HTTP 403, so this is attempted first and plain
 	// defaults are the fallback.
@@ -52,7 +55,13 @@ func (p *Provider) Name() string { return Name }
 
 // Capabilities implements provider.Provider.
 func (p *Provider) Capabilities() provider.Caps {
-	return provider.Caps{Search: true, Download: true}
+	return provider.Caps{
+		Search:        true,
+		Download:      true,
+		SearchAlbums:  true,
+		SearchArtists: true,
+		Radio:         true,
+	}
 }
 
 // MissingDeps lists the external binaries this provider needs.
@@ -68,43 +77,227 @@ func (p *Provider) MissingDeps() []string {
 
 // Search runs the embedded ytmusicapi helper and parses its JSON output.
 func (p *Provider) Search(ctx context.Context, q string, opts provider.SearchOpts) ([]provider.Track, error) {
-	script, err := support.YTMusicSearchScript()
+	hits, err := p.songSearch(ctx, "songs", q, limitOr(opts.Limit, defaultSearchLimit))
+	if err != nil {
+		return nil, err
+	}
+	return hits, nil
+}
+
+// SearchAlbums implements provider.AlbumSearcher.
+func (p *Provider) SearchAlbums(ctx context.Context, q string, opts provider.SearchOpts) ([]provider.Album, error) {
+	out, err := p.run(ctx, "search", "albums", q, strconv.Itoa(limitOr(opts.Limit, defaultSearchLimit)))
+	if err != nil {
+		return nil, err
+	}
+	var hits []albumHit
+	if err := json.Unmarshal(out, &hits); err != nil {
+		return nil, fmt.Errorf("ytmusic album search %q: parse helper output: %w", q, err)
+	}
+	albums := make([]provider.Album, 0, len(hits))
+	for _, hit := range hits {
+		if hit.ID == "" {
+			continue
+		}
+		albums = append(albums, provider.Album{
+			ProviderAlbumID: hit.ID,
+			Title:           hit.Title,
+			Artists:         hit.Artists,
+			Year:            hit.Year,
+			TrackCount:      hit.TrackCount,
+		})
+	}
+	return albums, nil
+}
+
+// SearchArtists implements provider.ArtistSearcher.
+func (p *Provider) SearchArtists(ctx context.Context, q string, opts provider.SearchOpts) ([]provider.Artist, error) {
+	out, err := p.run(ctx, "search", "artists", q, strconv.Itoa(limitOr(opts.Limit, defaultSearchLimit)))
+	if err != nil {
+		return nil, err
+	}
+	var hits []artistHit
+	if err := json.Unmarshal(out, &hits); err != nil {
+		return nil, fmt.Errorf("ytmusic artist search %q: parse helper output: %w", q, err)
+	}
+	artists := make([]provider.Artist, 0, len(hits))
+	for _, hit := range hits {
+		if hit.ID == "" || hit.Name == "" {
+			continue
+		}
+		artists = append(artists, provider.Artist{ProviderArtistID: hit.ID, Name: hit.Name})
+	}
+	return artists, nil
+}
+
+// Album implements provider.AlbumSearcher: it fetches one album's tracklist.
+func (p *Provider) Album(ctx context.Context, providerAlbumID string) (*provider.AlbumDetail, error) {
+	out, err := p.run(ctx, "album", providerAlbumID)
+	if err != nil {
+		return nil, err
+	}
+	var hit albumDetailHit
+	if err := json.Unmarshal(out, &hit); err != nil {
+		return nil, fmt.Errorf("ytmusic album %s: parse helper output: %w", providerAlbumID, err)
+	}
+
+	detail := &provider.AlbumDetail{
+		Album: provider.Album{
+			ProviderAlbumID: providerAlbumID,
+			Title:           hit.Title,
+			Artists:         hit.Artists,
+			Year:            hit.Year,
+			TrackCount:      hit.TrackCount,
+		},
+		Tracks: make([]provider.Track, 0, len(hit.Tracks)),
+	}
+	for _, track := range hit.Tracks {
+		if track.ID == "" {
+			continue
+		}
+		detail.Tracks = append(detail.Tracks, provider.Track{
+			ProviderTrackID: track.ID,
+			Title:           track.Title,
+			Artists:         track.Artists,
+			Album:           firstNonEmpty(track.Album, hit.Title),
+			DurationMs:      track.DurationMs,
+		})
+	}
+	return detail, nil
+}
+
+// ArtistAlbums implements provider.ArtistSearcher. YouTube Music has no plain
+// "artist albums" call, so the artist's song hit is used to reach the albums
+// the search endpoint exposes for that artist name.
+func (p *Provider) ArtistAlbums(ctx context.Context, providerArtistID string) ([]provider.Album, error) {
+	// The helper searches by name; the id is what the caller holds, so ask the
+	// provider for the artist's own page and fall back to a name search.
+	out, err := p.run(ctx, "artist", providerArtistID)
+	if err != nil {
+		return nil, err
+	}
+	var hit struct {
+		Name   string     `json:"name"`
+		Albums []albumHit `json:"albums"`
+	}
+	if err := json.Unmarshal(out, &hit); err != nil {
+		return nil, fmt.Errorf("ytmusic artist %s: parse helper output: %w", providerArtistID, err)
+	}
+	albums := make([]provider.Album, 0, len(hit.Albums))
+	for _, album := range hit.Albums {
+		if album.ID == "" {
+			continue
+		}
+		artists := album.Artists
+		if len(artists) == 0 && hit.Name != "" {
+			artists = []string{hit.Name}
+		}
+		albums = append(albums, provider.Album{
+			ProviderAlbumID: album.ID,
+			Title:           album.Title,
+			Artists:         artists,
+			Year:            album.Year,
+			TrackCount:      album.TrackCount,
+		})
+	}
+	return albums, nil
+}
+
+// Radio implements provider.RadioProvider with YouTube Music's own station.
+func (p *Provider) Radio(ctx context.Context, seed provider.Track, limit int) ([]provider.Track, error) {
+	if seed.ProviderTrackID == "" {
+		return nil, fmt.Errorf("ytmusic radio: the seed has no ytmusic rendition")
+	}
+	hits, err := p.songSearch(ctx, "radio", seed.ProviderTrackID, limitOr(limit, defaultRadioLimit))
+	if err != nil {
+		return nil, err
+	}
+	return hits, nil
+}
+
+// songSearch runs a helper command that returns song-shaped JSON.
+func (p *Provider) songSearch(ctx context.Context, kind, argument string, limit int) ([]provider.Track, error) {
+	args := []string{"search", kind, argument}
+	if kind == "radio" {
+		args = []string{"radio", argument, strconv.Itoa(limit)}
+	} else {
+		args = append(args, strconv.Itoa(limit))
+	}
+
+	out, err := p.run(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	var hits []searchHit
+	if err := json.Unmarshal(out, &hits); err != nil {
+		return nil, fmt.Errorf("ytmusic %s %q: parse helper output: %w", kind, argument, err)
+	}
+
+	tracks := make([]provider.Track, 0, len(hits))
+	for _, hit := range hits {
+		if hit.ID == "" {
+			continue
+		}
+		tracks = append(tracks, provider.Track{
+			ProviderTrackID: hit.ID,
+			Title:           hit.Title,
+			Artists:         hit.Artists,
+			Album:           hit.Album,
+			DurationMs:      hit.DurationMs,
+		})
+	}
+	return tracks, nil
+}
+
+// run feeds the embedded helper to python3 on stdin and returns its stdout.
+func (p *Provider) run(ctx context.Context, args ...string) ([]byte, error) {
+	script, err := support.YTMusicScript()
 	if err != nil {
 		return nil, fmt.Errorf("ytmusic: %w", err)
 	}
-	limit := opts.Limit
-	if limit <= 0 {
-		limit = defaultSearchLimit
-	}
-
-	cmd := exec.CommandContext(ctx, p.python, "-", q, strconv.Itoa(limit))
+	cmd := exec.CommandContext(ctx, p.python, append([]string{"-"}, args...)...)
 	cmd.Stdin = strings.NewReader(script)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("ytmusic search %q: %w: %s", q, err, strings.TrimSpace(stderr.String()))
+		return nil, fmt.Errorf("ytmusic %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
+	return stdout.Bytes(), nil
+}
 
-	var hits []searchHit
-	if err := json.Unmarshal(stdout.Bytes(), &hits); err != nil {
-		return nil, fmt.Errorf("ytmusic search %q: parse helper output: %w", q, err)
+func limitOr(limit, fallback int) int {
+	if limit <= 0 {
+		return fallback
 	}
+	return limit
+}
 
-	tracks := make([]provider.Track, 0, len(hits))
-	for _, h := range hits {
-		if h.ID == "" {
-			continue
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
 		}
-		tracks = append(tracks, provider.Track{
-			ProviderTrackID: h.ID,
-			Title:           h.Title,
-			Artists:         h.Artists,
-			Album:           h.Album,
-			DurationMs:      h.DurationMs,
-		})
 	}
-	return tracks, nil
+	return ""
+}
+
+type albumHit struct {
+	ID         string   `json:"id"`
+	Title      string   `json:"title"`
+	Artists    []string `json:"artists"`
+	Year       string   `json:"year"`
+	TrackCount int      `json:"trackCount"`
+}
+
+type albumDetailHit struct {
+	albumHit
+	Tracks []searchHit `json:"tracks"`
+}
+
+type artistHit struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
 type searchHit struct {

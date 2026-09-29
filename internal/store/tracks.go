@@ -232,23 +232,6 @@ func ensureArtist(ctx context.Context, q execer, name string) (uuid.UUID, error)
 	return parseUUID(id)
 }
 
-// EnsureAlbum returns the id of title, creating it if needed.
-func (d *DB) EnsureAlbum(ctx context.Context, title string) (uuid.UUID, error) {
-	return ensureAlbum(ctx, d.db, title)
-}
-
-func ensureAlbum(ctx context.Context, q execer, title string) (uuid.UUID, error) {
-	if _, err := q.ExecContext(ctx,
-		`INSERT OR IGNORE INTO albums (id, title) VALUES (?, ?)`, uuid.NewString(), title); err != nil {
-		return uuid.Nil, mapErr(err)
-	}
-	var id string
-	if err := q.QueryRowContext(ctx, `SELECT id FROM albums WHERE title = ?`, title).Scan(&id); err != nil {
-		return uuid.Nil, mapErr(err)
-	}
-	return parseUUID(id)
-}
-
 // TrackArtists lists a track's artists in credit order.
 func (d *DB) TrackArtists(ctx context.Context, id uuid.UUID) ([]Artist, error) {
 	rows, err := d.db.QueryContext(ctx, `
@@ -333,8 +316,16 @@ func (d *DB) SetTrackArtists(ctx context.Context, id uuid.UUID, names []string) 
 	})
 }
 
-// SetTrackAlbums replaces a track's album credits.
+// SetTrackAlbums replaces a track's album credits. The track's own artists
+// name the albums, so a credit creates a real album identity rather than a
+// nameless one.
 func (d *DB) SetTrackAlbums(ctx context.Context, id uuid.UUID, titles []string) error {
+	artists, err := d.TrackArtists(ctx, id)
+	if err != nil {
+		return err
+	}
+	artistNames := artistNamesOf(artists)
+
 	return d.withTx(ctx, func(tx *sql.Tx) error {
 		if err := ensureTrackExists(ctx, tx, id); err != nil {
 			return err
@@ -343,7 +334,7 @@ func (d *DB) SetTrackAlbums(ctx context.Context, id uuid.UUID, titles []string) 
 			return mapErr(err)
 		}
 		for i, title := range titles {
-			albumID, err := ensureAlbum(ctx, tx, title)
+			albumID, err := ensureAlbum(ctx, tx, title, artistNames)
 			if err != nil {
 				return err
 			}
@@ -355,6 +346,48 @@ func (d *DB) SetTrackAlbums(ctx context.Context, id uuid.UUID, titles []string) 
 		}
 		return nil
 	})
+}
+
+// ensureAlbum creates or finds the album for a title by artists inside a
+// transaction.
+func ensureAlbum(ctx context.Context, q txLike, title string, artists []string) (uuid.UUID, error) {
+	titleKey, artistKey := albumIdentity(title, artists)
+
+	var existing string
+	err := q.QueryRowContext(ctx,
+		`SELECT id FROM albums WHERE title_key = ? AND artist_key = ?`, titleKey, artistKey).Scan(&existing)
+	switch {
+	case err == nil:
+		id, parseErr := parseUUID(existing)
+		if parseErr != nil {
+			return uuid.Nil, parseErr
+		}
+		if err := attachAlbumArtists(ctx, q, id, artists); err != nil {
+			return uuid.Nil, err
+		}
+		return id, nil
+	case !isNotFound(err):
+		return uuid.Nil, mapErr(err)
+	}
+
+	id := uuid.New()
+	if _, err := q.ExecContext(ctx,
+		`INSERT INTO albums (id, title, title_key, artist_key, created_at) VALUES (?, ?, ?, ?, ?)`,
+		id.String(), title, titleKey, artistKey, time.Now().UnixMilli()); err != nil {
+		return uuid.Nil, mapErr(err)
+	}
+	if err := attachAlbumArtists(ctx, q, id, artists); err != nil {
+		return uuid.Nil, err
+	}
+	return id, nil
+}
+
+func artistNamesOf(artists []Artist) []string {
+	names := make([]string, 0, len(artists))
+	for _, artist := range artists {
+		names = append(names, artist.Name)
+	}
+	return names
 }
 
 func ensureTrackExists(ctx context.Context, q execer, id uuid.UUID) error {

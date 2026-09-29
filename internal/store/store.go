@@ -43,10 +43,12 @@ type Artist struct {
 	Name string
 }
 
-// Album is a canonical album identity.
+// Album is a canonical album. Its identity is the title plus its primary
+// artist, so two artists may each have a "Greatest Hits".
 type Album struct {
-	ID    uuid.UUID
-	Title string
+	ID        uuid.UUID
+	Title     string
+	CreatedAt time.Time
 }
 
 // Variant is one provider's (or the local library's) rendition of a track.
@@ -106,13 +108,17 @@ type TrackRepo interface {
 	CandidateTracks(ctx context.Context, durationMs, toleranceMs int64, limit int) ([]Track, error)
 	// DeleteTrack removes a canonical track nothing points at any more.
 	DeleteTrack(ctx context.Context, id uuid.UUID) error
+	// AlbumCandidates and ArtistCandidates are the prefilter for collection
+	// matching; see AlbumRepo and ArtistRepo for the rest.
+	AlbumCandidates(ctx context.Context, titleKey, artistKey string, limit int) ([]Album, error)
+	ArtistCandidates(ctx context.Context, normalized string, limit int) ([]Artist, error)
 	SetTrackDuration(ctx context.Context, id uuid.UUID, durationMs int64) error
 	TrackArtists(ctx context.Context, id uuid.UUID) ([]Artist, error)
 	SetTrackArtists(ctx context.Context, id uuid.UUID, names []string) error
 	TrackAlbums(ctx context.Context, id uuid.UUID) ([]Album, error)
 	SetTrackAlbums(ctx context.Context, id uuid.UUID, titles []string) error
 	EnsureArtist(ctx context.Context, name string) (uuid.UUID, error)
-	EnsureAlbum(ctx context.Context, title string) (uuid.UUID, error)
+	EnsureAlbum(ctx context.Context, title string, artists []string) (uuid.UUID, error)
 }
 
 // VariantRepo stores provider renditions, unique per (provider, provider id).
@@ -285,6 +291,7 @@ var migrations = []migration{
 	{version: 2, name: "votes", sql: schemaV2},
 	{version: 3, name: "media last use", sql: schemaV3},
 	{version: 4, name: "playlists", sql: schemaV4},
+	{version: 5, name: "albums and artists", sql: schemaV5},
 }
 
 func (d *DB) migrate(ctx context.Context) error {
@@ -356,6 +363,12 @@ func mapErr(err error) error {
 	}
 	return err
 }
+
+// isNotFound and isConflict let the collection code branch on the sentinels
+// while the driver errors are still a single value away.
+func isNotFound(err error) bool { return errors.Is(mapErr(err), ErrNotFound) }
+
+func isConflict(err error) bool { return errors.Is(mapErr(err), ErrConflict) }
 
 func parseUUID(s string) (uuid.UUID, error) {
 	id, err := uuid.Parse(s)

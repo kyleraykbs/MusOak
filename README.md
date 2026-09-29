@@ -68,6 +68,55 @@ Listen Together details worth knowing before you rely on it:
   (`minVotersForSkip`), they are enough of the room (`voterFractionForSkip`) and
   the mean is below `skipThreshold`. Neutral (3) counts towards the mean.
 
+## Playlists, radios, albums and artists
+
+**Playlists** belong to an account: create one, append tracks, remove or reorder
+by position, rename or delete it. `prism playlist queue` feeds one into the
+local queue and `prism room queue playlist` into a listening room.
+
+**Radios** are stations grown from a song. The caller picks the providers, and
+the station interleaves them round-robin, so a two-provider radio really
+alternates. Suggestions are matched into the canonical library on the way in, so
+the seed never repeats and the same recording from two sources is one entry.
+
+```sh
+prism radio 0 --providers ytmusic --length 25      # saved as a playlist
+prism radio 0 --providers ytmusic,spotify --play   # straight to the speakers
+prism radio 0 --room                               # into the room you are in
+```
+
+**Albums and artists** are canonical too. One album exists once, with each
+provider's release hanging off it as a variant, and one artist exists once with
+each provider's page as a variant. Searching matches across sources: the same
+record found on two providers is one album with two variants.
+
+**Syncing** goes the other way, from provider to library:
+
+```sh
+prism album search "Whenever You Need Somebody"
+prism album sync 0 --providers ytmusic        # pull the tracklist, match every track
+prism album sync 0 --providers ytmusic,spotify --resolve
+prism artist search "Rick Astley"
+prism artist sync 0                           # their albums
+prism artist sync 0 --albums                  # and each album's tracklist
+```
+
+A sync fetches each selected release's tracklist, matches every track into the
+canonical library (creating renditions as it goes) and attaches the result to
+the album. That is what makes an album playable through *another* source's
+renditions: sync the Spotify release and its tracks land on the same canonical
+tracks as the YouTube Music ones. Syncing twice adds nothing twice. With
+`resolve`, any track still lacking a playable rendition is matched against the
+downloadable providers.
+
+Two things worth knowing:
+
+* Releases of one record (remasters, reissues, deluxe editions) share a title and
+  primary artist, so they merge into one album with several variants. If you want
+  editions kept apart, that is the place to change.
+* An artist's album list is taken at face value: whatever the provider lists is
+  what gets pulled, up to fifty albums per sync.
+
 ## Configuration
 
 `--config FILE` wins, then `$PRISMUSIC_CONFIG`, then
@@ -109,6 +158,10 @@ prism queue list|rm|clear
 prism play                            gapless playback, prefetching ahead
 prism library import <file|dir>       add local files; they match into the library
 prism fav add|list|rm <track-id|index>
+prism playlist create|list|show|add|rm|reorder|rename|delete|queue|play
+prism radio <track-id|index>          station from a song (--providers, --length, --play, --room)
+prism album search|show|sync|queue|play
+prism artist search|show|sync         (--albums pulls the discography's tracklists)
 prism providers [rank <a,b,c>]        provider capabilities and preference
 prism login <username> [--register]   password on stdin or --password
 prism me | logout
@@ -152,6 +205,12 @@ specification and the routes cannot drift apart.
   (idempotent); `GET /api/v1/media/{variantId}` streams the file with Range and
   a sha256 ETag, and never starts work.
 * `POST /api/v1/library/import` — local files become first-class variants.
+* `GET/POST /api/v1/me/playlists...` — playlists, including positional edits.
+* `POST /api/v1/radio` — a station from a seed, mixed from the providers you name.
+* `GET /api/v1/albums/search`, `GET /api/v1/albums/{id}`,
+  `POST /api/v1/albums/{id}/sync` — canonical albums and their sync.
+* `GET /api/v1/artists/search`, `GET /api/v1/artists/{id}`,
+  `POST /api/v1/artists/{id}/sync` — canonical artists and their sync.
 * `GET /api/v1/ws` — room events plus clock-sync pings.
 
 ## Nix
@@ -218,8 +277,13 @@ Rules that keep the rest of the server honest:
    `provider.ErrDownloadUnsupported` from `Download`. Tracks like that are
    played through a matched rendition from a downloadable provider, and the
    server refuses to try downloading them directly.
-5. Shelling out? Implement `MissingDeps()` so startup reports your tooling.
-6. Register it in `Server.registerProviders` and add its config section.
+5. Collections are optional: implement `AlbumSearcher` and `ArtistSearcher` to
+   let an album or artist be browsed and synced, and `RadioProvider` to feed
+   stations. Set the matching flags in `Caps` — a provider that cannot download
+   can still browse (Spotify does), and a provider that cannot build a station
+   is simply left out of a radio mix.
+6. Shelling out? Implement `MissingDeps()` so startup reports your tooling.
+7. Register it in `Server.registerProviders` and add its config section.
 
 Test it with `httptest` against the provider's own API shape (see
 `internal/provider/spotify/spotify_test.go`), plus a `//go:build live` test when

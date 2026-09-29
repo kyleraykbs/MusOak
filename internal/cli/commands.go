@@ -41,6 +41,16 @@ func (a *App) cmdSearch(ctx context.Context, args []string) error {
 		a.printf("no results for %q\n", query)
 	}
 	a.state.LastSearch = a.state.LastSearch[:0]
+	for _, group := range result.Groups {
+		a.state.LastSearch = append(a.state.LastSearch, queueItem{TrackID: group.Track.ID, Title: group.Track.Title})
+	}
+	// Persist before printing: the process may die on SIGPIPE the moment
+	// output is piped into something like `head`, and the indices the user
+	// then types must still resolve.
+	if err := a.state.save(); err != nil {
+		return err
+	}
+
 	for i, group := range result.Groups {
 		providers := make([]string, 0, len(group.Variants))
 		for _, variant := range group.Variants {
@@ -54,13 +64,9 @@ func (a *App) cmdSearch(ctx context.Context, args []string) error {
 		a.printf("%3d. %-50s %8s  [%s]\n", i, truncate(group.Track.Title, 50),
 			formatDuration(group.Track.DurationMs), strings.Join(providers, " "))
 		a.printf("     %s\n", joinArtists(group.Track.Artists))
-		a.state.LastSearch = append(a.state.LastSearch, queueItem{TrackID: group.Track.ID, Title: group.Track.Title})
 	}
 	for _, problem := range result.ProviderErrors {
 		a.printf("  ! %s: %s\n", problem.Provider, problem.Error)
-	}
-	if err := a.state.save(); err != nil {
-		return err
 	}
 	if len(result.Groups) > 0 {
 		a.printf("\nqueue one with: prism queue add <index>\n")

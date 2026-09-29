@@ -544,3 +544,8 @@ func (c *Client) SetRanking(ctx context.Context, providers []string) (*Ranking, 
 	}
 	return &out, nil
 }
+
+// urlQuery escapes a query parameter value.
+func urlQuery(value string) string {
+	return url.QueryEscape(value)
+}

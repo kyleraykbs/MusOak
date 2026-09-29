@@ -559,6 +559,197 @@ paths:
               schema: { $ref: "#/components/schemas/PlaylistDetail" }
         "400": { $ref: "#/components/responses/BadRequest" }
 
+  /api/v1/radio:
+    post:
+      tags: [library]
+      summary: Start a station from a track
+      description: |
+        Builds a station from the seed track using exactly the providers the
+        caller names, interleaving their suggestions so the mix reflects the
+        choice. Suggestions are matched into the canonical library, so a
+        recording never appears twice and the seed itself is left out.
+
+        Saving is the default: the station is stored as a playlist named after
+        the seed. Guests can generate a station but cannot save one, because
+        playlists belong to an account.
+      operationId: createRadio
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [seedTrackId]
+              properties:
+                seedTrackId: { type: string, format: uuid }
+                providers:
+                  type: array
+                  description: Providers to mix; empty means every enabled one that can build a station.
+                  items: { type: string }
+                length:
+                  type: integer
+                  description: How many tracks the station should hold.
+                  default: 25
+                  maximum: 200
+                save:
+                  type: boolean
+                  description: Store the station as a playlist (default true).
+                name: { type: string }
+      responses:
+        "200":
+          description: The station, plus the playlist when it was saved.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RadioResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: No selected provider has a rendition of the seed track.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/albums/search:
+    get:
+      tags: [library]
+      summary: Search albums across the providers
+      description: |
+        Album hits from every provider that can browse them, matched into one
+        canonical album per record. The same release found on two sources is one
+        entry with two variants.
+      operationId: searchAlbums
+      parameters:
+        - { $ref: "#/components/parameters/SearchQuery" }
+        - { $ref: "#/components/parameters/SearchLimit" }
+      responses:
+        "200":
+          description: Canonical albums with their provider releases.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [query, albums]
+                properties:
+                  query: { type: string }
+                  albums:
+                    type: array
+                    items: { $ref: "#/components/schemas/Album" }
+                  providerErrors:
+                    type: array
+                    items: { $ref: "#/components/schemas/ProviderProblem" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/v1/albums/{albumId}:
+    get:
+      tags: [library]
+      summary: One album with its tracks
+      operationId: getAlbum
+      parameters: [{ $ref: "#/components/parameters/AlbumID" }]
+      responses:
+        "200":
+          description: The album, its credits, releases and tracklist.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Album" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/albums/{albumId}/sync:
+    post:
+      tags: [library]
+      summary: Sync an album from its providers
+      description: |
+        Fetches the tracklist of each selected provider release, matches every
+        track into the canonical library and attaches the result to the album,
+        so one album can be played through another source's renditions. Tracks
+        already on the album are not duplicated.
+      operationId: syncAlbum
+      parameters: [{ $ref: "#/components/parameters/AlbumID" }]
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SyncRequest" }
+      responses:
+        "200":
+          description: What the sync added, and the album's tracklist.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SyncResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: The album has no provider release to sync from.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/artists/search:
+    get:
+      tags: [library]
+      summary: Search artists across the providers
+      operationId: searchArtists
+      parameters:
+        - { $ref: "#/components/parameters/SearchQuery" }
+        - { $ref: "#/components/parameters/SearchLimit" }
+      responses:
+        "200":
+          description: Canonical artists with their provider pages.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [query, artists]
+                properties:
+                  query: { type: string }
+                  artists:
+                    type: array
+                    items: { $ref: "#/components/schemas/Artist" }
+                  providerErrors:
+                    type: array
+                    items: { $ref: "#/components/schemas/ProviderProblem" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/v1/artists/{artistId}:
+    get:
+      tags: [library]
+      summary: One artist with their albums
+      operationId: getArtist
+      parameters: [{ $ref: "#/components/parameters/ArtistID" }]
+      responses:
+        "200":
+          description: The artist, their provider pages and their albums.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Artist" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/artists/{artistId}/sync:
+    post:
+      tags: [library]
+      summary: Sync an artist from their providers
+      description: |
+        Records the artist's provider pages and pulls their albums into the
+        canonical library. With `syncAlbums` the albums' tracklists are fetched
+        too, which is what makes the whole discography playable.
+      operationId: syncArtist
+      parameters: [{ $ref: "#/components/parameters/ArtistID" }]
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SyncRequest" }
+      responses:
+        "200":
+          description: The albums that were pulled.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SyncResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: The artist has no provider page to sync from.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /api/v1/clock:
     get:
       summary: Server clock and room rules
@@ -885,6 +1076,25 @@ components:
       in: path
       required: true
       schema: { type: string }
+    SearchQuery:
+      name: q
+      in: query
+      required: true
+      schema: { type: string }
+    SearchLimit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+    AlbumID:
+      name: albumId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ArtistID:
+      name: artistId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
     PlaylistID:
       name: playlistId
       in: path
@@ -1100,6 +1310,128 @@ components:
           type: array
           description: Configured fallback order.
           items: { type: string }
+
+    RadioResult:
+      type: object
+      required: [seed, providers, tracks]
+      properties:
+        seed: { $ref: "#/components/schemas/Track" }
+        providers:
+          type: array
+          description: The providers that contributed.
+          items: { type: string }
+        tracks:
+          type: array
+          items: { $ref: "#/components/schemas/Track" }
+        providerErrors:
+          type: array
+          description: Providers that could not contribute, and why.
+          items:
+            type: object
+            required: [provider, error]
+            properties:
+              provider: { type: string }
+              error: { type: string }
+        playlist: { $ref: "#/components/schemas/Playlist" }
+
+    Album:
+      type: object
+      required: [id, title, artists, trackCount, providers]
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string }
+        artists: { type: array, items: { type: string } }
+        year: { type: string }
+        trackCount:
+          type: integer
+          description: How many tracks the canonical album holds.
+        providers:
+          type: array
+          description: Providers that know this album.
+          items: { type: string }
+        variants:
+          type: array
+          items: { $ref: "#/components/schemas/AlbumVariant" }
+        tracks:
+          type: array
+          description: The tracklist, present on the album endpoint.
+          items: { $ref: "#/components/schemas/Track" }
+
+    AlbumVariant:
+      type: object
+      required: [id, provider, providerAlbumId, title]
+      properties:
+        id: { type: string, format: uuid }
+        provider: { type: string }
+        providerAlbumId: { type: string }
+        title: { type: string }
+        artists: { type: array, items: { type: string } }
+        year: { type: string }
+        trackCount: { type: integer }
+
+    Artist:
+      type: object
+      required: [id, name, providers]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        providers:
+          type: array
+          items: { type: string }
+        variants:
+          type: array
+          items:
+            type: object
+            required: [id, provider, providerArtistId, name]
+            properties:
+              id: { type: string, format: uuid }
+              provider: { type: string }
+              providerArtistId: { type: string }
+              name: { type: string }
+        albums:
+          type: array
+          items: { $ref: "#/components/schemas/Album" }
+
+    SyncRequest:
+      type: object
+      properties:
+        providers:
+          type: array
+          description: What to sync from; empty means every known release.
+          items: { type: string }
+        resolve:
+          type: boolean
+          description: Also make sure each track has a playable rendition.
+        syncAlbums:
+          type: boolean
+          description: Artist syncs only; fetch each album's tracklist too.
+
+    SyncResult:
+      type: object
+      required: [providers, added]
+      properties:
+        albumId: { type: string, format: uuid }
+        artistId: { type: string, format: uuid }
+        providers: { type: array, items: { type: string } }
+        added:
+          type: integer
+          description: Tracks the sync added to the library.
+        tracks:
+          type: array
+          items: { $ref: "#/components/schemas/Track" }
+        albums:
+          type: array
+          items: { $ref: "#/components/schemas/Album" }
+        providerErrors:
+          type: array
+          items: { $ref: "#/components/schemas/ProviderProblem" }
+
+    ProviderProblem:
+      type: object
+      required: [provider, error]
+      properties:
+        provider: { type: string }
+        error: { type: string }
 
     Playlist:
       type: object

@@ -175,10 +175,13 @@ func absDiff(a, b int64) int64 {
 	return b - a
 }
 
-// Store is the repository slice matching needs.
+// Store is the repository slice matching needs: tracks and their renditions,
+// plus the collection tables (albums, artists and their provider releases).
 type Store interface {
 	store.TrackRepo
 	store.VariantRepo
+	store.AlbumRepo
+	store.ArtistRepo
 }
 
 // Group is a canonical track with the variants that matched onto it.

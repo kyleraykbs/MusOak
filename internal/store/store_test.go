@@ -135,8 +135,8 @@ func TestEnsureArtistAndAlbumAreIdempotent(t *testing.T) {
 		t.Error("distinct names must have distinct ids")
 	}
 
-	b1, _ := db.EnsureAlbum(ctx, "Album")
-	b2, _ := db.EnsureAlbum(ctx, "Album")
+	b1, _ := db.EnsureAlbum(ctx, "Album", []string{"Artist"})
+	b2, _ := db.EnsureAlbum(ctx, "Album", []string{"Artist"})
 	if b1 != b2 {
 		t.Errorf("album ids differ: %s vs %s", b1, b2)
 	}
