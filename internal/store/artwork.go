@@ -31,12 +31,15 @@ const (
 	ArtworkAlbum    ArtworkKind = "album"
 	ArtworkArtist   ArtworkKind = "artist"
 	ArtworkPlaylist ArtworkKind = "playlist"
+	// ArtworkUser is an account's own icon. It lives in the same cache as the
+	// rest of the images, so every client fetches it the same way.
+	ArtworkUser ArtworkKind = "user"
 )
 
 // Valid reports whether kind is one of the known kinds.
 func (k ArtworkKind) Valid() bool {
 	switch k {
-	case ArtworkTrack, ArtworkAlbum, ArtworkArtist, ArtworkPlaylist:
+	case ArtworkTrack, ArtworkAlbum, ArtworkArtist, ArtworkPlaylist, ArtworkUser:
 		return true
 	}
 	return false
@@ -131,6 +134,15 @@ func (d *DB) EntityArtwork(ctx context.Context, kind ArtworkKind, id uuid.UUID) 
 			return "", err
 		}
 		return d.artworkOf(ctx, "playlists", id)
+	case ArtworkUser:
+		// An account's icon is named icon_url, not artwork_url, so it cannot
+		// go through artworkOf.
+		var url string
+		if err := d.db.QueryRowContext(ctx,
+			`SELECT icon_url FROM users WHERE id = ?`, id.String()).Scan(&url); err != nil {
+			return "", mapErr(err)
+		}
+		return url, nil
 	}
 	return "", ErrNotFound
 }

@@ -91,6 +91,11 @@ type User struct {
 	ID           uuid.UUID
 	Username     string
 	PasswordHash string
+	// DisplayName and IconURL are what other people see; Username is how you
+	// sign in. LastPlayedAt is what "online" is derived from.
+	DisplayName  string
+	IconURL      string
+	LastPlayedAt time.Time
 	CreatedAt    time.Time
 }
 
@@ -303,6 +308,10 @@ var migrations = []migration{
 	{version: 7, name: "external playlists", sql: schemaV7},
 	{version: 8, name: "playlist artwork", sql: schemaV8},
 	{version: 9, name: "playback state", sql: schemaV9},
+	{version: 10, name: "uploads", sql: schemaV10},
+	{version: 11, name: "source votes", sql: schemaV11},
+	{version: 12, name: "profiles", sql: schemaV12},
+	{version: 13, name: "friends and notifications", sql: schemaV13},
 }
 
 func (d *DB) migrate(ctx context.Context) error {

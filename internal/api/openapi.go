@@ -79,6 +79,37 @@ func (s *Server) routeTable() []route {
 		{"DELETE /api/v1/me/playlists/{playlistId}/items/{position}", s.handlePlaylistRemove},
 		{"POST /api/v1/me/playlists/{playlistId}/reorder", s.handlePlaylistReorder},
 
+		{"POST /api/v1/uploads", s.handleUploadCreate},
+		{"GET /api/v1/uploads", s.handleUploadList},
+		{"GET /api/v1/uploads/all", s.handleUploadListAll},
+		{"PATCH /api/v1/uploads/{uploadId}", s.handleUploadPatch},
+		{"DELETE /api/v1/uploads/{uploadId}", s.handleUploadDelete},
+
+		{"GET /api/v1/tracks/{trackId}/sources", s.handleTrackSources},
+		{"POST /api/v1/variants/{variantId}/vote", s.handleVariantVote},
+		{"PUT /api/v1/me/tracks/{trackId}/preference", s.handleTrackPreference},
+
+		{"PATCH /api/v1/me", s.handleMePatch},
+		{"POST /api/v1/me/icon", s.handleMeIcon},
+		{"POST /api/v1/me/password", s.handleMePassword},
+		{"POST /api/v1/me/username", s.handleMeUsername},
+
+		{"GET /api/v1/users", s.handleUserSearch},
+		{"GET /api/v1/users/{userId}", s.handleUserGet},
+		{"GET /api/v1/users/{userId}/playback", s.handleUserPlayback},
+		{"GET /api/v1/me/friends", s.handleFriendsList},
+		{"POST /api/v1/me/friends", s.handleFriendAdd},
+		{"POST /api/v1/me/friends/{userId}/accept", s.handleFriendAccept},
+		{"DELETE /api/v1/me/friends/{userId}", s.handleFriendRemove},
+		{"POST /api/v1/me/friends/{userId}/ignore", s.handleFriendIgnore},
+		{"DELETE /api/v1/me/friends/{userId}/ignore", s.handleFriendUnignore},
+		{"GET /api/v1/me/shares", s.handleShareList},
+		{"POST /api/v1/me/shares", s.handleShareCreate},
+		{"GET /api/v1/me/notifications", s.handleNotifications},
+		{"POST /api/v1/me/notifications/read", s.handleNotificationsRead},
+
+		{"DELETE /api/v1/rooms/{roomId}/queue", s.handleRoomClear},
+
 		{"GET /api/v1/clock", s.handleClock},
 		{"GET /api/v1/ws", s.handleWS},
 		{"GET /api/v1/rooms", s.handleRoomList},

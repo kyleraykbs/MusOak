@@ -17,30 +17,34 @@ func (d *DB) CreateUser(ctx context.Context, u *User) error {
 		u.CreatedAt = time.Now()
 	}
 	_, err := d.db.ExecContext(ctx,
-		`INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)`,
-		u.ID.String(), u.Username, u.PasswordHash, u.CreatedAt.UnixMilli())
+		`INSERT INTO users (id, username, password_hash, display_name, icon_url, last_played_at, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		u.ID.String(), u.Username, u.PasswordHash, u.DisplayName, u.IconURL, u.LastPlayedAt.UnixMilli(), u.CreatedAt.UnixMilli())
 	return mapErr(err)
 }
+
+const userColumns = `id, username, password_hash, display_name, icon_url, last_played_at, created_at`
 
 // User returns the account by id.
 func (d *DB) User(ctx context.Context, id uuid.UUID) (*User, error) {
 	return scanUser(d.db.QueryRowContext(ctx,
-		`SELECT id, username, password_hash, created_at FROM users WHERE id = ?`, id.String()))
+		`SELECT `+userColumns+` FROM users WHERE id = ?`, id.String()))
 }
 
 // UserByUsername returns the account by username.
 func (d *DB) UserByUsername(ctx context.Context, username string) (*User, error) {
 	return scanUser(d.db.QueryRowContext(ctx,
-		`SELECT id, username, password_hash, created_at FROM users WHERE username = ?`, username))
+		`SELECT `+userColumns+` FROM users WHERE username = ?`, username))
 }
 
 func scanUser(row rowScanner) (*User, error) {
 	var (
-		u       User
-		id      string
-		created int64
+		u         User
+		id        string
+		created   int64
+		lastPlayed int64
 	)
-	if err := row.Scan(&id, &u.Username, &u.PasswordHash, &created); err != nil {
+	if err := row.Scan(&id, &u.Username, &u.PasswordHash, &u.DisplayName, &u.IconURL, &lastPlayed, &created); err != nil {
 		return nil, mapErr(err)
 	}
 	var err error
@@ -48,6 +52,7 @@ func scanUser(row rowScanner) (*User, error) {
 		return nil, err
 	}
 	u.CreatedAt = time.UnixMilli(created).UTC()
+	u.LastPlayedAt = time.UnixMilli(lastPlayed).UTC()
 	return &u, nil
 }
 
