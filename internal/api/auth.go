@@ -76,6 +76,10 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	if user := s.currentUser(r); user != nil {
 		body["authenticated"] = true
 		body["user"] = userResponse{ID: user.ID.String(), Username: user.Username}
+		// The account tab reads these flat, beside the policy flags.
+		body["username"] = user.Username
+		body["displayName"] = user.DisplayName
+		body["iconUrl"] = user.IconURL
 	} else {
 		body["authenticated"] = false
 		body["guest"] = true
