@@ -48,13 +48,13 @@ type shareResponse struct {
 
 // notificationResponse is one bell entry.
 type notificationResponse struct {
-	ID        string             `json:"id"`
-	Kind      string             `json:"kind"`
+	ID        string              `json:"id"`
+	Kind      string              `json:"kind"`
 	From      *publicUserResponse `json:"from"`
-	TrackID   *string            `json:"trackId"`
-	RoomID    *string            `json:"roomId"`
-	CreatedAt time.Time          `json:"createdAt"`
-	Read      bool               `json:"read"`
+	TrackID   *string             `json:"trackId"`
+	RoomID    *string             `json:"roomId"`
+	CreatedAt time.Time           `json:"createdAt"`
+	Read      bool                `json:"read"`
 }
 
 // buildPublicUser fills in what an account row cannot: whether the user counts as

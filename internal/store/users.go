@@ -39,9 +39,9 @@ func (d *DB) UserByUsername(ctx context.Context, username string) (*User, error)
 
 func scanUser(row rowScanner) (*User, error) {
 	var (
-		u         User
-		id        string
-		created   int64
+		u          User
+		id         string
+		created    int64
 		lastPlayed int64
 	)
 	if err := row.Scan(&id, &u.Username, &u.PasswordHash, &u.DisplayName, &u.IconURL, &lastPlayed, &created); err != nil {

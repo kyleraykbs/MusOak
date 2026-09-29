@@ -424,11 +424,11 @@ func TestPlaybackVisibleToFriendsOnly(t *testing.T) {
 		t.Fatalf("user page = %d: %s", rec.Code, rec.Body.String())
 	}
 	var page struct {
-		User            publicUserResponse      `json:"user"`
+		User            publicUserResponse `json:"user"`
 		PublicPlaylists []playlistResponse `json:"publicPlaylists"`
-		Favorites       []trackResponse   `json:"favorites"`
-		Recent          []trackResponse   `json:"recent"`
-		Shared          []shareResponse   `json:"shared"`
+		Favorites       []trackResponse    `json:"favorites"`
+		Recent          []trackResponse    `json:"recent"`
+		Shared          []shareResponse    `json:"shared"`
 	}
 	c.decode(rec, &page)
 	if page.User.Relationship != "friend" {
