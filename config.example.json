@@ -1,0 +1,18 @@
+{
+  "listen": ":8080",
+  "storageDir": "/home/alice/.local/share/prismusic",
+  "requireLogin": false,
+  "registrationOpen": true,
+  "providers": {
+    "ytmusic": { "enabled": true },
+    "spotify": { "enabled": false, "clientId": "", "clientSecret": "" }
+  },
+  "defaultProviderOrder": ["ytmusic", "spotify"],
+  "prefetchCount": 3,
+  "listenTogether": {
+    "skipThreshold": 2.0,
+    "minVotersForSkip": 2,
+    "voterFractionForSkip": 0.5,
+    "readyTimeoutSeconds": 30
+  }
+}
