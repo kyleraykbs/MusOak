@@ -184,3 +184,69 @@ func TestPlaylistArtworkIsServedByKind(t *testing.T) {
 		t.Fatalf("artwork for a playlist without one: err = %v, want ErrNotFound", err)
 	}
 }
+
+func TestASecondSearchWritesNothing(t *testing.T) {
+	db, ctx := playlistFixture(t)
+
+	incoming := &ExternalPlaylist{
+		Provider:           "ytmusic",
+		ProviderPlaylistID: "PLsame",
+		Title:              "Late night",
+		Owner:              "kyle",
+		TrackCount:         12,
+		ArtworkURL:         "https://cdn.example/pl.jpg",
+	}
+	first, _, err := db.UpsertExternalPlaylist(ctx, incoming)
+	if err != nil {
+		t.Fatalf("UpsertExternalPlaylist: %v", err)
+	}
+
+	// The same hit again must not write: a search that finds what it already
+	// knows once made a busy database fail the search.
+	before, err := db.ExternalPlaylist(ctx, first.ID)
+	if err != nil {
+		t.Fatalf("ExternalPlaylist: %v", err)
+	}
+	again := *incoming
+	again.ArtworkURL = "" // a search often reports no cover
+	stored, isNew, err := db.UpsertExternalPlaylist(ctx, &again)
+	if err != nil {
+		t.Fatalf("second UpsertExternalPlaylist: %v", err)
+	}
+	if isNew {
+		t.Fatal("the same provider playlist must not be created twice")
+	}
+	if stored.Title != before.Title || stored.TrackCount != before.TrackCount {
+		t.Fatalf("stored = %+v, want %+v", stored, before)
+	}
+	if stored.ArtworkURL != before.ArtworkURL {
+		t.Fatalf("an empty cover from a search replaced the stored one: %q", stored.ArtworkURL)
+	}
+
+	// Something that did change is still written.
+	changed := *incoming
+	changed.Title = "Late night mix"
+	stored, _, err = db.UpsertExternalPlaylist(ctx, &changed)
+	if err != nil {
+		t.Fatalf("third UpsertExternalPlaylist: %v", err)
+	}
+	if stored.Title != "Late night mix" {
+		t.Fatalf("a changed title was not stored: %+v", stored)
+	}
+}
+
+func TestABusyDatabaseIsRetried(t *testing.T) {
+	// The retry is about timing, so this checks the predicate the store uses.
+	for _, message := range []string{
+		"database is locked (5) (SQLITE_BUSY)",
+		"SQLITE_BUSY: database is locked",
+		"database table is locked",
+	} {
+		if !isBusy(errors.New(message)) {
+			t.Errorf("isBusy(%q) = false", message)
+		}
+	}
+	if isBusy(nil) || isBusy(errors.New("no such table")) {
+		t.Error("isBusy must only match a lock")
+	}
+}

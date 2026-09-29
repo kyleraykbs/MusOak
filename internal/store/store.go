@@ -340,6 +340,25 @@ func (d *DB) migrate(ctx context.Context) error {
 }
 
 func (d *DB) withTx(ctx context.Context, fn func(*sql.Tx) error) error {
+	// A busy database is a timing problem, not a failure: another writer had the
+	// lock. Trying again shortly is what SQLite's own busy handling does for
+	// single statements, and it applies to transactions just as well.
+	var err error
+	for attempt := 0; attempt < busyAttempts; attempt++ {
+		err = d.runTx(ctx, fn)
+		if !isBusy(err) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(busyBackoff(attempt)):
+		}
+	}
+	return err
+}
+
+func (d *DB) runTx(ctx context.Context, fn func(*sql.Tx) error) error {
 	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -349,6 +368,46 @@ func (d *DB) withTx(ctx context.Context, fn func(*sql.Tx) error) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// execRetry runs one write statement, waiting out a busy database.
+func (d *DB) execRetry(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	var (
+		result sql.Result
+		err    error
+	)
+	for attempt := 0; attempt < busyAttempts; attempt++ {
+		result, err = d.db.ExecContext(ctx, query, args...)
+		if !isBusy(err) {
+			return result, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(busyBackoff(attempt)):
+		}
+	}
+	return result, err
+}
+
+// busyAttempts is how many times a write is retried while the database is busy,
+// and busyBackoff how long to wait between tries.
+const busyAttempts = 4
+
+func busyBackoff(attempt int) time.Duration {
+	return time.Duration(20*(1<<attempt)) * time.Millisecond
+}
+
+// isBusy reports whether the database was locked by another writer. The driver
+// is the one that decides, and it says so in the message.
+func isBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "database is locked") ||
+		strings.Contains(message, "SQLITE_BUSY") ||
+		strings.Contains(message, "database table is locked")
 }
 
 // mapErr translates driver errors into the package's sentinels.

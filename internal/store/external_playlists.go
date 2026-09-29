@@ -85,8 +85,13 @@ func (d *DB) UpsertExternalPlaylist(
 	existing, err := d.externalPlaylistByProviderID(ctx, playlist.Provider, playlist.ProviderPlaylistID)
 	switch {
 	case err == nil:
+		// A search that finds what it already knows must not write: writing on
+		// every search is what made a busy database fail a search.
+		if !externalPlaylistChanged(existing, playlist) {
+			return existing, false, nil
+		}
 		// Refresh the metadata, but keep the id: the synced tracks hang off it.
-		if _, err := d.db.ExecContext(ctx, `
+		if _, err := d.execRetry(ctx, `
 			UPDATE external_playlists
 			   SET title = ?, owner = ?, description = ?, track_count = ?,
 			       artwork_url = CASE WHEN ? <> '' THEN ? ELSE artwork_url END
@@ -107,7 +112,7 @@ func (d *DB) UpsertExternalPlaylist(
 	if playlist.CreatedAt.IsZero() {
 		playlist.CreatedAt = time.Now()
 	}
-	if _, err := d.db.ExecContext(ctx, `
+	if _, err := d.execRetry(ctx, `
 		INSERT INTO external_playlists
 			(id, provider, provider_playlist_id, title, owner, description,
 			 track_count, artwork_url, created_at)
@@ -118,6 +123,20 @@ func (d *DB) UpsertExternalPlaylist(
 		return nil, false, mapErr(err)
 	}
 	return playlist, true, nil
+}
+
+// externalPlaylistChanged reports whether a provider playlist carries anything
+// new, so a search that found nothing new does not write.
+func externalPlaylistChanged(stored, incoming *ExternalPlaylist) bool {
+	if stored.Title != incoming.Title ||
+		stored.Owner != incoming.Owner ||
+		stored.Description != incoming.Description ||
+		stored.TrackCount != incoming.TrackCount {
+		return true
+	}
+	// The cover is only worth writing when we have one and it differs; an empty
+	// one from a search must never wipe a cover a sync recorded.
+	return incoming.ArtworkURL != "" && incoming.ArtworkURL != stored.ArtworkURL
 }
 
 // ExternalPlaylist reads one playlist by id.
