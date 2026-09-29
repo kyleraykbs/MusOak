@@ -97,6 +97,8 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return a.cmdLibrary(ctx, rest)
 	case "fav", "favorite", "favorites":
 		return a.cmdFavorites(ctx, rest)
+	case "playlist", "playlists":
+		return a.cmdPlaylist(ctx, rest)
 	case "providers":
 		return a.cmdProviders(ctx, rest)
 	case "login":
@@ -130,6 +132,7 @@ Usage:
   prism queue clear                    empty the queue
   prism library import <file|dir>      add local files to the library
   prism fav add|list|rm <track-id|index>
+  prism playlist create|list|show|add|rm|reorder|rename|delete|queue|play
   prism providers                      list providers
   prism providers rank <a,b,c>         set your provider preference
   prism login <username> [--register]  log in (password on stdin or --password)

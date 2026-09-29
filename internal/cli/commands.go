@@ -294,19 +294,38 @@ func (a *App) cmdProviders(ctx context.Context, args []string) error {
 // --- accounts --------------------------------------------------------------
 
 func (a *App) cmdLogin(ctx context.Context, args []string) error {
-	set := flag.NewFlagSet("login", flag.ContinueOnError)
-	set.SetOutput(a.out)
-	password := set.String("password", "", "password (read from stdin when empty)")
-	register := set.Bool("register", false, "create the account instead of logging in")
-	if err := set.Parse(args); err != nil {
-		return err
+	// Flags may come before or after the username, so this is parsed by hand
+	// rather than with flag.FlagSet (which stops at the first positional).
+	var (
+		username string
+		password string
+		register bool
+	)
+	for i := 0; i < len(args); i++ {
+		switch argument := args[i]; {
+		case argument == "--register" || argument == "-register":
+			register = true
+		case argument == "--password" || argument == "-password":
+			if i+1 >= len(args) {
+				return errors.New("prism: --password needs a value")
+			}
+			password = args[i+1]
+			i++
+		case strings.HasPrefix(argument, "--password="):
+			password = strings.TrimPrefix(argument, "--password=")
+		case strings.HasPrefix(argument, "-"):
+			return fmt.Errorf("prism: unknown login option %q", argument)
+		case username == "":
+			username = argument
+		default:
+			return fmt.Errorf("prism: unexpected login argument %q", argument)
+		}
 	}
-	if set.NArg() < 1 {
-		return errors.New("prism: usage: prism login <username> [--register]")
+	if username == "" {
+		return errors.New("prism: usage: prism login <username> [--register] [--password PW]")
 	}
-	username := set.Arg(0)
 
-	secret := *password
+	secret := password
 	if secret == "" {
 		line, err := readPassword(a.out)
 		if err != nil {
@@ -319,7 +338,7 @@ func (a *App) cmdLogin(ctx context.Context, args []string) error {
 		auth *client.Auth
 		err  error
 	)
-	if *register {
+	if register {
 		auth, err = a.client.Register(ctx, username, secret)
 	} else {
 		auth, err = a.client.Login(ctx, username, secret)
@@ -438,8 +457,14 @@ func (a *App) cmdRoom(ctx context.Context, args []string) error {
 		a.printf("left %s\n", room.RoomID)
 		return nil
 	case "queue":
-		if len(args) < 3 || args[1] != "add" {
-			return errors.New("prism: usage: prism room queue add <track-id|index>")
+		if len(args) < 3 {
+			return errors.New("prism: usage: prism room queue add <track-id|index> | prism room queue playlist <id|name>")
+		}
+		if args[1] == "playlist" {
+			return a.roomQueuePlaylist(ctx, args[2])
+		}
+		if args[1] != "add" {
+			return fmt.Errorf("prism: unknown room queue command %q", args[1])
 		}
 		item, err := a.resolveTrack(ctx, args[2])
 		if err != nil {

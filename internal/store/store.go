@@ -199,6 +199,7 @@ var (
 	_ FavoriteRepo = (*DB)(nil)
 	_ RankingRepo  = (*DB)(nil)
 	_ VoteRepo     = (*DB)(nil)
+	_ PlaylistRepo = (*DB)(nil)
 )
 
 // DB is the SQLite-backed store. It implements every repository interface.
@@ -283,6 +284,7 @@ var migrations = []migration{
 	{version: 1, name: "initial schema", sql: schemaV1},
 	{version: 2, name: "votes", sql: schemaV2},
 	{version: 3, name: "media last use", sql: schemaV3},
+	{version: 4, name: "playlists", sql: schemaV4},
 }
 
 func (d *DB) migrate(ctx context.Context) error {

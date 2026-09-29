@@ -273,3 +273,79 @@ func TestSearchWithoutProvidersReportsNothing(t *testing.T) {
 		t.Errorf("search output = %q", out.String())
 	}
 }
+
+func TestPlaylistCommands(t *testing.T) {
+	app, out := testApp(t, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	dir := t.TempDir()
+	tone(t, dir, "First.opus", 0.5)
+	tone(t, dir, "Second.opus", 0.5)
+	if err := app.Run(ctx, []string{"library", "import", dir}); err != nil {
+		t.Fatalf("library import: %v", err)
+	}
+	entries := app.cache.Entries()
+	if len(entries) != 2 {
+		t.Fatalf("cache entries = %d, want 2", len(entries))
+	}
+
+	if err := app.Run(ctx, []string{"playlist", "create", "driving"}); err == nil {
+		t.Fatal("creating a playlist must require a login")
+	}
+	if err := app.Run(ctx, []string{"login", "kyle", "--register", "--password", "hunter2hunter2"}); err != nil {
+		t.Fatalf("login --register: %v", err)
+	}
+	if err := app.Run(ctx, []string{"playlist", "create", "driving"}); err != nil {
+		t.Fatalf("playlist create: %v", err)
+	}
+	// The commands accept a name as readily as an id.
+	if err := app.Run(ctx, []string{"playlist", "add", "driving", entries[0].TrackID, entries[1].TrackID}); err != nil {
+		t.Fatalf("playlist add: %v", err)
+	}
+
+	out.buf.Reset()
+	if err := app.Run(ctx, []string{"playlist", "show", "driving"}); err != nil {
+		t.Fatalf("playlist show: %v", err)
+	}
+	shown := out.String()
+	for _, title := range []string{"First", "Second"} {
+		if !bytes.Contains([]byte(shown), []byte(title)) {
+			t.Errorf("playlist show = %q, missing %s", shown, title)
+		}
+	}
+	if !bytes.Contains([]byte(shown), []byte("0.")) || !bytes.Contains([]byte(shown), []byte("1.")) {
+		t.Errorf("playlist show = %q, want positions", shown)
+	}
+
+	if err := app.Run(ctx, []string{"playlist", "queue", "driving"}); err != nil {
+		t.Fatalf("playlist queue: %v", err)
+	}
+	if len(app.state.Queue) != 2 {
+		t.Fatalf("queue = %d entries, want 2", len(app.state.Queue))
+	}
+
+	if err := app.Run(ctx, []string{"playlist", "rm", "driving", "0"}); err != nil {
+		t.Fatalf("playlist rm: %v", err)
+	}
+	if err := app.Run(ctx, []string{"playlist", "list"}); err != nil {
+		t.Fatalf("playlist list: %v", err)
+	}
+	if !bytes.Contains([]byte(out.String()), []byte("1 track(s)")) {
+		t.Errorf("playlist list = %q, want the new count", out.String())
+	}
+
+	if err := app.Run(ctx, []string{"playlist", "rename", "driving", "night drive"}); err != nil {
+		t.Fatalf("playlist rename: %v", err)
+	}
+	if err := app.Run(ctx, []string{"playlist", "delete", "night drive"}); err != nil {
+		t.Fatalf("playlist delete: %v", err)
+	}
+	out.buf.Reset()
+	if err := app.Run(ctx, []string{"playlist", "list"}); err != nil {
+		t.Fatalf("playlist list: %v", err)
+	}
+	if !bytes.Contains([]byte(out.String()), []byte("no playlists")) {
+		t.Errorf("playlist list = %q, want it empty", out.String())
+	}
+}

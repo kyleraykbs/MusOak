@@ -402,6 +402,163 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
+  /api/v1/me/playlists:
+    get:
+      tags: [auth]
+      summary: List your playlists
+      operationId: listPlaylists
+      responses:
+        "200":
+          description: Your playlists, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [playlists]
+                properties:
+                  playlists:
+                    type: array
+                    items: { $ref: "#/components/schemas/Playlist" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [auth]
+      summary: Create a playlist
+      operationId: createPlaylist
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        "201":
+          description: The new playlist.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Playlist" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/me/playlists/{playlistId}:
+    get:
+      tags: [auth]
+      summary: One playlist with its tracks
+      operationId: getPlaylist
+      parameters: [{ $ref: "#/components/parameters/PlaylistID" }]
+      responses:
+        "200":
+          description: The playlist and its entries in play order.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlaylistDetail" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [auth]
+      summary: Rename a playlist
+      operationId: renamePlaylist
+      parameters: [{ $ref: "#/components/parameters/PlaylistID" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        "200":
+          description: The renamed playlist.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Playlist" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [auth]
+      summary: Delete a playlist
+      operationId: deletePlaylist
+      parameters: [{ $ref: "#/components/parameters/PlaylistID" }]
+      responses:
+        "204": { description: Deleted. }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/me/playlists/{playlistId}/items:
+    post:
+      tags: [auth]
+      summary: Append tracks
+      operationId: addPlaylistItems
+      parameters: [{ $ref: "#/components/parameters/PlaylistID" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                trackId: { type: string, format: uuid }
+                trackIds:
+                  type: array
+                  items: { type: string, format: uuid }
+              description: Either `trackId` or `trackIds`; both may be given.
+      responses:
+        "200":
+          description: The playlist after the change.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlaylistDetail" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/me/playlists/{playlistId}/items/{position}:
+    delete:
+      tags: [auth]
+      summary: Remove the entry at a position
+      operationId: removePlaylistItem
+      parameters:
+        - { $ref: "#/components/parameters/PlaylistID" }
+        - name: position
+          in: path
+          required: true
+          schema: { type: integer, minimum: 0 }
+      responses:
+        "200":
+          description: The playlist after the change.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlaylistDetail" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/me/playlists/{playlistId}/reorder:
+    post:
+      tags: [auth]
+      summary: Reorder the playlist
+      operationId: reorderPlaylist
+      parameters: [{ $ref: "#/components/parameters/PlaylistID" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [order]
+              properties:
+                order:
+                  type: array
+                  description: The current positions, in their new order.
+                  items: { type: integer, minimum: 0 }
+      responses:
+        "200":
+          description: The playlist after the change.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlaylistDetail" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
   /api/v1/clock:
     get:
       summary: Server clock and room rules
@@ -728,6 +885,11 @@ components:
       in: path
       required: true
       schema: { type: string }
+    PlaylistID:
+      name: playlistId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
 
   headers:
     ETag:
@@ -938,6 +1100,31 @@ components:
           type: array
           description: Configured fallback order.
           items: { type: string }
+
+    Playlist:
+      type: object
+      required: [id, name, trackCount]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        trackCount: { type: integer }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    PlaylistDetail:
+      allOf:
+        - $ref: "#/components/schemas/Playlist"
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items:
+                type: object
+                required: [position, track]
+                properties:
+                  position: { type: integer }
+                  track: { $ref: "#/components/schemas/Track" }
 
     SkipRules:
       type: object
