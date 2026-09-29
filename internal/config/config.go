@@ -51,6 +51,16 @@ type Match struct {
 	Threshold float64 `json:"threshold"`
 }
 
+// Client configures client-side behaviour (the CLI, or any other API client)
+// rather than the server.
+type Client struct {
+	// ServerURL is the server to talk to. Empty means the CLI runs its own
+	// server in-process, over loopback.
+	ServerURL string `json:"serverURL"`
+	// CacheDir holds downloaded renditions and the local queue.
+	CacheDir string `json:"cacheDir"`
+}
+
 // Config is the complete configuration, shared by the server and the CLI.
 type Config struct {
 	Listen               string         `json:"listen"`
@@ -62,6 +72,7 @@ type Config struct {
 	PrefetchCount        int            `json:"prefetchCount"`
 	ListenTogether       ListenTogether `json:"listenTogether"`
 	Match                Match          `json:"match"`
+	Client               Client         `json:"client"`
 }
 
 // DefaultMatchThreshold is the score above which two renditions are the same
@@ -83,7 +94,8 @@ func Default() *Config {
 			VoterFractionForSkip: 0.5,
 			ReadyTimeoutSeconds:  30,
 		},
-		Match: Match{Threshold: DefaultMatchThreshold},
+		Match:  Match{Threshold: DefaultMatchThreshold},
+		Client: Client{CacheDir: DefaultCacheDir()},
 	}
 }
 
@@ -107,6 +119,17 @@ func DefaultStorageDir() string {
 			return ""
 		}
 		dir = filepath.Join(home, ".local", "share")
+	}
+	return filepath.Join(dir, appName)
+}
+
+// DefaultCacheDir is $XDG_CACHE_HOME/prismusic, where a client keeps the
+// renditions it has downloaded. It is empty when no cache directory can be
+// determined.
+func DefaultCacheDir() string {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return ""
 	}
 	return filepath.Join(dir, appName)
 }
@@ -149,6 +172,9 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.StorageDir == "" {
 		cfg.StorageDir = DefaultStorageDir()
+	}
+	if cfg.Client.CacheDir == "" {
+		cfg.Client.CacheDir = DefaultCacheDir()
 	}
 
 	if err := cfg.Validate(); err != nil {

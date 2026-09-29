@@ -10,6 +10,10 @@
   "defaultProviderOrder": ["ytmusic", "spotify"],
   "prefetchCount": 3,
   "match": { "threshold": 0.8 },
+  "client": {
+    "serverURL": "",
+    "cacheDir": "/home/alice/.cache/prismusic"
+  },
   "listenTogether": {
     "skipThreshold": 2.0,
     "minVotersForSkip": 2,
