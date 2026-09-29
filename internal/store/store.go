@@ -94,6 +94,13 @@ type Session struct {
 type TrackRepo interface {
 	CreateTrack(ctx context.Context, t *Track) error
 	Track(ctx context.Context, id uuid.UUID) (*Track, error)
+	// TrackByISRC finds the canonical track that already has a variant with
+	// this ISRC (the strongest match signal).
+	TrackByISRC(ctx context.Context, isrc string) (*Track, error)
+	// CandidateTracks lists tracks whose duration is close enough to be the
+	// same recording, or that have no known duration. A non-positive
+	// durationMs means "no duration filter".
+	CandidateTracks(ctx context.Context, durationMs, toleranceMs int64, limit int) ([]Track, error)
 	SetTrackDuration(ctx context.Context, id uuid.UUID, durationMs int64) error
 	TrackArtists(ctx context.Context, id uuid.UUID) ([]Artist, error)
 	SetTrackArtists(ctx context.Context, id uuid.UUID, names []string) error
@@ -150,6 +157,27 @@ type RankingRepo interface {
 	AllRankings(ctx context.Context) (map[uuid.UUID][]string, error)
 }
 
+// Vote is one room member's score for the track playing in that room.
+type Vote struct {
+	RoomID    string
+	TrackID   uuid.UUID
+	MemberID  string
+	UserID    *uuid.UUID
+	Score     int
+	CreatedAt time.Time
+}
+
+// VoteRepo stores room votes so they outlive the room.
+type VoteRepo interface {
+	// SaveVote records (or replaces) a member's vote for a track in a room.
+	SaveVote(ctx context.Context, v *Vote) error
+	// TrackVotes lists every vote a track received in a room.
+	TrackVotes(ctx context.Context, roomID string, trackID uuid.UUID) ([]Vote, error)
+	// TrackVoteStats returns the vote count and mean score for a track
+	// across all rooms.
+	TrackVoteStats(ctx context.Context, trackID uuid.UUID) (int, float64, error)
+}
+
 var (
 	_ TrackRepo    = (*DB)(nil)
 	_ VariantRepo  = (*DB)(nil)
@@ -158,6 +186,7 @@ var (
 	_ SessionRepo  = (*DB)(nil)
 	_ FavoriteRepo = (*DB)(nil)
 	_ RankingRepo  = (*DB)(nil)
+	_ VoteRepo     = (*DB)(nil)
 )
 
 // DB is the SQLite-backed store. It implements every repository interface.
@@ -240,6 +269,7 @@ type migration struct {
 // migrations are append-only; never edit an applied migration.
 var migrations = []migration{
 	{version: 1, name: "initial schema", sql: schemaV1},
+	{version: 2, name: "votes", sql: schemaV2},
 }
 
 func (d *DB) migrate(ctx context.Context) error {

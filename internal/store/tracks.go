@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -115,18 +116,69 @@ func (d *DB) CreateTrack(ctx context.Context, t *Track) error {
 
 // Track returns the track by id.
 func (d *DB) Track(ctx context.Context, id uuid.UUID) (*Track, error) {
-	var (
-		t       Track
-		idStr   string
-		created int64
-	)
-	err := d.db.QueryRowContext(ctx,
-		`SELECT id, title, duration_ms, created_at FROM tracks WHERE id = ?`, id.String()).
-		Scan(&idStr, &t.Title, &t.DurationMs, &created)
+	row := d.db.QueryRowContext(ctx,
+		`SELECT id, title, duration_ms, created_at FROM tracks WHERE id = ?`, id.String())
+	return scanTrack(row)
+}
+
+// TrackByISRC returns the canonical track owning a variant with this ISRC.
+func (d *DB) TrackByISRC(ctx context.Context, isrc string) (*Track, error) {
+	isrc = strings.ToUpper(strings.TrimSpace(isrc))
+	if isrc == "" {
+		return nil, ErrNotFound
+	}
+	row := d.db.QueryRowContext(ctx, `
+		SELECT t.id, t.title, t.duration_ms, t.created_at
+		FROM tracks t
+		JOIN variants v ON v.track_id = t.id
+		WHERE v.isrc = ?
+		ORDER BY t.created_at
+		LIMIT 1`, isrc)
+	return scanTrack(row)
+}
+
+// CandidateTracks lists tracks a new rendition could belong to: those whose
+// duration is within tolerance, plus those whose duration is unknown. A
+// non-positive durationMs disables the filter.
+func (d *DB) CandidateTracks(ctx context.Context, durationMs, toleranceMs int64, limit int) ([]Track, error) {
+	if limit <= 0 {
+		limit = defaultCandidateLimit
+	}
+	rows, err := d.db.QueryContext(ctx, `
+		SELECT id, title, duration_ms, created_at FROM tracks
+		WHERE ? <= 0 OR duration_ms = 0 OR ABS(duration_ms - ?) <= ?
+		ORDER BY created_at DESC
+		LIMIT ?`, durationMs, durationMs, toleranceMs, limit)
 	if err != nil {
 		return nil, mapErr(err)
 	}
-	if t.ID, err = parseUUID(idStr); err != nil {
+	defer rows.Close()
+
+	var tracks []Track
+	for rows.Next() {
+		t, err := scanTrack(rows)
+		if err != nil {
+			return nil, err
+		}
+		tracks = append(tracks, *t)
+	}
+	return tracks, mapErr(rows.Err())
+}
+
+// defaultCandidateLimit bounds how many tracks a match attempt scores.
+const defaultCandidateLimit = 500
+
+func scanTrack(row rowScanner) (*Track, error) {
+	var (
+		t       Track
+		id      string
+		created int64
+	)
+	if err := row.Scan(&id, &t.Title, &t.DurationMs, &created); err != nil {
+		return nil, mapErr(err)
+	}
+	var err error
+	if t.ID, err = parseUUID(id); err != nil {
 		return nil, err
 	}
 	t.CreatedAt = time.UnixMilli(created).UTC()

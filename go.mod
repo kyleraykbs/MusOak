@@ -3,8 +3,10 @@ module codeberg.org/kyleraykbs/prismusic
 go 1.26.5
 
 require (
+	github.com/coder/websocket v1.8.15
 	github.com/dhowden/tag v0.0.0-20240417053706-3d75831295e8
 	github.com/google/uuid v1.6.0
+	golang.org/x/crypto v0.57.0
 	golang.org/x/sync v0.23.0
 	modernc.org/sqlite v1.60.0
 )

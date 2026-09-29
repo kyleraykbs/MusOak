@@ -39,6 +39,9 @@ func TestLoadExample(t *testing.T) {
 	if cfg.ListenTogether.ReadyTimeoutSeconds != 30 {
 		t.Errorf("readyTimeoutSeconds = %d, want 30", cfg.ListenTogether.ReadyTimeoutSeconds)
 	}
+	if cfg.Match.Threshold != DefaultMatchThreshold {
+		t.Errorf("match.threshold = %v, want %v", cfg.Match.Threshold, DefaultMatchThreshold)
+	}
 	if !cfg.Providers.YTMusic.Enabled || cfg.Providers.Spotify.Enabled {
 		t.Errorf("unexpected provider enablement: %+v", cfg.Providers)
 	}
@@ -118,6 +121,7 @@ func TestValidateErrors(t *testing.T) {
 		{"no voters", func(c *Config) { c.ListenTogether.MinVotersForSkip = 0 }, "minVotersForSkip"},
 		{"fraction high", func(c *Config) { c.ListenTogether.VoterFractionForSkip = 1.5 }, "voterFractionForSkip"},
 		{"negative timeout", func(c *Config) { c.ListenTogether.ReadyTimeoutSeconds = -1 }, "readyTimeoutSeconds"},
+		{"bad match threshold", func(c *Config) { c.Match.Threshold = 1.5 }, "match.threshold"},
 		{"empty order", func(c *Config) { c.DefaultProviderOrder = nil }, "must not be empty"},
 		{"unknown order", func(c *Config) { c.DefaultProviderOrder = []string{"deezer"} }, "unknown provider"},
 		{"duplicate order", func(c *Config) { c.DefaultProviderOrder = []string{"ytmusic", "ytmusic"} }, "duplicate provider"},

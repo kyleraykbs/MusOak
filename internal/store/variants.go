@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -52,6 +53,7 @@ func (d *DB) CreateVariant(ctx context.Context, v *Variant) error {
 	if v.CreatedAt.IsZero() {
 		v.CreatedAt = time.Now()
 	}
+	v.ISRC = strings.ToUpper(strings.TrimSpace(v.ISRC))
 	artists := v.Artists
 	if artists == nil {
 		artists = []string{}

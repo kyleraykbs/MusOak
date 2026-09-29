@@ -9,6 +9,7 @@
   },
   "defaultProviderOrder": ["ytmusic", "spotify"],
   "prefetchCount": 3,
+  "match": { "threshold": 0.8 },
   "listenTogether": {
     "skipThreshold": 2.0,
     "minVotersForSkip": 2,

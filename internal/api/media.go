@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/google/uuid"
@@ -40,15 +41,7 @@ func (s *Server) handleMediaStatus(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	status := s.media.Status(r.Context(), id)
-	writeJSON(w, http.StatusOK, mediaStatusResponse{
-		VariantID:  status.VariantID.String(),
-		State:      string(status.State),
-		Progress:   status.Progress,
-		Error:      status.Err,
-		DurationMs: status.DurationMs,
-		Bytes:      status.Bytes,
-	})
+	writeJSON(w, http.StatusOK, s.mediaStatus(r.Context(), id))
 }
 
 type mediaStatusResponse struct {
@@ -58,4 +51,63 @@ type mediaStatusResponse struct {
 	Error      string  `json:"error,omitempty"`
 	DurationMs int64   `json:"durationMs,omitempty"`
 	Bytes      int64   `json:"bytes,omitempty"`
+}
+
+func (s *Server) mediaStatus(ctx context.Context, variantID uuid.UUID) mediaStatusResponse {
+	status := s.media.Status(ctx, variantID)
+	return mediaStatusResponse{
+		VariantID:  status.VariantID.String(),
+		State:      string(status.State),
+		Progress:   status.Progress,
+		Error:      status.Err,
+		DurationMs: status.DurationMs,
+		Bytes:      status.Bytes,
+	}
+}
+
+// handleMediaDownload starts (or joins) a variant's download. It is
+// idempotent: concurrent callers share one transfer. Poll the status endpoint
+// to watch progress, or pass wait=1 to block until the file is ready.
+func (s *Server) handleMediaDownload(w http.ResponseWriter, r *http.Request) {
+	id, ok := variantIDFromPath(w, r)
+	if !ok {
+		return
+	}
+	variant, err := s.store.Variant(r.Context(), id)
+	if err != nil {
+		writeStoreError(w, err, "variant not found")
+		return
+	}
+	if !variant.Downloadable {
+		writeError(w, http.StatusConflict,
+			"variant is not downloadable; resolve its track first (POST /api/v1/tracks/{trackId}/resolve)")
+		return
+	}
+
+	if waitParam(r) {
+		if _, err := s.media.Ensure(r.Context(), id); err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, s.mediaStatus(r.Context(), id))
+		return
+	}
+
+	// Detached so the download survives the client hanging up: the manager
+	// deduplicates it with every other requester anyway.
+	ctx := context.WithoutCancel(r.Context())
+	go func() {
+		if _, err := s.media.Ensure(ctx, id); err != nil {
+			s.logger.Warn("media download failed", "variant", id, "error", err)
+		}
+	}()
+	writeJSON(w, http.StatusAccepted, s.mediaStatus(r.Context(), id))
+}
+
+func waitParam(r *http.Request) bool {
+	switch r.URL.Query().Get("wait") {
+	case "1", "true", "yes":
+		return true
+	}
+	return false
 }

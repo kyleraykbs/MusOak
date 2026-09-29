@@ -13,10 +13,14 @@ import (
 	"strings"
 	"time"
 
+	"codeberg.org/kyleraykbs/prismusic/internal/auth"
 	"codeberg.org/kyleraykbs/prismusic/internal/config"
+	"codeberg.org/kyleraykbs/prismusic/internal/match"
 	"codeberg.org/kyleraykbs/prismusic/internal/media"
 	"codeberg.org/kyleraykbs/prismusic/internal/provider"
 	"codeberg.org/kyleraykbs/prismusic/internal/provider/ytmusic"
+	"codeberg.org/kyleraykbs/prismusic/internal/ranking"
+	"codeberg.org/kyleraykbs/prismusic/internal/rooms"
 	"codeberg.org/kyleraykbs/prismusic/internal/store"
 )
 
@@ -35,6 +39,10 @@ type Server struct {
 	store     *store.DB
 	providers *provider.Registry
 	media     *media.Manager
+	matcher   *match.Matcher
+	auth      *auth.Service
+	ranking   *ranking.Service
+	rooms     *rooms.Manager
 }
 
 // New builds the server: it opens the store and instantiates the enabled
@@ -53,6 +61,10 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		providers: provider.NewRegistry(logger, ProviderTimeout),
 	}
 	s.media = media.New(filepath.Join(cfg.StorageDir, "media"), db, s.providers, logger)
+	s.matcher = match.New(db, s.providers, cfg.Match.Threshold, logger)
+	s.auth = auth.New(cfg, db, logger)
+	s.ranking = ranking.New(db, cfg.DefaultProviderOrder, logger)
+	s.rooms = rooms.NewManager(cfg, db, s.matcher, s.ranking, logger)
 
 	s.registerProviders()
 	s.logProviderDeps()
@@ -62,6 +74,9 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 
 // Close releases the server's resources.
 func (s *Server) Close() error {
+	if s.rooms != nil {
+		s.rooms.Close()
+	}
 	if s.store == nil {
 		return nil
 	}
@@ -100,12 +115,44 @@ func depHint(bin string) string {
 }
 
 // Handler exposes the HTTP handler for tests.
-func (s *Server) Handler() http.Handler { return s.mux }
+func (s *Server) Handler() http.Handler { return s.withAuth(s.mux) }
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
+	s.mux.HandleFunc("GET /api/v1/providers", s.handleProviders)
+	s.mux.HandleFunc("GET /api/v1/search", s.handleSearch)
+	s.mux.HandleFunc("GET /api/v1/tracks/{trackId}", s.handleTrack)
+	s.mux.HandleFunc("GET /api/v1/tracks/{trackId}/variants", s.handleTrackVariants)
+	s.mux.HandleFunc("POST /api/v1/tracks/{trackId}/resolve", s.handleTrackResolve)
 	s.mux.HandleFunc("GET /api/v1/media/{variantId}", s.handleMediaFile)
 	s.mux.HandleFunc("GET /api/v1/media/{variantId}/status", s.handleMediaStatus)
+	s.mux.HandleFunc("POST /api/v1/media/{variantId}/download", s.handleMediaDownload)
+	s.mux.HandleFunc("POST /api/v1/library/import", s.handleLibraryImport)
+	s.mux.HandleFunc("POST /api/v1/auth/register", s.handleRegister)
+	s.mux.HandleFunc("POST /api/v1/auth/login", s.handleLogin)
+	s.mux.HandleFunc("POST /api/v1/auth/logout", s.handleLogout)
+	s.mux.HandleFunc("GET /api/v1/me", s.handleMe)
+	s.mux.HandleFunc("GET /api/v1/me/favorites", s.handleFavoritesList)
+	s.mux.HandleFunc("POST /api/v1/me/favorites", s.handleFavoriteAdd)
+	s.mux.HandleFunc("DELETE /api/v1/me/favorites/{trackId}", s.handleFavoriteRemove)
+	s.mux.HandleFunc("GET /api/v1/me/providers/ranking", s.handleRankingGet)
+	s.mux.HandleFunc("PUT /api/v1/me/providers/ranking", s.handleRankingPut)
+	s.mux.HandleFunc("GET /api/v1/clock", s.handleClock)
+	s.mux.HandleFunc("GET /api/v1/ws", s.handleWS)
+	s.mux.HandleFunc("GET /api/v1/rooms", s.handleRoomList)
+	s.mux.HandleFunc("POST /api/v1/rooms", s.handleRoomCreate)
+	s.mux.HandleFunc("GET /api/v1/rooms/{roomId}", s.handleRoomGet)
+	s.mux.HandleFunc("POST /api/v1/rooms/{roomId}/join", s.handleRoomJoin)
+	s.mux.HandleFunc("POST /api/v1/rooms/{roomId}/leave", s.handleRoomLeave)
+	s.mux.HandleFunc("POST /api/v1/rooms/{roomId}/queue", s.handleRoomEnqueue)
+	s.mux.HandleFunc("DELETE /api/v1/rooms/{roomId}/queue/{itemId}", s.handleRoomRemove)
+	s.mux.HandleFunc("POST /api/v1/rooms/{roomId}/queue/reorder", s.handleRoomReorder)
+	s.mux.HandleFunc("POST /api/v1/rooms/{roomId}/pause", s.handleRoomPause)
+	s.mux.HandleFunc("POST /api/v1/rooms/{roomId}/resume", s.handleRoomResume)
+	s.mux.HandleFunc("POST /api/v1/rooms/{roomId}/skip", s.handleRoomSkip)
+	s.mux.HandleFunc("POST /api/v1/rooms/{roomId}/seek", s.handleRoomSeek)
+	s.mux.HandleFunc("POST /api/v1/rooms/{roomId}/vote", s.handleRoomVote)
+	s.mux.HandleFunc("POST /api/v1/rooms/{roomId}/ready", s.handleRoomReady)
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {

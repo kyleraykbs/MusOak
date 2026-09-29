@@ -46,6 +46,11 @@ type ListenTogether struct {
 	ReadyTimeoutSeconds  int     `json:"readyTimeoutSeconds"`
 }
 
+// Match tunes cross-provider track merging.
+type Match struct {
+	Threshold float64 `json:"threshold"`
+}
+
 // Config is the complete configuration, shared by the server and the CLI.
 type Config struct {
 	Listen               string         `json:"listen"`
@@ -56,7 +61,12 @@ type Config struct {
 	DefaultProviderOrder []string       `json:"defaultProviderOrder"`
 	PrefetchCount        int            `json:"prefetchCount"`
 	ListenTogether       ListenTogether `json:"listenTogether"`
+	Match                Match          `json:"match"`
 }
+
+// DefaultMatchThreshold is the score above which two renditions are the same
+// recording.
+const DefaultMatchThreshold = 0.8
 
 // Default returns the built-in configuration.
 func Default() *Config {
@@ -73,6 +83,7 @@ func Default() *Config {
 			VoterFractionForSkip: 0.5,
 			ReadyTimeoutSeconds:  30,
 		},
+		Match: Match{Threshold: DefaultMatchThreshold},
 	}
 }
 
@@ -174,6 +185,10 @@ func (c *Config) Validate() error {
 	}
 	if lt.ReadyTimeoutSeconds < 0 {
 		return fmt.Errorf("listenTogether.readyTimeoutSeconds must be >= 0, got %d", lt.ReadyTimeoutSeconds)
+	}
+
+	if c.Match.Threshold <= 0 || c.Match.Threshold > 1 {
+		return fmt.Errorf("match.threshold must be in (0, 1], got %g", c.Match.Threshold)
 	}
 
 	if len(c.DefaultProviderOrder) == 0 {
