@@ -63,7 +63,7 @@
             pname = "prismusic";
             inherit version;
             src = lib.cleanSource ./.;
-            vendorHash = "sha256-yjUzphFaFxmjTgDb0UuI/ZkyOccYOpcstLhXTeLcMTA=";
+            vendorHash = "sha256-qAU2YSYCvMRLuU+LJxnw1WhikvmFAQr50HcbHL6og6Q=";
             subPackages = [
               "cmd/prism"
               "cmd/prismusicd"

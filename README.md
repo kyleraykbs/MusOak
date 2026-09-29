@@ -117,6 +117,24 @@ prism room queue add|vote|skip|pause|resume|seek|now
 prism serve                           run the server in the foreground
 ```
 
+### Player keys
+
+`prism play` keeps a status line while it plays, and takes single keys without
+Enter:
+
+| key | action |
+| --- | --- |
+| `k` / `↑` | volume up |
+| `j` / `↓` | volume down |
+| `l` / `→` | next track |
+| `h` / `←` | previous track |
+| `space` | pause / resume |
+| `q` | quit |
+
+Skipping to a track that is still downloading is remembered and applied as soon
+as it is ready. Without a terminal on stdin, playback stays non-interactive and
+prints one line per track.
+
 Headless machines can play through a null sink:
 `PRISM_MPV_ARGS="--ao=null --no-video" prism play`.
 

@@ -368,6 +368,74 @@ func (s *MpvSink) Close() {
 	s.process.close()
 }
 
+// --- transport controls (interactive playback) ------------------------------
+
+// volume reports mpv's volume as a percentage.
+func (m *mpvProcess) volume(ctx context.Context) (int, error) {
+	raw, err := m.property(ctx, "volume")
+	if err != nil {
+		return 0, err
+	}
+	var level float64
+	if err := json.Unmarshal(raw, &level); err != nil {
+		return 0, nil
+	}
+	return int(level + 0.5), nil
+}
+
+func (m *mpvProcess) setVolume(ctx context.Context, volume int) error {
+	_, err := m.command(ctx, "set_property", "volume", volume)
+	return err
+}
+
+func (m *mpvProcess) pauseState(ctx context.Context) (bool, error) {
+	raw, err := m.property(ctx, "pause")
+	if err != nil {
+		return false, err
+	}
+	var paused bool
+	if err := json.Unmarshal(raw, &paused); err != nil {
+		return false, nil
+	}
+	return paused, nil
+}
+
+// durationMs reports the length of the loaded file.
+func (m *mpvProcess) durationMs(ctx context.Context) (int64, error) {
+	raw, err := m.property(ctx, "duration")
+	if err != nil {
+		return 0, err
+	}
+	var seconds *float64
+	if err := json.Unmarshal(raw, &seconds); err != nil || seconds == nil {
+		return 0, nil
+	}
+	return int64(*seconds * 1000), nil
+}
+
+// playlistPosition is the index of the playing entry, or -1 when idle.
+func (m *mpvProcess) playlistPosition(ctx context.Context) (int, error) {
+	raw, err := m.property(ctx, "playlist-pos")
+	if err != nil {
+		return -1, err
+	}
+	var position *int
+	if err := json.Unmarshal(raw, &position); err != nil || position == nil {
+		return -1, nil
+	}
+	return *position, nil
+}
+
+func (m *mpvProcess) nextEntry(ctx context.Context) error {
+	_, err := m.command(ctx, "playlist-next")
+	return err
+}
+
+func (m *mpvProcess) previousEntry(ctx context.Context) error {
+	_, err := m.command(ctx, "playlist-prev")
+	return err
+}
+
 // --- queue playback (prism play) -------------------------------------------
 
 // StartFile replaces the playlist with path and starts playing.

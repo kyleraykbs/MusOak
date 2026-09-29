@@ -23,11 +23,17 @@ func (a *App) cmdPlay(ctx context.Context, args []string) error {
 	}
 	defer sink.Close()
 
+	ui := newPlayer(a.out, sink, queue)
+	ui.start(ctx)
+	defer ui.stop()
+
 	prefetch := a.cfg.PrefetchCount
 	if prefetch < 0 {
 		prefetch = 0
 	}
-	a.printf("playing %d track(s), %d prefetched ahead\n", len(queue), prefetch)
+	if !ui.interactive {
+		a.printf("playing %d track(s), %d prefetched ahead\n", len(queue), prefetch)
+	}
 
 	// One download per queue entry, started as the window slides forward.
 	type ready struct {
@@ -57,19 +63,21 @@ func (a *App) cmdPlay(ctx context.Context, args []string) error {
 		if slot.err != nil {
 			return fmt.Errorf("prism: %s: %w", slot.item.Title, slot.err)
 		}
-		a.printf("%3d. %s\n", queued, slot.item.Title)
+		if !ui.interactive {
+			a.printf("%3d. %s\n", queued, slot.item.Title)
+		}
 
 		if queued == 0 {
-			if err := sink.StartFile(ctx, slot.entry.Path, 0); err != nil {
+			if err := ui.startTrack(ctx, slot.entry); err != nil {
 				return err
 			}
-		} else if err := sink.AppendFile(ctx, slot.entry.Path); err != nil {
+		} else if err := ui.appendTrack(ctx, slot.entry); err != nil {
 			return err
 		}
 		queued++
 	}
 
-	return sink.WaitIdle(ctx)
+	return ui.wait(ctx)
 }
 
 // ensureTrack makes sure a rendition of the track is on disk locally. A copy
