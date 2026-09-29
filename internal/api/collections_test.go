@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 
@@ -10,11 +11,12 @@ import (
 
 // fakeCollectionsProvider serves album and artist browsing.
 type fakeCollectionsProvider struct {
-	name     string
-	albums   []provider.Album
-	details  map[string]*provider.AlbumDetail
-	artists  []provider.Artist
-	byArtist map[string][]provider.Album
+	name      string
+	albums    []provider.Album
+	details   map[string]*provider.AlbumDetail
+	artists   []provider.Artist
+	byArtist  map[string][]provider.Album
+	searchErr error
 }
 
 func (f *fakeCollectionsProvider) Name() string { return f.name }
@@ -26,6 +28,9 @@ func (f *fakeCollectionsProvider) Search(ctx context.Context, q string, opts pro
 }
 func (f *fakeCollectionsProvider) Download(ctx context.Context, id, dest string) error { return nil }
 func (f *fakeCollectionsProvider) SearchAlbums(ctx context.Context, q string, opts provider.SearchOpts) ([]provider.Album, error) {
+	if f.searchErr != nil {
+		return nil, f.searchErr
+	}
 	return f.albums, nil
 }
 func (f *fakeCollectionsProvider) Album(ctx context.Context, id string) (*provider.AlbumDetail, error) {
@@ -36,6 +41,9 @@ func (f *fakeCollectionsProvider) Album(ctx context.Context, id string) (*provid
 	return detail, nil
 }
 func (f *fakeCollectionsProvider) SearchArtists(ctx context.Context, q string, opts provider.SearchOpts) ([]provider.Artist, error) {
+	if f.searchErr != nil {
+		return nil, f.searchErr
+	}
 	return f.artists, nil
 }
 func (f *fakeCollectionsProvider) ArtistAlbums(ctx context.Context, id string) ([]provider.Album, error) {
@@ -228,5 +236,35 @@ func TestArtistEndpoints(t *testing.T) {
 
 	if rec := c.do(http.MethodGet, "/api/v1/artists/00000000-0000-0000-0000-000000000000", "", nil); rec.Code != http.StatusNotFound {
 		t.Errorf("unknown artist = %d, want 404", rec.Code)
+	}
+}
+
+// TestCollectionSearchErrorShape pins the wire contract: every search endpoint
+// reports provider failures with the same keys, because a client parses one
+// shape everywhere. (The GUI found this by showing "None: None".)
+func TestCollectionSearchErrorShape(t *testing.T) {
+	c := newHTTPTestServer(t, nil)
+	broken := &fakeCollectionsProvider{name: "ytmusic", searchErr: errors.New("upstream is down")}
+	c.providers.Register(broken)
+
+	for _, path := range []string{"/api/v1/albums/search?q=x", "/api/v1/artists/search?q=x"} {
+		rec := c.do(http.MethodGet, path, "", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s = %d", path, rec.Code)
+		}
+		var payload struct {
+			ProviderErrors []map[string]any `json:"providerErrors"`
+		}
+		c.decode(rec, &payload)
+		if len(payload.ProviderErrors) != 1 {
+			t.Fatalf("%s: providerErrors = %+v", path, payload.ProviderErrors)
+		}
+		problem := payload.ProviderErrors[0]
+		if problem["provider"] != "ytmusic" {
+			t.Errorf("%s: provider key = %v (want lowercase \"provider\")", path, problem)
+		}
+		if _, ok := problem["error"]; !ok {
+			t.Errorf("%s: no lowercase \"error\" key: %v", path, problem)
+		}
 	}
 }

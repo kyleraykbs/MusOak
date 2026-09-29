@@ -185,7 +185,7 @@ func (s *Server) handleAlbumSearch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"query":          query,
 		"albums":         out,
-		"providerErrors": problems,
+		"providerErrors": problemsJSON(problems),
 	})
 }
 
@@ -221,8 +221,18 @@ func (s *Server) handleArtistSearch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"query":          query,
 		"artists":        out,
-		"providerErrors": problems,
+		"providerErrors": problemsJSON(problems),
 	})
+}
+
+// problemsJSON renders collection provider failures with the same keys the
+// track search uses, so a client parses one shape everywhere.
+func problemsJSON(problems []library.ProviderError) []providerProblem {
+	out := make([]providerProblem, 0, len(problems))
+	for _, problem := range problems {
+		out = append(out, providerProblem{Provider: problem.Provider, Error: problem.Error})
+	}
+	return out
 }
 
 // handleAlbum returns one album with its tracks.
