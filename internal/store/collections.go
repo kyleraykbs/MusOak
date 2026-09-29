@@ -237,8 +237,8 @@ func (d *DB) Album(ctx context.Context, id uuid.UUID) (*Album, error) {
 		created int64
 	)
 	err := d.db.QueryRowContext(ctx,
-		`SELECT id, title, created_at FROM albums WHERE id = ?`, id.String()).
-		Scan(&idStr, &album.Title, &created)
+		`SELECT id, title, created_at, artwork_url FROM albums WHERE id = ?`, id.String()).
+		Scan(&idStr, &album.Title, &created, &album.ArtworkURL)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -254,7 +254,7 @@ func (d *DB) Album(ctx context.Context, id uuid.UUID) (*Album, error) {
 // AlbumArtists lists an album's credited artists.
 func (d *DB) AlbumArtists(ctx context.Context, id uuid.UUID) ([]Artist, error) {
 	rows, err := d.db.QueryContext(ctx, `
-		SELECT a.id, a.name FROM artists a
+		SELECT a.id, a.name, a.artwork_url FROM artists a
 		JOIN album_artists aa ON aa.artist_id = a.id
 		WHERE aa.album_id = ? ORDER BY aa.position`, id.String())
 	if err != nil {
@@ -268,7 +268,7 @@ func (d *DB) AlbumArtists(ctx context.Context, id uuid.UUID) ([]Artist, error) {
 			artist Artist
 			idStr  string
 		)
-		if err := rows.Scan(&idStr, &artist.Name); err != nil {
+		if err := rows.Scan(&idStr, &artist.Name, &artist.ArtworkURL); err != nil {
 			return nil, mapErr(err)
 		}
 		if artist.ID, err = parseUUID(idStr); err != nil {
@@ -437,7 +437,7 @@ func insertAlbumTracks(ctx context.Context, tx txLike, albumID uuid.UUID, trackI
 // AlbumTracks lists an album's tracks in album order.
 func (d *DB) AlbumTracks(ctx context.Context, albumID uuid.UUID) ([]Track, error) {
 	rows, err := d.db.QueryContext(ctx, `
-		SELECT t.id, t.title, t.duration_ms, t.created_at
+		SELECT t.id, t.title, t.duration_ms, t.created_at, t.artwork_url
 		FROM tracks t
 		JOIN album_tracks at ON at.track_id = t.id
 		WHERE at.album_id = ? ORDER BY at.position`, albumID.String())
@@ -460,7 +460,7 @@ func (d *DB) AlbumTracks(ctx context.Context, albumID uuid.UUID) ([]Track, error
 // AlbumsForArtist lists the albums an artist is credited on.
 func (d *DB) AlbumsForArtist(ctx context.Context, artistID uuid.UUID) ([]Album, error) {
 	rows, err := d.db.QueryContext(ctx, `
-		SELECT al.id, al.title, al.created_at
+		SELECT al.id, al.title, al.created_at, al.artwork_url
 		FROM albums al
 		JOIN album_artists aa ON aa.album_id = al.id
 		WHERE aa.artist_id = ?
@@ -477,7 +477,7 @@ func (d *DB) AlbumsForArtist(ctx context.Context, artistID uuid.UUID) ([]Album, 
 			idStr   string
 			created int64
 		)
-		if err := rows.Scan(&idStr, &album.Title, &created); err != nil {
+		if err := rows.Scan(&idStr, &album.Title, &created, &album.ArtworkURL); err != nil {
 			return nil, mapErr(err)
 		}
 		var err error
@@ -506,8 +506,8 @@ func (d *DB) Artist(ctx context.Context, id uuid.UUID) (*Artist, error) {
 		artist Artist
 		idStr  string
 	)
-	if err := d.db.QueryRowContext(ctx, `SELECT id, name FROM artists WHERE id = ?`, id.String()).
-		Scan(&idStr, &artist.Name); err != nil {
+	if err := d.db.QueryRowContext(ctx, `SELECT id, name, artwork_url FROM artists WHERE id = ?`, id.String()).
+		Scan(&idStr, &artist.Name, &artist.ArtworkURL); err != nil {
 		return nil, mapErr(err)
 	}
 	var err error
@@ -523,8 +523,8 @@ func (d *DB) ArtistByName(ctx context.Context, name string) (*Artist, error) {
 		artist Artist
 		idStr  string
 	)
-	if err := d.db.QueryRowContext(ctx, `SELECT id, name FROM artists WHERE name = ?`, name).
-		Scan(&idStr, &artist.Name); err != nil {
+	if err := d.db.QueryRowContext(ctx, `SELECT id, name, artwork_url FROM artists WHERE name = ?`, name).
+		Scan(&idStr, &artist.Name, &artist.ArtworkURL); err != nil {
 		return nil, mapErr(err)
 	}
 	var err error
@@ -640,7 +640,7 @@ func (d *DB) AlbumCandidates(ctx context.Context, titleKey, artistKey string, li
 		limit = 50
 	}
 	rows, err := d.db.QueryContext(ctx, `
-		SELECT id, title, created_at FROM albums
+		SELECT id, title, created_at, artwork_url FROM albums
 		WHERE title_key = ? OR artist_key = ?
 		ORDER BY CASE WHEN title_key = ? THEN 0 ELSE 1 END, title
 		LIMIT ?`, titleKey, artistKey, titleKey, limit)
@@ -658,7 +658,7 @@ func (d *DB) ArtistCandidates(ctx context.Context, normalized string, limit int)
 		limit = 25
 	}
 	rows, err := d.db.QueryContext(ctx,
-		`SELECT id, name FROM artists WHERE lower(trim(name)) = ? LIMIT ?`, normalized, limit)
+		`SELECT id, name, artwork_url FROM artists WHERE lower(trim(name)) = ? LIMIT ?`, normalized, limit)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -670,7 +670,7 @@ func (d *DB) ArtistCandidates(ctx context.Context, normalized string, limit int)
 			artist Artist
 			idStr  string
 		)
-		if err := rows.Scan(&idStr, &artist.Name); err != nil {
+		if err := rows.Scan(&idStr, &artist.Name, &artist.ArtworkURL); err != nil {
 			return nil, mapErr(err)
 		}
 		if artist.ID, err = parseUUID(idStr); err != nil {
@@ -693,7 +693,7 @@ func scanAlbums(rows interface {
 			idStr   string
 			created int64
 		)
-		if err := rows.Scan(&idStr, &album.Title, &created); err != nil {
+		if err := rows.Scan(&idStr, &album.Title, &created, &album.ArtworkURL); err != nil {
 			return nil, mapErr(err)
 		}
 		var err error

@@ -29,6 +29,7 @@ type albumResponse struct {
 	Year       string                 `json:"year,omitempty"`
 	TrackCount int                    `json:"trackCount"`
 	Providers  []string               `json:"providers"`
+	ArtworkURL string                 `json:"artworkUrl,omitempty"`
 	Variants   []albumVariantResponse `json:"variants,omitempty"`
 	Tracks     []trackResponse        `json:"tracks,omitempty"`
 }
@@ -41,11 +42,12 @@ type artistVariantResponse struct {
 }
 
 type artistResponse struct {
-	ID        string                  `json:"id"`
-	Name      string                  `json:"name"`
-	Providers []string                `json:"providers"`
-	Variants  []artistVariantResponse `json:"variants,omitempty"`
-	Albums    []albumResponse         `json:"albums,omitempty"`
+	ID         string                  `json:"id"`
+	Name       string                  `json:"name"`
+	Providers  []string                `json:"providers"`
+	ArtworkURL string                  `json:"artworkUrl,omitempty"`
+	Variants   []artistVariantResponse `json:"variants,omitempty"`
+	Albums     []albumResponse         `json:"albums,omitempty"`
 }
 
 type syncRequest struct {
@@ -78,6 +80,9 @@ func (s *Server) buildAlbum(ctx context.Context, album *library.Album, withTrack
 	}
 	for _, artist := range album.Artists {
 		out.Artists = append(out.Artists, artist.Name)
+	}
+	if album.Album.ArtworkURL != "" {
+		out.ArtworkURL = artworkPath(store.ArtworkAlbum, album.Album.ID)
 	}
 	seen := map[string]bool{}
 	for _, variant := range album.Variants {
@@ -118,6 +123,9 @@ func (s *Server) buildArtist(ctx context.Context, artist *library.Artist, withAl
 		Name:      artist.Artist.Name,
 		Providers: make([]string, 0, len(artist.Variants)),
 		Variants:  make([]artistVariantResponse, 0, len(artist.Variants)),
+	}
+	if artist.Artist.ArtworkURL != "" {
+		out.ArtworkURL = artworkPath(store.ArtworkArtist, artist.Artist.ID)
 	}
 	for _, variant := range artist.Variants {
 		out.Providers = append(out.Providers, variant.Provider)
@@ -219,7 +227,7 @@ func (s *Server) handleArtistSearch(w http.ResponseWriter, r *http.Request) {
 
 // handleAlbum returns one album with its tracks.
 func (s *Server) handleAlbum(w http.ResponseWriter, r *http.Request) {
-	albumID, ok := s.collectionID(w, r, "albumId", library.ErrNoAlbum)
+	albumID, ok := s.collectionID(w, r, "albumId")
 	if !ok {
 		return
 	}
@@ -238,7 +246,7 @@ func (s *Server) handleAlbum(w http.ResponseWriter, r *http.Request) {
 
 // handleArtist returns one artist with their albums.
 func (s *Server) handleArtist(w http.ResponseWriter, r *http.Request) {
-	artistID, ok := s.collectionID(w, r, "artistId", library.ErrNoArtist)
+	artistID, ok := s.collectionID(w, r, "artistId")
 	if !ok {
 		return
 	}
@@ -257,7 +265,7 @@ func (s *Server) handleArtist(w http.ResponseWriter, r *http.Request) {
 
 // handleAlbumSync pulls the album's provider tracklists into the library.
 func (s *Server) handleAlbumSync(w http.ResponseWriter, r *http.Request) {
-	albumID, ok := s.collectionID(w, r, "albumId", library.ErrNoAlbum)
+	albumID, ok := s.collectionID(w, r, "albumId")
 	if !ok {
 		return
 	}
@@ -298,7 +306,7 @@ func (s *Server) handleAlbumSync(w http.ResponseWriter, r *http.Request) {
 
 // handleArtistSync records the artist's provider pages and pulls their albums.
 func (s *Server) handleArtistSync(w http.ResponseWriter, r *http.Request) {
-	artistID, ok := s.collectionID(w, r, "artistId", library.ErrNoArtist)
+	artistID, ok := s.collectionID(w, r, "artistId")
 	if !ok {
 		return
 	}
@@ -343,7 +351,7 @@ func (s *Server) handleArtistSync(w http.ResponseWriter, r *http.Request) {
 }
 
 // collectionID parses an album or artist id path value.
-func (s *Server) collectionID(w http.ResponseWriter, r *http.Request, name string, missing error) (uuid.UUID, bool) {
+func (s *Server) collectionID(w http.ResponseWriter, r *http.Request, name string) (uuid.UUID, bool) {
 	raw := r.PathValue(name)
 	if len(raw) == 0 || len(raw) > maxMediaVariantIDLen {
 		writeError(w, http.StatusBadRequest, "invalid "+name)
@@ -354,7 +362,6 @@ func (s *Server) collectionID(w http.ResponseWriter, r *http.Request, name strin
 		writeError(w, http.StatusBadRequest, "invalid "+name)
 		return uuid.Nil, false
 	}
-	_ = missing
 	return id, true
 }
 

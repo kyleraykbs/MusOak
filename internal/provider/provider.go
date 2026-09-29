@@ -35,6 +35,8 @@ type Track struct {
 	Album           string
 	DurationMs      int64
 	ISRC            string
+	// ArtworkURL is the best image the provider offers for this recording.
+	ArtworkURL string
 }
 
 // SearchOpts tunes a search.
@@ -49,12 +51,16 @@ type Album struct {
 	Artists         []string
 	Year            string
 	TrackCount      int
+	// ArtworkURL is the best cover the provider offers.
+	ArtworkURL string
 }
 
 // Artist is a provider's artist hit.
 type Artist struct {
 	ProviderArtistID string
 	Name             string
+	// ArtworkURL is the best portrait the provider offers.
+	ArtworkURL string
 }
 
 // AlbumDetail is an album with its tracklist, in album order.

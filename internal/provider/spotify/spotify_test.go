@@ -277,3 +277,30 @@ func TestTokenRequestShape(t *testing.T) {
 		t.Errorf("client credentials must travel in the header, not the form: %v", seenForm)
 	}
 }
+
+func TestSearchPicksTheLargestCover(t *testing.T) {
+	fake := newFakeSpotify(t)
+	fake.setHits(map[string]any{
+		"id":          "4cOdK2wGLETKBW3PvgPWqT",
+		"name":        "Never Gonna Give You Up",
+		"duration_ms": 213573,
+		"artists":     []map[string]any{{"name": "Rick Astley"}},
+		"album": map[string]any{
+			"name": "Whenever You Need Somebody",
+			"images": []map[string]any{
+				{"url": "https://i.scdn.co/small.jpg", "width": 64, "height": 64},
+				{"url": "https://i.scdn.co/large.jpg", "width": 640, "height": 640},
+				{"url": "", "width": 1000, "height": 1000},
+			},
+		},
+		"external_ids": map[string]any{"isrc": "GBAYE8700001"},
+	})
+
+	tracks, err := fake.provider(t).Search(context.Background(), "never gonna", provider.SearchOpts{})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(tracks) != 1 || tracks[0].ArtworkURL != "https://i.scdn.co/large.jpg" {
+		t.Fatalf("tracks = %+v", tracks)
+	}
+}

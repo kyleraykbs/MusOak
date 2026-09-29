@@ -145,3 +145,53 @@ var _ provider.Provider = (*Provider)(nil)
 var _ provider.DependencyChecker = (*Provider)(nil)
 
 var errUnused = errors.New("")
+
+func TestSearchKeepsArtwork(t *testing.T) {
+	fixture := filepath.Join(t.TempDir(), "hits.json")
+	const body = `[{"id":"abc","title":"Song","artists":["Artist"],"album":"Album","durationMs":180000,
+	                "artworkUrl":"https://lh3.googleusercontent.com/cover=w544-h544"}]`
+	if err := os.WriteFile(fixture, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("YT_FIXTURE", fixture)
+
+	tracks, err := testProvider(t, stubPython(t, `cat "$YT_FIXTURE"`)).
+		Search(context.Background(), "query", provider.SearchOpts{})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(tracks) != 1 || tracks[0].ArtworkURL != "https://lh3.googleusercontent.com/cover=w544-h544" {
+		t.Fatalf("tracks = %+v", tracks)
+	}
+}
+
+func TestAlbumAndArtistArtwork(t *testing.T) {
+	albums := filepath.Join(t.TempDir(), "albums.json")
+	if err := os.WriteFile(albums, []byte(`[{"id":"MPREb","title":"Album","artists":["Artist"],"year":"1987","trackCount":10,"artworkUrl":"https://yt.example/album.jpg"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("YT_FIXTURE", albums)
+
+	p := testProvider(t, stubPython(t, `cat "$YT_FIXTURE"`))
+	found, err := p.SearchAlbums(context.Background(), "album", provider.SearchOpts{})
+	if err != nil {
+		t.Fatalf("SearchAlbums: %v", err)
+	}
+	if len(found) != 1 || found[0].ArtworkURL != "https://yt.example/album.jpg" {
+		t.Fatalf("albums = %+v", found)
+	}
+
+	artists := filepath.Join(t.TempDir(), "artists.json")
+	if err := os.WriteFile(artists, []byte(`[{"id":"UC1","name":"Artist","artworkUrl":"https://yt.example/artist.jpg"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("YT_FIXTURE", artists)
+
+	found2, err := p.SearchArtists(context.Background(), "artist", provider.SearchOpts{})
+	if err != nil {
+		t.Fatalf("SearchArtists: %v", err)
+	}
+	if len(found2) != 1 || found2[0].ArtworkURL != "https://yt.example/artist.jpg" {
+		t.Fatalf("artists = %+v", found2)
+	}
+}

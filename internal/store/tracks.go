@@ -118,7 +118,7 @@ func (d *DB) CreateTrack(ctx context.Context, t *Track) error {
 // Track returns the track by id.
 func (d *DB) Track(ctx context.Context, id uuid.UUID) (*Track, error) {
 	row := d.db.QueryRowContext(ctx,
-		`SELECT id, title, duration_ms, created_at FROM tracks WHERE id = ?`, id.String())
+		`SELECT `+trackColumns+` FROM tracks WHERE id = ?`, id.String())
 	return scanTrack(row)
 }
 
@@ -129,7 +129,7 @@ func (d *DB) TrackByISRC(ctx context.Context, isrc string) (*Track, error) {
 		return nil, ErrNotFound
 	}
 	row := d.db.QueryRowContext(ctx, `
-		SELECT t.id, t.title, t.duration_ms, t.created_at
+		SELECT t.id, t.title, t.duration_ms, t.created_at, t.artwork_url
 		FROM tracks t
 		JOIN variants v ON v.track_id = t.id
 		WHERE v.isrc = ?
@@ -146,7 +146,7 @@ func (d *DB) CandidateTracks(ctx context.Context, durationMs, toleranceMs int64,
 		limit = defaultCandidateLimit
 	}
 	rows, err := d.db.QueryContext(ctx, `
-		SELECT id, title, duration_ms, created_at FROM tracks
+		SELECT id, title, duration_ms, created_at, artwork_url FROM tracks
 		WHERE ? <= 0 OR duration_ms = 0 OR ABS(duration_ms - ?) <= ?
 		ORDER BY created_at DESC
 		LIMIT ?`, durationMs, durationMs, toleranceMs, limit)
@@ -188,13 +188,17 @@ func (d *DB) DeleteTrack(ctx context.Context, id uuid.UUID) error {
 // defaultCandidateLimit bounds how many tracks a match attempt scores.
 const defaultCandidateLimit = 500
 
+// trackColumns is the column list every track query shares; scanning reads
+// artwork along with the rest.
+const trackColumns = `id, title, duration_ms, created_at, artwork_url`
+
 func scanTrack(row rowScanner) (*Track, error) {
 	var (
 		t       Track
 		id      string
 		created int64
 	)
-	if err := row.Scan(&id, &t.Title, &t.DurationMs, &created); err != nil {
+	if err := row.Scan(&id, &t.Title, &t.DurationMs, &created, &t.ArtworkURL); err != nil {
 		return nil, mapErr(err)
 	}
 	var err error
@@ -235,7 +239,7 @@ func ensureArtist(ctx context.Context, q execer, name string) (uuid.UUID, error)
 // TrackArtists lists a track's artists in credit order.
 func (d *DB) TrackArtists(ctx context.Context, id uuid.UUID) ([]Artist, error) {
 	rows, err := d.db.QueryContext(ctx, `
-		SELECT a.id, a.name
+		SELECT a.id, a.name, a.artwork_url
 		FROM artists a
 		JOIN track_artists ta ON ta.artist_id = a.id
 		WHERE ta.track_id = ?
@@ -251,7 +255,7 @@ func (d *DB) TrackArtists(ctx context.Context, id uuid.UUID) ([]Artist, error) {
 			a     Artist
 			idStr string
 		)
-		if err := rows.Scan(&idStr, &a.Name); err != nil {
+		if err := rows.Scan(&idStr, &a.Name, &a.ArtworkURL); err != nil {
 			return nil, mapErr(err)
 		}
 		if a.ID, err = parseUUID(idStr); err != nil {

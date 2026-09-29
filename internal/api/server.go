@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"codeberg.org/kyleraykbs/prismusic/internal/artwork"
 	"codeberg.org/kyleraykbs/prismusic/internal/auth"
 	"codeberg.org/kyleraykbs/prismusic/internal/config"
 	"codeberg.org/kyleraykbs/prismusic/internal/library"
@@ -49,6 +50,7 @@ type Server struct {
 	rooms     *rooms.Manager
 	radio     *radio.Service
 	library   *library.Service
+	artwork   *artwork.Fetcher
 
 	searchLimiter *limiter
 	loginLimiter  *limiter
@@ -77,6 +79,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 	s.rooms = rooms.NewManager(cfg, db, s.matcher, s.ranking, logger)
 	s.radio = radio.New(db, s.providers, s.matcher, logger)
 	s.library = library.New(db, s.providers, s.matcher, logger)
+	s.artwork = artwork.New(filepath.Join(cfg.StorageDir, "artwork"), db, logger)
 
 	// One search burst may be as wide as a handful of keystrokes; login bursts
 	// stay tight because each attempt costs an argon2id hash.

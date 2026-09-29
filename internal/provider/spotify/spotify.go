@@ -142,7 +142,8 @@ func (p *Provider) Search(ctx context.Context, q string, opts provider.SearchOpt
 					Name string `json:"name"`
 				} `json:"artists"`
 				Album struct {
-					Name string `json:"name"`
+					Name   string         `json:"name"`
+					Images []spotifyImage `json:"images"`
 				} `json:"album"`
 				ExternalIDs struct {
 					ISRC string `json:"isrc"`
@@ -172,6 +173,7 @@ func (p *Provider) Search(ctx context.Context, q string, opts provider.SearchOpt
 			Album:           item.Album.Name,
 			DurationMs:      item.DurationMs,
 			ISRC:            strings.ToUpper(strings.TrimSpace(item.ExternalIDs.ISRC)),
+			ArtworkURL:      bestImage(item.Album.Images),
 		})
 	}
 	return tracks, nil
@@ -198,6 +200,7 @@ func (p *Provider) SearchAlbums(ctx context.Context, q string, opts provider.Sea
 			Artists:         item.artistNames(),
 			Year:            yearOf(item.ReleaseDate),
 			TrackCount:      item.TotalTracks,
+			ArtworkURL:      bestImage(item.Images),
 		})
 	}
 	return albums, nil
@@ -208,8 +211,9 @@ func (p *Provider) SearchArtists(ctx context.Context, q string, opts provider.Se
 	var page struct {
 		Artists struct {
 			Items []struct {
-				ID   string `json:"id"`
-				Name string `json:"name"`
+				ID     string         `json:"id"`
+				Name   string         `json:"name"`
+				Images []spotifyImage `json:"images"`
 			} `json:"items"`
 		} `json:"artists"`
 	}
@@ -221,7 +225,11 @@ func (p *Provider) SearchArtists(ctx context.Context, q string, opts provider.Se
 		if item.ID == "" || item.Name == "" {
 			continue
 		}
-		artists = append(artists, provider.Artist{ProviderArtistID: item.ID, Name: item.Name})
+		artists = append(artists, provider.Artist{
+			ProviderArtistID: item.ID,
+			Name:             item.Name,
+			ArtworkURL:       bestImage(item.Images),
+		})
 	}
 	return artists, nil
 }
@@ -254,6 +262,7 @@ func (p *Provider) Album(ctx context.Context, providerAlbumID string) (*provider
 			Artists:         album.artistNames(),
 			Year:            yearOf(album.ReleaseDate),
 			TrackCount:      album.TotalTracks,
+			ArtworkURL:      bestImage(album.Images),
 		},
 		Tracks: make([]provider.Track, 0, len(tracks.Items)),
 	}
@@ -276,6 +285,7 @@ func (p *Provider) Album(ctx context.Context, providerAlbumID string) (*provider
 			Artists:         artists,
 			Album:           album.Name,
 			DurationMs:      item.DurationMs,
+			ArtworkURL:      bestImage(album.Images),
 		})
 	}
 	return detail, nil
@@ -305,6 +315,7 @@ func (p *Provider) ArtistAlbums(ctx context.Context, providerArtistID string) ([
 			Artists:         artists,
 			Year:            yearOf(item.ReleaseDate),
 			TrackCount:      item.TotalTracks,
+			ArtworkURL:      bestImage(item.Images),
 		})
 	}
 	return albums, nil
@@ -335,7 +346,8 @@ func (p *Provider) Radio(ctx context.Context, seed provider.Track, limit int) ([
 				Name string `json:"name"`
 			} `json:"artists"`
 			Album struct {
-				Name string `json:"name"`
+				Name   string         `json:"name"`
+				Images []spotifyImage `json:"images"`
 			} `json:"album"`
 			ExternalIDs struct {
 				ISRC string `json:"isrc"`
@@ -365,17 +377,40 @@ func (p *Provider) Radio(ctx context.Context, seed provider.Track, limit int) ([
 			Album:           item.Album.Name,
 			DurationMs:      item.DurationMs,
 			ISRC:            strings.ToUpper(strings.TrimSpace(item.ExternalIDs.ISRC)),
+			ArtworkURL:      bestImage(item.Album.Images),
 		})
 	}
 	return tracks, nil
 }
 
+// spotifyImage is one cover size.
+type spotifyImage struct {
+	URL    string `json:"url"`
+	Width  int    `json:"width"`
+	Height int    `json:"height"`
+}
+
+// bestImage picks the largest cover the provider offers.
+func bestImage(images []spotifyImage) string {
+	best, area := "", -1
+	for _, image := range images {
+		if image.URL == "" {
+			continue
+		}
+		if size := image.Width * image.Height; size >= area {
+			best, area = image.URL, size
+		}
+	}
+	return best
+}
+
 // spotifyAlbum is the album shape both search and lookup return.
 type spotifyAlbum struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	ReleaseDate string `json:"release_date"`
-	TotalTracks int    `json:"total_tracks"`
+	ID          string         `json:"id"`
+	Name        string         `json:"name"`
+	ReleaseDate string         `json:"release_date"`
+	TotalTracks int            `json:"total_tracks"`
+	Images      []spotifyImage `json:"images"`
 	Artists     []struct {
 		Name string `json:"name"`
 	} `json:"artists"`

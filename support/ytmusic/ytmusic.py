@@ -40,6 +40,23 @@ def duration_ms(item):
     return 0
 
 
+def artwork_of(item):
+    """Pick the largest thumbnail these endpoints embed under several names."""
+    best = ""
+    best_area = -1
+    for key in ("thumbnails", "thumbnail"):
+        for image in item.get(key) or []:
+            if not isinstance(image, dict):
+                continue
+            url = image.get("url") or ""
+            if not url:
+                continue
+            area = int(image.get("width") or 0) * int(image.get("height") or 0)
+            if area >= best_area:
+                best, best_area = url, area
+    return best
+
+
 def artists_of(item):
     names = []
     for artist in item.get("artists") or []:
@@ -63,6 +80,7 @@ def song(item):
         "artists": artists_of(item),
         "album": album_of(item),
         "durationMs": duration_ms(item),
+        "artworkUrl": artwork_of(item),
     }
 
 
@@ -78,6 +96,7 @@ def search(yt, kind, query, limit):
                 "artists": artists_of(item),
                 "year": str(item.get("year", "") or ""),
                 "trackCount": int(item.get("trackCount") or 0),
+                "artworkUrl": artwork_of(item),
             }
             for item in raw
             if item.get("browseId")
@@ -87,6 +106,7 @@ def search(yt, kind, query, limit):
             {
                 "id": item.get("browseId", "") or "",
                 "name": item.get("artist", "") or item.get("title", "") or "",
+                "artworkUrl": artwork_of(item),
             }
             for item in raw
             if item.get("browseId")
@@ -102,6 +122,7 @@ def album(yt, browse_id):
         "artists": artists_of(raw),
         "year": str(raw.get("year", "") or ""),
         "trackCount": int(raw.get("trackCount") or 0),
+        "artworkUrl": artwork_of(raw),
         "tracks": [song(track) for track in (raw.get("tracks") or []) if track.get("videoId")],
     }
 
@@ -121,9 +142,10 @@ def artist(yt, browse_id):
                     "artists": artists_of(item),
                     "year": str(item.get("year", "") or ""),
                     "trackCount": int(item.get("trackCount") or 0),
+                    "artworkUrl": artwork_of(item),
                 }
             )
-    return {"name": raw.get("name", "") or "", "albums": albums}
+    return {"name": raw.get("name", "") or "", "artworkUrl": artwork_of(raw), "albums": albums}
 
 
 def radio(yt, video_id, limit):

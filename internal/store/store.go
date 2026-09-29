@@ -35,12 +35,17 @@ type Track struct {
 	Title      string
 	DurationMs int64
 	CreatedAt  time.Time
+	// ArtworkURL is where the track's image came from; the API turns it into a
+	// path on this server.
+	ArtworkURL string
 }
 
 // Artist is a canonical artist identity.
 type Artist struct {
 	ID   uuid.UUID
 	Name string
+	// ArtworkURL is where the artist's portrait came from.
+	ArtworkURL string
 }
 
 // Album is a canonical album. Its identity is the title plus its primary
@@ -49,6 +54,8 @@ type Album struct {
 	ID        uuid.UUID
 	Title     string
 	CreatedAt time.Time
+	// ArtworkURL is where the cover came from.
+	ArtworkURL string
 }
 
 // Variant is one provider's (or the local library's) rendition of a track.
@@ -292,6 +299,7 @@ var migrations = []migration{
 	{version: 3, name: "media last use", sql: schemaV3},
 	{version: 4, name: "playlists", sql: schemaV4},
 	{version: 5, name: "albums and artists", sql: schemaV5},
+	{version: 6, name: "artwork", sql: schemaV6},
 }
 
 func (d *DB) migrate(ctx context.Context) error {

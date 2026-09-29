@@ -165,6 +165,11 @@ func (m *Matcher) matchAlbumLocked(ctx context.Context, providerName string, hit
 	if err != nil {
 		return nil, nil, false, err
 	}
+	if hit.ArtworkURL != "" {
+		if err := m.db.SetAlbumVariantArtwork(ctx, variant.ID, hit.ArtworkURL); err != nil {
+			m.logger.Warn("match: set album variant artwork", "variant", variant.ID, "error", err)
+		}
+	}
 	return album, variant, created, nil
 }
 
@@ -205,6 +210,11 @@ func (m *Matcher) findOrCreateAlbumLocked(ctx context.Context, hit provider.Albu
 
 	if best != nil && bestScore >= m.threshold {
 		m.logger.Debug("matched album", "title", hit.Title, "candidate", best.Title, "score", bestScore)
+		if hit.ArtworkURL != "" {
+			if err := m.db.SetAlbumArtwork(ctx, best.ID, hit.ArtworkURL); err != nil {
+				m.logger.Warn("match: set album artwork", "album", best.ID, "error", err)
+			}
+		}
 		return best.ID, false, nil
 	}
 	if best != nil {
@@ -215,6 +225,11 @@ func (m *Matcher) findOrCreateAlbumLocked(ctx context.Context, hit provider.Albu
 	albumID, err := m.db.EnsureAlbum(ctx, hit.Title, hit.Artists)
 	if err != nil {
 		return uuid.Nil, false, err
+	}
+	if hit.ArtworkURL != "" {
+		if err := m.db.SetAlbumArtwork(ctx, albumID, hit.ArtworkURL); err != nil {
+			m.logger.Warn("match: set album artwork", "album", albumID, "error", err)
+		}
 	}
 	m.logger.Debug("created canonical album", "album", albumID, "title", hit.Title, "provider", providerNameOf(hit))
 	return albumID, true, nil
@@ -294,6 +309,14 @@ func (m *Matcher) MatchArtist(ctx context.Context, providerName string, hit prov
 	})
 	if err != nil {
 		return nil, nil, false, err
+	}
+	if hit.ArtworkURL != "" {
+		if err := m.db.SetArtistArtwork(ctx, artistID, hit.ArtworkURL); err != nil {
+			m.logger.Warn("match: set artist artwork", "artist", artistID, "error", err)
+		}
+		if err := m.db.SetArtistVariantArtwork(ctx, variant.ID, hit.ArtworkURL); err != nil {
+			m.logger.Warn("match: set artist variant artwork", "variant", variant.ID, "error", err)
+		}
 	}
 	if created {
 		m.logger.Debug("created canonical artist", "artist", artistID, "name", hit.Name)

@@ -182,6 +182,7 @@ type Store interface {
 	store.VariantRepo
 	store.AlbumRepo
 	store.ArtistRepo
+	store.ArtworkRepo
 }
 
 // Group is a canonical track with the variants that matched onto it.
@@ -221,12 +222,14 @@ func (m *Matcher) Attach(ctx context.Context, providerName string, hit provider.
 // attachLocked is Attach without the lock, so Resolve can call it while it
 // already holds one.
 func (m *Matcher) attachLocked(ctx context.Context, providerName string, hit provider.Track) (*store.Track, *store.Variant, error) {
-	// Already known: this exact provider track has a variant.
+	// Already known: this exact provider track has a variant. The hit may
+	// still teach the track something it never learned (a cover, a duration).
 	if existing, err := m.db.VariantByProviderTrack(ctx, providerName, hit.ProviderTrackID); err == nil {
 		track, err := m.db.Track(ctx, existing.TrackID)
 		if err != nil {
 			return nil, nil, err
 		}
+		m.learnLocked(ctx, track, existing, hit)
 		return track, existing, nil
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return nil, nil, err
@@ -275,13 +278,33 @@ func (m *Matcher) attachLocked(ctx context.Context, providerName string, hit pro
 		return nil, nil, err
 	}
 
-	// A canonical track learns its duration the first time anyone tells us.
-	if track.DurationMs == 0 && hit.DurationMs > 0 {
+	m.learnLocked(ctx, track, variant, hit)
+	return track, variant, nil
+}
+
+// learnLocked records what a hit teaches the canonical track and its rendition,
+// and refreshes the structs the caller receives so a response never reads a
+// stale row.
+func (m *Matcher) learnLocked(ctx context.Context, track *store.Track, variant *store.Variant, hit provider.Track) {
+	if hit.DurationMs > 0 && track.DurationMs == 0 {
 		if err := m.db.SetTrackDuration(ctx, track.ID, hit.DurationMs); err != nil {
 			m.logger.Warn("match: set track duration", "track", track.ID, "error", err)
 		}
+		track.DurationMs = hit.DurationMs
 	}
-	return track, variant, nil
+	if hit.ArtworkURL == "" {
+		return
+	}
+	if track.ArtworkURL == "" {
+		if err := m.db.SetTrackArtwork(ctx, track.ID, hit.ArtworkURL); err != nil {
+			m.logger.Warn("match: set track artwork", "track", track.ID, "error", err)
+		} else {
+			track.ArtworkURL = hit.ArtworkURL
+		}
+	}
+	if err := m.db.SetVariantArtwork(ctx, variant.ID, hit.ArtworkURL); err != nil {
+		m.logger.Warn("match: set variant artwork", "variant", variant.ID, "error", err)
+	}
 }
 
 // findTrack looks for the canonical track a hit belongs to, or nil.

@@ -36,6 +36,7 @@ func (s *Server) routeTable() []route {
 		{"GET /api/v1/openapi.yaml", s.handleOpenAPI},
 
 		{"GET /api/v1/providers", s.handleProviders},
+		{"GET /api/v1/artwork/{kind}/{artworkId}", s.handleArtwork},
 		{"GET /api/v1/search", s.handleSearch},
 		{"GET /api/v1/tracks/{trackId}", s.handleTrack},
 		{"GET /api/v1/tracks/{trackId}/variants", s.handleTrackVariants},

@@ -20,6 +20,8 @@ type trackResponse struct {
 	Artists    []string  `json:"artists"`
 	Albums     []string  `json:"albums"`
 	CreatedAt  time.Time `json:"createdAt"`
+	// ArtworkURL is a path on this server, empty when nothing is known yet.
+	ArtworkURL string `json:"artworkUrl,omitempty"`
 }
 
 // variantResponse is one provider's rendition of a track, with its download
@@ -56,6 +58,17 @@ func (s *Server) buildTrack(ctx context.Context, track store.Track) (trackRespon
 		Artists:    make([]string, 0, len(artists)),
 		Albums:     make([]string, 0, len(albums)),
 		CreatedAt:  track.CreatedAt,
+	}
+	// The header may have been read before the cover was learned, so fall back
+	// to a lookup rather than pretending the track has no artwork.
+	artwork := track.ArtworkURL
+	if artwork == "" {
+		if url, err := s.store.TrackArtwork(ctx, track.ID); err == nil {
+			artwork = url
+		}
+	}
+	if artwork != "" {
+		out.ArtworkURL = artworkPath(store.ArtworkTrack, track.ID)
 	}
 	for _, artist := range artists {
 		out.Artists = append(out.Artists, artist.Name)

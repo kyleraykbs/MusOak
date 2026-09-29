@@ -105,6 +105,7 @@ func (p *Provider) SearchAlbums(ctx context.Context, q string, opts provider.Sea
 			Artists:         hit.Artists,
 			Year:            hit.Year,
 			TrackCount:      hit.TrackCount,
+			ArtworkURL:      hit.ArtworkURL,
 		})
 	}
 	return albums, nil
@@ -125,7 +126,11 @@ func (p *Provider) SearchArtists(ctx context.Context, q string, opts provider.Se
 		if hit.ID == "" || hit.Name == "" {
 			continue
 		}
-		artists = append(artists, provider.Artist{ProviderArtistID: hit.ID, Name: hit.Name})
+		artists = append(artists, provider.Artist{
+			ProviderArtistID: hit.ID,
+			Name:             hit.Name,
+			ArtworkURL:       hit.ArtworkURL,
+		})
 	}
 	return artists, nil
 }
@@ -148,6 +153,7 @@ func (p *Provider) Album(ctx context.Context, providerAlbumID string) (*provider
 			Artists:         hit.Artists,
 			Year:            hit.Year,
 			TrackCount:      hit.TrackCount,
+			ArtworkURL:      hit.ArtworkURL,
 		},
 		Tracks: make([]provider.Track, 0, len(hit.Tracks)),
 	}
@@ -161,6 +167,7 @@ func (p *Provider) Album(ctx context.Context, providerAlbumID string) (*provider
 			Artists:         track.Artists,
 			Album:           firstNonEmpty(track.Album, hit.Title),
 			DurationMs:      track.DurationMs,
+			ArtworkURL:      firstNonEmpty(track.ArtworkURL, hit.ArtworkURL),
 		})
 	}
 	return detail, nil
@@ -198,6 +205,7 @@ func (p *Provider) ArtistAlbums(ctx context.Context, providerArtistID string) ([
 			Artists:         artists,
 			Year:            album.Year,
 			TrackCount:      album.TrackCount,
+			ArtworkURL:      album.ArtworkURL,
 		})
 	}
 	return albums, nil
@@ -244,6 +252,7 @@ func (p *Provider) songSearch(ctx context.Context, kind, argument string, limit 
 			Artists:         hit.Artists,
 			Album:           hit.Album,
 			DurationMs:      hit.DurationMs,
+			ArtworkURL:      hit.ArtworkURL,
 		})
 	}
 	return tracks, nil
@@ -288,6 +297,7 @@ type albumHit struct {
 	Artists    []string `json:"artists"`
 	Year       string   `json:"year"`
 	TrackCount int      `json:"trackCount"`
+	ArtworkURL string   `json:"artworkUrl"`
 }
 
 type albumDetailHit struct {
@@ -296,8 +306,9 @@ type albumDetailHit struct {
 }
 
 type artistHit struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	ArtworkURL string `json:"artworkUrl"`
 }
 
 type searchHit struct {
@@ -306,6 +317,7 @@ type searchHit struct {
 	Artists    []string `json:"artists"`
 	Album      string   `json:"album"`
 	DurationMs int64    `json:"durationMs"`
+	ArtworkURL string   `json:"artworkUrl"`
 }
 
 // Download fetches the best available audio and leaves an Ogg/Opus file at
