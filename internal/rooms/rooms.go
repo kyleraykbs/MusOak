@@ -29,6 +29,7 @@ var (
 	ErrRoomNotFound   = errors.New("room not found")
 	ErrMemberNotFound = errors.New("not a member of this room")
 	ErrForbidden      = errors.New("only the host may do that")
+	ErrWrongPassword  = errors.New("wrong password")
 	ErrNoPlayback     = errors.New("no track is playing")
 	ErrInvalidVote    = errors.New("vote must be between 1 and 5")
 	ErrInvalidOrder   = errors.New("queue order does not match the queue")
@@ -130,27 +131,35 @@ type room struct {
 	name        string
 	host        string
 	controls    Controls
+	password    string // join password, empty for none; never leaves the manager
 	createdAtMs int64
 
 	members map[string]*Member
 	order   []string
 
-	queue   []QueueItem
+	// queues holds each member's own queue, including the item they have in
+	// flight until it finishes; master is the fair play order derived from it.
+	queues  map[string][]QueueItem
+	master  []QueueItem
 	current *playback
 }
 
 // Snapshot is a room as clients see it.
 type Snapshot struct {
-	ID          string        `json:"id"`
-	Name        string        `json:"name"`
-	Host        string        `json:"host"`
-	Controls    Controls      `json:"controls"`
-	CreatedAtMs int64         `json:"createdAtMs"`
-	Members     []Member      `json:"members"`
-	Queue       []QueueItem   `json:"queue"`
-	Current     *PlaybackView `json:"current,omitempty"`
-	ServerNowMs int64         `json:"serverNowMs"`
-	Skip        SkipRules     `json:"skip"`
+	ID          string                 `json:"id"`
+	Name        string                 `json:"name"`
+	Host        string                 `json:"host"`
+	Controls    Controls               `json:"controls"`
+	CreatedAtMs int64                  `json:"createdAtMs"`
+	Members     []Member               `json:"members"`
+	MemberCount int                    `json:"memberCount"`
+	HasPassword bool                   `json:"hasPassword"`
+	Queues      map[string][]QueueItem `json:"queues"`
+	MasterQueue []QueueItem            `json:"masterQueue"`
+	Queue       []QueueItem            `json:"queue"`
+	Current     *PlaybackView          `json:"current,omitempty"`
+	ServerNowMs int64                  `json:"serverNowMs"`
+	Skip        SkipRules              `json:"skip"`
 }
 
 // PlaybackView is the current track's state, including the room position at
@@ -246,8 +255,9 @@ func (m *Manager) NowMs() int64 {
 
 func (m *Manager) nowMsLocked() int64 { return m.clock.Now().UnixMilli() }
 
-// Create opens a room with host as its first member.
-func (m *Manager) Create(name string, controls Controls, host Member) (*Snapshot, error) {
+// Create opens a room with host as its first member. The password is kept in
+// memory only; empty means anyone may join.
+func (m *Manager) Create(name string, controls Controls, password string, host Member) (*Snapshot, error) {
 	if controls == "" {
 		controls = ControlsEveryone
 	}
@@ -268,14 +278,16 @@ func (m *Manager) Create(name string, controls Controls, host Member) (*Snapshot
 		name:        name,
 		host:        host.ID,
 		controls:    controls,
+		password:    password,
 		createdAtMs: m.nowMsLocked(),
 		members:     map[string]*Member{host.ID: &host},
 		order:       []string{host.ID},
+		queues:      map[string][]QueueItem{host.ID: {}},
 	}
 	m.rooms[id] = room
 	m.roomOrder = append(m.roomOrder, id)
 
-	m.publishLocked(room, EventMemberJoined, map[string]any{"member": host})
+	m.publishLocked(room, EventMemberJoined, map[string]any{"member": host, "memberCount": 1})
 	m.logger.Info("room created", "room", id, "host", host.ID, "controls", controls)
 	return m.snapshotLocked(room), nil
 }
@@ -308,8 +320,9 @@ func (m *Manager) Get(roomID string) (*Snapshot, error) {
 
 // Join adds a member (or refreshes an existing one) and returns the room. A
 // member arriving while a track is preparing or playing is given a rendition of
-// that track, so joining mid-track still means playing along.
-func (m *Manager) Join(roomID string, member Member) (*Snapshot, error) {
+// that track, so joining mid-track still means playing along. The password must
+// match when the room has one.
+func (m *Manager) Join(roomID string, member Member, password string) (*Snapshot, error) {
 	m.mu.Lock()
 
 	room, err := m.roomLocked(roomID)
@@ -317,14 +330,23 @@ func (m *Manager) Join(roomID string, member Member) (*Snapshot, error) {
 		m.mu.Unlock()
 		return nil, err
 	}
+	if room.password != "" && room.password != password {
+		m.mu.Unlock()
+		return nil, ErrWrongPassword
+	}
 	_, known := room.members[member.ID]
 	if !known {
 		room.order = append(room.order, member.ID)
+		room.queues[member.ID] = []QueueItem{}
+		recomputeMasterLocked(room) // the round-robin gains a (still empty) slot
 	}
 	member.JoinedAtMs = m.nowMsLocked()
 	room.members[member.ID] = &member
 
-	m.publishLocked(room, EventMemberJoined, map[string]any{"member": member})
+	m.publishLocked(room, EventMemberJoined, map[string]any{"member": member, "memberCount": len(room.members)})
+	if !known {
+		m.publishLocked(room, EventQueueUpdated, queueDataLocked(room))
+	}
 
 	var prepareItem string
 	if room.current != nil && room.current.variants[member.ID] == uuid.Nil {
@@ -357,13 +379,17 @@ func (m *Manager) Leave(roomID, memberID string) (*Snapshot, error) {
 
 	delete(room.members, memberID)
 	room.order = removeString(room.order, memberID)
+	// A member who leaves takes their queue with them.
+	delete(room.queues, memberID)
+	recomputeMasterLocked(room)
 	if room.current != nil {
 		// A member who left must not keep the room waiting or voting.
 		delete(room.current.ready, memberID)
 		delete(room.current.votes, memberID)
 		delete(room.current.variants, memberID)
 	}
-	m.publishLocked(room, EventMemberLeft, map[string]any{"memberId": memberID})
+	m.publishLocked(room, EventMemberLeft, map[string]any{"memberId": memberID, "memberCount": len(room.members)})
+	m.publishLocked(room, EventQueueUpdated, queueDataLocked(room))
 
 	if len(room.members) == 0 {
 		// The last member leaving closes the room; that is still a successful
@@ -374,13 +400,14 @@ func (m *Manager) Leave(roomID, memberID string) (*Snapshot, error) {
 	if room.host == memberID {
 		room.host = room.order[0]
 		m.logger.Info("room host promoted", "room", room.id, "host", room.host)
-		m.publishLocked(room, EventMemberJoined, map[string]any{"host": room.host})
+		m.publishLocked(room, EventMemberJoined, map[string]any{"host": room.host, "memberCount": len(room.members)})
 	}
 	m.maybeStartLocked(room)
 	return m.snapshotLocked(room), nil
 }
 
-// Enqueue appends a track, starting it right away when the room is idle.
+// Enqueue appends a track to the member's own queue, starting it right away
+// when the room is idle.
 func (m *Manager) Enqueue(ctx context.Context, roomID, memberID string, trackID uuid.UUID) (*Snapshot, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -397,21 +424,23 @@ func (m *Manager) Enqueue(ctx context.Context, roomID, memberID string, trackID 
 		return nil, err
 	}
 
-	room.queue = append(room.queue, QueueItem{
+	room.queues[memberID] = append(room.queues[memberID], QueueItem{
 		ID:        uuid.NewString(),
 		TrackID:   track.ID,
 		Title:     track.Title,
 		AddedBy:   memberID,
 		AddedAtMs: m.nowMsLocked(),
 	})
-	m.publishLocked(room, EventQueueUpdated, map[string]any{"queue": room.queue})
+	recomputeMasterLocked(room)
+	m.publishLocked(room, EventQueueUpdated, queueDataLocked(room))
 	if room.current == nil {
 		m.beginNextLocked(room)
 	}
 	return m.snapshotLocked(room), nil
 }
 
-// Remove drops one queued item.
+// Remove drops one queued item. A member edits their own queue; the host may
+// edit anyone's.
 func (m *Manager) Remove(roomID, memberID, itemID string) (*Snapshot, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -420,26 +449,27 @@ func (m *Manager) Remove(roomID, memberID, itemID string) (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := m.checkControlLocked(room, memberID); err != nil {
-		return nil, err
-	}
 
-	index := -1
-	for i, item := range room.queue {
-		if item.ID == itemID {
-			index = i
-			break
+	for _, owner := range room.order {
+		items := room.queues[owner]
+		for i, item := range items {
+			if item.ID != itemID {
+				continue
+			}
+			if err := m.checkQueueEditLocked(room, memberID, owner); err != nil {
+				return nil, err
+			}
+			room.queues[owner] = append(items[:i], items[i+1:]...)
+			recomputeMasterLocked(room)
+			m.publishLocked(room, EventQueueUpdated, queueDataLocked(room))
+			return m.snapshotLocked(room), nil
 		}
 	}
-	if index < 0 {
-		return nil, store.ErrNotFound
-	}
-	room.queue = append(room.queue[:index], room.queue[index+1:]...)
-	m.publishLocked(room, EventQueueUpdated, map[string]any{"queue": room.queue})
-	return m.snapshotLocked(room), nil
+	return nil, store.ErrNotFound
 }
 
-// Reorder rearranges the queue; itemIDs must be a permutation of it.
+// Reorder rearranges one member's queue; itemIDs must be a permutation of it.
+// A member edits their own queue; the host may edit anyone's.
 func (m *Manager) Reorder(roomID, memberID string, itemIDs []string) (*Snapshot, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -448,15 +478,32 @@ func (m *Manager) Reorder(roomID, memberID string, itemIDs []string) (*Snapshot,
 	if err != nil {
 		return nil, err
 	}
-	if err := m.checkControlLocked(room, memberID); err != nil {
-		return nil, err
-	}
-	if len(itemIDs) != len(room.queue) {
+	if len(itemIDs) == 0 {
 		return nil, ErrInvalidOrder
 	}
 
-	byID := make(map[string]QueueItem, len(room.queue))
-	for _, item := range room.queue {
+	// The items name the queue they belong to.
+	owner := ""
+	for _, candidate := range room.order {
+		for _, item := range room.queues[candidate] {
+			if item.ID == itemIDs[0] {
+				owner = candidate
+			}
+		}
+	}
+	if owner == "" {
+		return nil, ErrInvalidOrder
+	}
+	items := room.queues[owner]
+	if len(itemIDs) != len(items) {
+		return nil, ErrInvalidOrder
+	}
+	if err := m.checkQueueEditLocked(room, memberID, owner); err != nil {
+		return nil, err
+	}
+
+	byID := make(map[string]QueueItem, len(items))
+	for _, item := range items {
 		byID[item.ID] = item
 	}
 	reordered := make([]QueueItem, 0, len(itemIDs))
@@ -470,8 +517,38 @@ func (m *Manager) Reorder(roomID, memberID string, itemIDs []string) (*Snapshot,
 		reordered = append(reordered, item)
 	}
 
-	room.queue = reordered
-	m.publishLocked(room, EventQueueUpdated, map[string]any{"queue": room.queue})
+	room.queues[owner] = reordered
+	recomputeMasterLocked(room)
+	m.publishLocked(room, EventQueueUpdated, queueDataLocked(room))
+	return m.snapshotLocked(room), nil
+}
+
+// Clear empties one member's queue — the caller's own, or any queue when the
+// caller is the host.
+func (m *Manager) Clear(roomID, memberID, targetMemberID string) (*Snapshot, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	room, err := m.roomLocked(roomID)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := room.members[memberID]; !ok {
+		return nil, ErrMemberNotFound
+	}
+	if targetMemberID == "" {
+		targetMemberID = memberID
+	}
+	if targetMemberID != memberID && memberID != room.host {
+		return nil, ErrForbidden
+	}
+	if _, ok := room.members[targetMemberID]; !ok {
+		return nil, store.ErrNotFound
+	}
+
+	room.queues[targetMemberID] = []QueueItem{}
+	recomputeMasterLocked(room)
+	m.publishLocked(room, EventQueueUpdated, queueDataLocked(room))
 	return m.snapshotLocked(room), nil
 }
 
@@ -710,18 +787,101 @@ func (m *Manager) checkControlLocked(room *room, memberID string) error {
 	return nil
 }
 
-// beginNextLocked moves the next queued item into preparation.
+// checkQueueEditLocked enforces queue ownership: a member edits their own
+// queue, the host may edit anyone's. Control policies govern playback, not
+// what each member has queued.
+func (m *Manager) checkQueueEditLocked(room *room, memberID, ownerID string) error {
+	if _, ok := room.members[memberID]; !ok {
+		return ErrMemberNotFound
+	}
+	if ownerID != memberID && memberID != room.host {
+		return ErrForbidden
+	}
+	return nil
+}
+
+// recomputeMasterLocked rebuilds the play order: a perfectly fair
+// round-robin across the member queues in join order — one item from each
+// member per pass, each member's own order kept. With A=[a1 a2] and
+// B=[b1 b2] the master queue is [a1 b1 a2 b2].
+func recomputeMasterLocked(room *room) {
+	total := 0
+	for _, memberID := range room.order {
+		total += len(room.queues[memberID])
+	}
+	master := make([]QueueItem, 0, total)
+	for pass := 0; len(master) < total; pass++ {
+		for _, memberID := range room.order {
+			items := room.queues[memberID]
+			if pass < len(items) {
+				master = append(master, items[pass])
+			}
+		}
+	}
+	room.master = master
+}
+
+// dropItemLocked removes one played item from its owner's queue and from the
+// play order. The remaining order keeps its round-robin phase — the master is
+// only recomputed when members edit their queues, so the room plays one track
+// per member per pass even as queues change.
+func dropItemLocked(room *room, item QueueItem) {
+	if items, ok := room.queues[item.AddedBy]; ok {
+		for i, queued := range items {
+			if queued.ID == item.ID {
+				room.queues[item.AddedBy] = append(items[:i], items[i+1:]...)
+				break
+			}
+		}
+	}
+	for i, queued := range room.master {
+		if queued.ID == item.ID {
+			room.master = append(room.master[:i], room.master[i+1:]...)
+			break
+		}
+	}
+}
+
+// pendingLocked is the play order after the current track — the "queue" key
+// existing clients already follow.
+func pendingLocked(room *room) []QueueItem {
+	pending := make([]QueueItem, 0, len(room.master))
+	for _, item := range room.master {
+		if room.current != nil && item.ID == room.current.item.ID {
+			continue
+		}
+		pending = append(pending, item)
+	}
+	return pending
+}
+
+// queueDataLocked renders the queue state for queue_updated: every member's
+// own queue and the fair master mix, for everyone.
+func queueDataLocked(room *room) map[string]any {
+	queues := make(map[string][]QueueItem, len(room.queues))
+	for memberID, items := range room.queues {
+		queues[memberID] = append([]QueueItem(nil), items...)
+	}
+	return map[string]any{
+		"queues":      queues,
+		"masterQueue": append([]QueueItem(nil), room.master...),
+		"queue":       pendingLocked(room),
+	}
+}
+
+// beginNextLocked moves the next master-queue item into preparation. The item
+// keeps its place in its owner's queue and in the play order until it finishes,
+// so the round-robin phase survives while the room works through the mix.
 func (m *Manager) beginNextLocked(room *room) {
 	m.stopTimersLocked(room)
 
-	if len(room.queue) == 0 {
+	if len(room.master) == 0 {
 		room.current = nil
-		m.publishLocked(room, EventQueueUpdated, map[string]any{"queue": room.queue})
+		m.publishLocked(room, EventQueueUpdated, queueDataLocked(room))
 		return
 	}
 
-	item := room.queue[0]
-	room.queue = room.queue[1:]
+	item := room.master[0]
 	playback := &playback{
 		item:     item,
 		variants: map[string]uuid.UUID{},
@@ -733,7 +893,9 @@ func (m *Manager) beginNextLocked(room *room) {
 	}
 	room.current = playback
 
-	m.publishLocked(room, EventQueueUpdated, map[string]any{"queue": room.queue, "preparing": item})
+	data := queueDataLocked(room)
+	data["preparing"] = item
+	m.publishLocked(room, EventQueueUpdated, data)
 
 	// Variant assignment needs the providers (and possibly the network), so it
 	// happens off the lock.
@@ -915,6 +1077,9 @@ func (m *Manager) advanceLocked(ctx context.Context, room *room, reason string) 
 				"mean":       meanScore(playback.votes),
 			})
 		}
+		// The played item is done: it leaves its owner's queue and the play
+		// order, which keeps its phase rather than being rebuilt.
+		dropItemLocked(room, playback.item)
 	}
 	m.beginNextLocked(room)
 }
@@ -974,6 +1139,10 @@ func (m *Manager) publishLocked(room *room, eventType EventType, data any) {
 func (m *Manager) snapshotLocked(room *room) *Snapshot {
 	nowMs := m.nowMsLocked()
 
+	queues := make(map[string][]QueueItem, len(room.queues))
+	for memberID, items := range room.queues {
+		queues[memberID] = append([]QueueItem(nil), items...)
+	}
 	snapshot := &Snapshot{
 		ID:          room.id,
 		Name:        room.name,
@@ -981,7 +1150,11 @@ func (m *Manager) snapshotLocked(room *room) *Snapshot {
 		Controls:    room.controls,
 		CreatedAtMs: room.createdAtMs,
 		Members:     make([]Member, 0, len(room.order)),
-		Queue:       append(make([]QueueItem, 0, len(room.queue)), room.queue...),
+		MemberCount: len(room.members),
+		HasPassword: room.password != "",
+		Queues:      queues,
+		MasterQueue: append([]QueueItem(nil), room.master...),
+		Queue:       pendingLocked(room),
 		ServerNowMs: nowMs,
 		Skip: SkipRules{
 			SkipThreshold:        m.cfg.ListenTogether.SkipThreshold,

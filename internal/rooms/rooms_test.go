@@ -2,8 +2,11 @@ package rooms
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -188,6 +191,23 @@ func (f *fixture) get(roomID string) *Snapshot {
 	return snapshot
 }
 
+// track creates one canonical track with a single local rendition.
+func (f *fixture) track(title string) *store.Track {
+	f.t.Helper()
+	track, _ := f.trackWithVariants(title, variantSpec{
+		provider: "local", providerTrackID: title, durationMs: 180_000, downloadable: true,
+	})
+	return track
+}
+
+func queueTitles(items []QueueItem) []string {
+	titles := make([]string, 0, len(items))
+	for _, item := range items {
+		titles = append(titles, item.Title)
+	}
+	return titles
+}
+
 // TestThreeClientsStaySynchronizedAndSkipOnVotes is the Block 9 acceptance
 // test: three clients with renditions of 180s, 179s and 182s start together,
 // the shortest one runs out early and pads with silence, a vote-driven skip
@@ -213,7 +233,7 @@ func TestThreeClientsStaySynchronizedAndSkipOnVotes(t *testing.T) {
 	)
 
 	host := Member{ID: "host", Name: "Host"}
-	snapshot, err := f.m.Create("party", ControlsEveryone, host)
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", host)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -229,7 +249,7 @@ func TestThreeClientsStaySynchronizedAndSkipOnVotes(t *testing.T) {
 		{id: "third", variantID: variants[2].ID, durationMs: 182_000},
 	}
 	for _, client := range clients[1:] {
-		if _, err := f.m.Join(roomID, Member{ID: client.id, Name: client.id}); err != nil {
+		if _, err := f.m.Join(roomID, Member{ID: client.id, Name: client.id}, ""); err != nil {
 			t.Fatalf("Join: %v", err)
 		}
 	}
@@ -383,11 +403,11 @@ func TestReadinessTimeoutStartsWithoutLaggards(t *testing.T) {
 		variantSpec{provider: "local", providerTrackID: "a", durationMs: 200_000, downloadable: true},
 	)
 
-	snapshot, err := f.m.Create("party", ControlsEveryone, Member{ID: "host"})
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "host"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.m.Join(snapshot.ID, Member{ID: "laggard"}); err != nil {
+	if _, err := f.m.Join(snapshot.ID, Member{ID: "laggard"}, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.m.Enqueue(ctx, snapshot.ID, "host", track.ID); err != nil {
@@ -463,14 +483,14 @@ func TestSkipRule(t *testing.T) {
 				variantSpec{provider: "local", providerTrackID: "b", durationMs: 300_000, downloadable: true},
 			)
 
-			snapshot, err := f.m.Create("party", ControlsEveryone, Member{ID: "m0"})
+			snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "m0"})
 			if err != nil {
 				t.Fatal(err)
 			}
 			members := []string{"m0"}
 			for i := 1; i < tt.members; i++ {
 				id := "m" + string(rune('0'+i))
-				if _, err := f.m.Join(snapshot.ID, Member{ID: id}); err != nil {
+				if _, err := f.m.Join(snapshot.ID, Member{ID: id}, ""); err != nil {
 					t.Fatal(err)
 				}
 				members = append(members, id)
@@ -509,11 +529,11 @@ func TestHostOnlyControls(t *testing.T) {
 	track, variants := f.trackWithVariants("Song",
 		variantSpec{provider: "local", providerTrackID: "a", durationMs: 300_000, downloadable: true},
 	)
-	snapshot, err := f.m.Create("party", ControlsHost, Member{ID: "host"})
+	snapshot, err := f.m.Create("party", ControlsHost, "", Member{ID: "host"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.m.Join(snapshot.ID, Member{ID: "guest"}); err != nil {
+	if _, err := f.m.Join(snapshot.ID, Member{ID: "guest"}, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.m.Enqueue(ctx, snapshot.ID, "guest", track.ID); err != nil {
@@ -576,7 +596,7 @@ func TestJoiningDuringPlaybackAssignsARendition(t *testing.T) {
 		variantSpec{provider: "local", providerTrackID: "a", durationMs: 300_000, downloadable: true},
 	)
 
-	snapshot, err := f.m.Create("party", ControlsEveryone, Member{ID: "host"})
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "host"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -595,7 +615,7 @@ func TestJoiningDuringPlaybackAssignsARendition(t *testing.T) {
 	events, cancel := f.m.Subscribe()
 	defer cancel()
 
-	if _, err := f.m.Join(snapshot.ID, Member{ID: "late"}); err != nil {
+	if _, err := f.m.Join(snapshot.ID, Member{ID: "late"}, ""); err != nil {
 		t.Fatalf("Join: %v", err)
 	}
 
@@ -635,11 +655,11 @@ func TestJoiningDuringPlaybackAssignsARendition(t *testing.T) {
 func TestRoomClosesWhenEverybodyLeaves(t *testing.T) {
 	f := newFixture(t, nil)
 
-	snapshot, err := f.m.Create("party", ControlsEveryone, Member{ID: "host"})
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "host"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.m.Join(snapshot.ID, Member{ID: "guest"}); err != nil {
+	if _, err := f.m.Join(snapshot.ID, Member{ID: "guest"}, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.m.Leave(snapshot.ID, "host"); err != nil {
@@ -658,5 +678,343 @@ func TestRoomClosesWhenEverybodyLeaves(t *testing.T) {
 	}
 	if _, err := f.m.Get(snapshot.ID); !errors.Is(err, ErrRoomNotFound) {
 		t.Errorf("the closed room is still there: %v", err)
+	}
+}
+
+// TestMasterQueueInterleavesMemberQueues is the per-member queue acceptance
+// test: two members' own queues interleave fairly — one track per member per
+// pass, in join order, each member's own order kept (A1 B1 A2 B2) — the
+// master recomputes live as either edits, and remove/reorder/clear only ever
+// touch the caller's queue.
+func TestMasterQueueInterleavesMemberQueues(t *testing.T) {
+	f := newFixture(t, nil)
+	ctx := context.Background()
+
+	events, cancel := f.m.Subscribe()
+	defer cancel()
+
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "a", Name: "A"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	roomID := snapshot.ID
+	if _, err := f.m.Join(roomID, Member{ID: "b", Name: "B"}, ""); err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+
+	tracks := map[string]*store.Track{}
+	for _, title := range []string{"A1", "A2", "B1", "B2", "B3"} {
+		tracks[title] = f.track(title)
+	}
+	enqueue := func(member, title string) {
+		f.t.Helper()
+		if _, err := f.m.Enqueue(ctx, roomID, member, tracks[title].ID); err != nil {
+			f.t.Fatalf("Enqueue(%s %s): %v", member, title, err)
+		}
+	}
+
+	enqueue("a", "A1") // the room takes A1 into playback right away
+	enqueue("a", "A2")
+	enqueue("b", "B1")
+	enqueue("b", "B2")
+
+	state := f.get(roomID)
+	if got, want := queueTitles(state.MasterQueue), []string{"A1", "B1", "A2", "B2"}; !slices.Equal(got, want) {
+		t.Errorf("masterQueue = %v, want %v", got, want)
+	}
+	if got, want := queueTitles(state.Queues["a"]), []string{"A1", "A2"}; !slices.Equal(got, want) {
+		t.Errorf("a's queue = %v, want %v", got, want)
+	}
+	if got, want := queueTitles(state.Queues["b"]), []string{"B1", "B2"}; !slices.Equal(got, want) {
+		t.Errorf("b's queue = %v, want %v", got, want)
+	}
+	// The room plays masterQueue: its head is what is on.
+	if got := f.current(state).Item.Title; got != "A1" {
+		t.Errorf("current = %s, want A1", got)
+	}
+	// "queue" keeps its old meaning: the play order after the current track.
+	if got, want := queueTitles(state.Queue), []string{"B1", "A2", "B2"}; !slices.Equal(got, want) {
+		t.Errorf("queue = %v, want %v", got, want)
+	}
+
+	// B reorders their own queue: only B's order moves, and the master mix
+	// recomputes around it.
+	bItems := state.Queues["b"]
+	reordered, err := f.m.Reorder(roomID, "b", []string{bItems[1].ID, bItems[0].ID})
+	if err != nil {
+		t.Fatalf("Reorder: %v", err)
+	}
+	if got, want := queueTitles(reordered.Queues["b"]), []string{"B2", "B1"}; !slices.Equal(got, want) {
+		t.Errorf("b's queue after reorder = %v, want %v", got, want)
+	}
+	if got, want := queueTitles(reordered.Queues["a"]), []string{"A1", "A2"}; !slices.Equal(got, want) {
+		t.Errorf("a's queue after b's reorder = %v, want %v", got, want)
+	}
+	if got, want := queueTitles(reordered.MasterQueue), []string{"A1", "B2", "A2", "B1"}; !slices.Equal(got, want) {
+		t.Errorf("masterQueue after reorder = %v, want %v", got, want)
+	}
+
+	// B drops one of their own items; A's queue does not move.
+	removed, err := f.m.Remove(roomID, "b", reordered.Queues["b"][0].ID) // B2
+	if err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if got, want := queueTitles(removed.Queues["b"]), []string{"B1"}; !slices.Equal(got, want) {
+		t.Errorf("b's queue after remove = %v, want %v", got, want)
+	}
+	if got, want := queueTitles(removed.Queues["a"]), []string{"A1", "A2"}; !slices.Equal(got, want) {
+		t.Errorf("a's queue after b's remove = %v, want %v", got, want)
+	}
+	if got, want := queueTitles(removed.MasterQueue), []string{"A1", "B1", "A2"}; !slices.Equal(got, want) {
+		t.Errorf("masterQueue after remove = %v, want %v", got, want)
+	}
+
+	// B queues up again, then clears their own queue.
+	enqueue("b", "B3")
+	cleared, err := f.m.Clear(roomID, "b", "")
+	if err != nil {
+		t.Fatalf("Clear: %v", err)
+	}
+	if len(cleared.Queues["b"]) != 0 {
+		t.Errorf("b's queue after clear = %v, want empty", queueTitles(cleared.Queues["b"]))
+	}
+	if got, want := queueTitles(cleared.Queues["a"]), []string{"A1", "A2"}; !slices.Equal(got, want) {
+		t.Errorf("a's queue after b's clear = %v, want %v", got, want)
+	}
+	if got, want := queueTitles(cleared.MasterQueue), []string{"A1", "A2"}; !slices.Equal(got, want) {
+		t.Errorf("masterQueue after clear = %v, want %v", got, want)
+	}
+
+	// The host may act on any queue.
+	enqueue("b", "B3")
+	if _, err := f.m.Clear(roomID, "a", "b"); err != nil {
+		t.Fatalf("host clear of b's queue: %v", err)
+	}
+	enqueue("b", "B2")
+	withB := f.get(roomID)
+	var b2 QueueItem
+	for _, item := range withB.Queues["b"] {
+		if item.Title == "B2" {
+			b2 = item
+		}
+	}
+	if _, err := f.m.Remove(roomID, "a", b2.ID); err != nil {
+		t.Fatalf("host remove of b's item: %v", err)
+	}
+	if len(f.get(roomID).Queues["b"]) != 0 {
+		t.Error("host remove did not empty b's queue")
+	}
+
+	// A member may not touch another member's queue.
+	withA := f.get(roomID)
+	aItemID := withA.Queues["a"][0].ID
+	if _, err := f.m.Remove(roomID, "b", aItemID); !errors.Is(err, ErrForbidden) {
+		t.Errorf("b removing a's item: err = %v, want ErrForbidden", err)
+	}
+	aOrder := make([]string, 0, len(withA.Queues["a"]))
+	for i := len(withA.Queues["a"]) - 1; i >= 0; i-- {
+		aOrder = append(aOrder, withA.Queues["a"][i].ID)
+	}
+	if _, err := f.m.Reorder(roomID, "b", aOrder); !errors.Is(err, ErrForbidden) {
+		t.Errorf("b reordering a's queue: err = %v, want ErrForbidden", err)
+	}
+	if _, err := f.m.Clear(roomID, "b", "a"); !errors.Is(err, ErrForbidden) {
+		t.Errorf("b clearing a's queue: err = %v, want ErrForbidden", err)
+	}
+
+	// queue_updated tells everyone both queues and the fair master mix.
+	var last map[string]any
+	for {
+		select {
+		case event := <-events:
+			if event.Type == EventQueueUpdated {
+				last, _ = event.Data.(map[string]any)
+			}
+			continue
+		default:
+		}
+		break
+	}
+	if last == nil {
+		t.Fatal("no queue_updated event was published")
+	}
+	queues, ok := last["queues"].(map[string][]QueueItem)
+	if !ok {
+		t.Fatalf("queue_updated carries %T for queues, want map[string][]QueueItem", last["queues"])
+	}
+	master, ok := last["masterQueue"].([]QueueItem)
+	if !ok {
+		t.Fatalf("queue_updated carries %T for masterQueue, want []QueueItem", last["masterQueue"])
+	}
+	if _, ok := last["queue"]; !ok {
+		t.Error("queue_updated lost the queue key existing clients follow")
+	}
+	if got, want := queueTitles(queues["a"]), []string{"A1", "A2"}; !slices.Equal(got, want) {
+		t.Errorf("event queues[a] = %v, want %v", got, want)
+	}
+	if len(queues["b"]) != 0 {
+		t.Errorf("event queues[b] = %v, want empty", queueTitles(queues["b"]))
+	}
+	if got, want := queueTitles(master), []string{"A1", "A2"}; !slices.Equal(got, want) {
+		t.Errorf("event masterQueue = %v, want %v", got, want)
+	}
+}
+
+// TestRoomPlaysMasterQueueInOrder walks a room through its mix: the playback
+// follows the master queue, one track per member per pass.
+func TestRoomPlaysMasterQueueInOrder(t *testing.T) {
+	f := newFixture(t, nil)
+	ctx := context.Background()
+
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "a"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	roomID := snapshot.ID
+	if _, err := f.m.Join(roomID, Member{ID: "b"}, ""); err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+
+	tracks := map[string]*store.Track{}
+	for _, title := range []string{"A1", "A2", "B1", "B2"} {
+		tracks[title] = f.track(title)
+	}
+	for _, enqueue := range []struct{ member, title string }{
+		{"a", "A1"}, {"a", "A2"}, {"b", "B1"}, {"b", "B2"},
+	} {
+		if _, err := f.m.Enqueue(ctx, roomID, enqueue.member, tracks[enqueue.title].ID); err != nil {
+			t.Fatalf("Enqueue(%s %s): %v", enqueue.member, enqueue.title, err)
+		}
+	}
+
+	var played []string
+	for {
+		state := f.get(roomID)
+		if state.Current == nil {
+			break
+		}
+		played = append(played, state.Current.Item.Title)
+		if _, err := f.m.Skip(roomID, "a"); err != nil {
+			t.Fatalf("Skip after %s: %v", played[len(played)-1], err)
+		}
+	}
+	if want := []string{"A1", "B1", "A2", "B2"}; !slices.Equal(played, want) {
+		t.Errorf("played = %v, want %v", played, want)
+	}
+}
+
+// TestRoomPassword gates joining. The password lives in the manager and is
+// never part of any state clients see.
+func TestRoomPassword(t *testing.T) {
+	f := newFixture(t, nil)
+
+	snapshot, err := f.m.Create("party", ControlsEveryone, "sesame", Member{ID: "host"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if !snapshot.HasPassword {
+		t.Error("a room with a password must report hasPassword")
+	}
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "sesame") {
+		t.Errorf("the snapshot leaks the password: %s", raw)
+	}
+
+	if _, err := f.m.Join(snapshot.ID, Member{ID: "guest"}, "open"); !errors.Is(err, ErrWrongPassword) {
+		t.Errorf("join with the wrong password: err = %v, want ErrWrongPassword", err)
+	}
+	if _, err := f.m.Join(snapshot.ID, Member{ID: "guest"}, ""); !errors.Is(err, ErrWrongPassword) {
+		t.Errorf("join without a password: err = %v, want ErrWrongPassword", err)
+	}
+	joined, err := f.m.Join(snapshot.ID, Member{ID: "guest"}, "sesame")
+	if err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+	if joined.MemberCount != 2 {
+		t.Errorf("memberCount = %d, want 2", joined.MemberCount)
+	}
+
+	open, err := f.m.Create("open", ControlsEveryone, "", Member{ID: "host"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if open.HasPassword {
+		t.Error("a room without a password must not report hasPassword")
+	}
+	if _, err := f.m.Join(open.ID, Member{ID: "guest"}, "anything"); err != nil {
+		t.Errorf("joining an open room: %v", err)
+	}
+}
+
+// TestMemberEventsCarryMemberCount: member_joined and member_left announce how
+// big the room is, and a member who leaves takes their queue with them.
+func TestMemberEventsCarryMemberCount(t *testing.T) {
+	f := newFixture(t, nil)
+	ctx := context.Background()
+
+	events, cancel := f.m.Subscribe()
+	defer cancel()
+
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "host"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	roomID := snapshot.ID
+	if _, err := f.m.Join(roomID, Member{ID: "guest"}, ""); err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+
+	track := f.track("Song")
+	hostTrack := f.track("Host Song")
+	if _, err := f.m.Enqueue(ctx, roomID, "host", hostTrack.ID); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := f.m.Enqueue(ctx, roomID, "guest", track.ID); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := f.m.Leave(roomID, "guest"); err != nil {
+		t.Fatalf("Leave: %v", err)
+	}
+
+	state := f.get(roomID)
+	if _, ok := state.Queues["guest"]; ok {
+		t.Error("a member who left still has a queue")
+	}
+	if got, want := queueTitles(state.MasterQueue), []string{"Host Song"}; !slices.Equal(got, want) {
+		t.Errorf("masterQueue = %v, want the leaver's items gone (%v)", got, want)
+	}
+
+	joined, left := map[int]int{}, map[int]int{}
+	for {
+		select {
+		case event := <-events:
+			data, _ := event.Data.(map[string]any)
+			switch event.Type {
+			case EventMemberJoined:
+				if count, ok := data["memberCount"].(int); ok {
+					joined[count]++
+				} else {
+					t.Errorf("member_joined carries no memberCount: %v", data)
+				}
+			case EventMemberLeft:
+				if count, ok := data["memberCount"].(int); ok {
+					left[count]++
+				} else {
+					t.Errorf("member_left carries no memberCount: %v", data)
+				}
+			}
+			continue
+		default:
+		}
+		break
+	}
+	if joined[1] != 1 || joined[2] != 1 {
+		t.Errorf("member_joined memberCounts = %v, want one 1 and one 2", joined)
+	}
+	if left[1] != 1 {
+		t.Errorf("member_left memberCounts = %v, want one 1", left)
 	}
 }

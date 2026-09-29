@@ -17,6 +17,11 @@ const memberHeader = "X-Member-Id"
 type createRoomRequest struct {
 	Name     string         `json:"name"`
 	Controls rooms.Controls `json:"controls"`
+	Password string         `json:"password"`
+}
+
+type joinRoomRequest struct {
+	Password string `json:"password"`
 }
 
 type roomResponse struct {
@@ -72,7 +77,7 @@ func (s *Server) handleRoomCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "member identity required")
 		return
 	}
-	room, err := s.rooms.Create(req.Name, req.Controls, member)
+	room, err := s.rooms.Create(req.Name, req.Controls, req.Password, member)
 	if err != nil {
 		writeRoomError(w, err)
 		return
@@ -94,12 +99,16 @@ func (s *Server) handleRoomGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRoomJoin(w http.ResponseWriter, r *http.Request) {
+	var req joinRoomRequest
+	if r.ContentLength > 0 && !decodeJSON(w, r, &req) {
+		return
+	}
 	member, ok := s.callerMember(r, true)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "member identity required")
 		return
 	}
-	room, err := s.rooms.Join(r.PathValue("roomId"), member)
+	room, err := s.rooms.Join(r.PathValue("roomId"), member, req.Password)
 	if err != nil {
 		writeRoomError(w, err)
 		return
@@ -167,6 +176,22 @@ func (s *Server) handleRoomReorder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	room, err := s.rooms.Reorder(r.PathValue("roomId"), member.ID, req.ItemIDs)
+	if err != nil {
+		writeRoomError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, room)
+}
+
+// handleRoomClear empties the caller's queue. A host may empty anyone's by
+// naming the owner with ?memberId=.
+func (s *Server) handleRoomClear(w http.ResponseWriter, r *http.Request) {
+	member, ok := s.callerMember(r, false)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "member identity required")
+		return
+	}
+	room, err := s.rooms.Clear(r.PathValue("roomId"), member.ID, r.URL.Query().Get("memberId"))
 	if err != nil {
 		writeRoomError(w, err)
 		return
@@ -289,7 +314,8 @@ func writeRoomError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, rooms.ErrRoomNotFound), errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, err.Error())
-	case errors.Is(err, rooms.ErrMemberNotFound), errors.Is(err, rooms.ErrForbidden):
+	case errors.Is(err, rooms.ErrMemberNotFound), errors.Is(err, rooms.ErrForbidden),
+		errors.Is(err, rooms.ErrWrongPassword):
 		writeError(w, http.StatusForbidden, err.Error())
 	case errors.Is(err, rooms.ErrNoPlayback):
 		writeError(w, http.StatusConflict, err.Error())
