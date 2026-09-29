@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -41,5 +42,13 @@ func (m *Manager) ServeFile(w http.ResponseWriter, r *http.Request, variantID uu
 	w.Header().Set("ETag", `"`+file.SHA256+`"`)
 	w.Header().Set("Content-Type", "audio/ogg")
 	w.Header().Set("X-Content-SHA256", file.SHA256)
+
+	// Serving a file is what keeps it in the cache; only refresh the record
+	// occasionally so streaming does not turn into a write per request.
+	if time.Since(file.AccessedAt) > time.Minute {
+		if err := m.db.TouchMediaFile(r.Context(), variantID, time.Now()); err != nil {
+			m.logger.Warn("media: could not record access", "variant", variantID, "error", err)
+		}
+	}
 	http.ServeContent(w, r, filepath.Base(file.Path), file.DownloadedAt, f)
 }

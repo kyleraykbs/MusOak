@@ -10,6 +10,8 @@
   "defaultProviderOrder": ["ytmusic", "spotify"],
   "prefetchCount": 3,
   "match": { "threshold": 0.8 },
+  "rateLimit": { "searchPerMinute": 30, "loginPerMinute": 10 },
+  "media": { "quotaMB": 0 },
   "client": {
     "serverURL": "",
     "cacheDir": "/home/alice/.cache/prismusic"

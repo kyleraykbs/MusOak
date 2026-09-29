@@ -94,19 +94,37 @@ func (f *fakeProvider) Download(ctx context.Context, id, dest string) error {
 
 func newTestManager(t *testing.T, p provider.Provider) (*Manager, *store.DB) {
 	t.Helper()
+	db := openTestDB(t)
+	var providers []provider.Provider
+	if p != nil {
+		providers = append(providers, p)
+	}
+	m := New(filepath.Join(t.TempDir(), "media"), 0, db, newTestRegistry(t, providers...), discardLogger())
+	return m, db
+}
+
+// openTestDB returns an in-memory store with a unique DSN per test.
+func openTestDB(t *testing.T) *store.DB {
+	t.Helper()
 	db, err := store.Open("file:media-" + uuid.NewString() + "?mode=memory&cache=shared")
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
 
-	registry := provider.NewRegistry(slog.New(slog.DiscardHandler), 5*time.Second)
-	if p != nil {
+// newTestRegistry returns a registry holding the given providers.
+func newTestRegistry(t *testing.T, providers ...provider.Provider) *provider.Registry {
+	t.Helper()
+	registry := provider.NewRegistry(discardLogger(), 5*time.Second)
+	for _, p := range providers {
 		registry.Register(p)
 	}
-	m := New(filepath.Join(t.TempDir(), "media"), db, registry, slog.New(slog.DiscardHandler))
-	return m, db
+	return registry
 }
+
+func discardLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
 func seedVariant(t *testing.T, db *store.DB, downloadable bool, providerName string) *store.Variant {
 	t.Helper()
@@ -229,6 +247,7 @@ func TestEnsureRefusesNonDownloadableVariant(t *testing.T) {
 func TestEnsureReportsFailureAndCleansUp(t *testing.T) {
 	fake := &fakeProvider{name: "ytmusic", err: errors.New("upstream exploded")}
 	m, db := newTestManager(t, fake)
+	m.SetDownloadRetry(1, time.Millisecond)
 	variant := seedVariant(t, db, true, "ytmusic")
 
 	_, err := m.Ensure(context.Background(), variant.ID)

@@ -15,14 +15,6 @@ type contextKey int
 // userKey carries the authenticated user through the request context.
 const userKey contextKey = iota
 
-// publicPaths stay reachable without a token even when requireLogin is set.
-var publicPaths = map[string]bool{
-	"/healthz":              true,
-	"/api/v1/auth/register": true,
-	"/api/v1/auth/login":    true,
-	"/api/v1/openapi.yaml":  true,
-}
-
 // withAuth resolves the bearer token (if any) and enforces requireLogin.
 func (s *Server) withAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

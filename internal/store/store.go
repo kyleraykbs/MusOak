@@ -72,6 +72,9 @@ type MediaFile struct {
 	DurationMs   int64
 	Bytes        int64
 	DownloadedAt time.Time
+	// AccessedAt is when the file was last served; eviction uses it as the
+	// least-recently-used key.
+	AccessedAt time.Time
 }
 
 // User is a local account.
@@ -128,6 +131,13 @@ type MediaRepo interface {
 	MediaFileBySHA256(ctx context.Context, sha256 string) (*MediaFile, error)
 	DeleteMediaFile(ctx context.Context, variantID uuid.UUID) error
 	MediaFiles(ctx context.Context) ([]MediaFile, error)
+	// TouchMediaFile records that a file was served, which is what the LRU
+	// eviction order is based on.
+	TouchMediaFile(ctx context.Context, variantID uuid.UUID, at time.Time) error
+	// MediaFilesByLastUse lists files least recently used first.
+	MediaFilesByLastUse(ctx context.Context) ([]MediaFile, error)
+	// MediaBytes is the total size of the media cache.
+	MediaBytes(ctx context.Context) (int64, error)
 }
 
 // UserRepo stores accounts.
@@ -272,6 +282,7 @@ type migration struct {
 var migrations = []migration{
 	{version: 1, name: "initial schema", sql: schemaV1},
 	{version: 2, name: "votes", sql: schemaV2},
+	{version: 3, name: "media last use", sql: schemaV3},
 }
 
 func (d *DB) migrate(ctx context.Context) error {

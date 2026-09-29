@@ -132,6 +132,7 @@ func (m *Manager) Import(ctx context.Context, path string) (*store.Variant, erro
 		Bytes:      file.Bytes,
 		Path:       final,
 	})
+	m.evict(ctx)
 	return variant, nil
 }
 

@@ -351,8 +351,10 @@ func (m *Manager) Leave(roomID, memberID string) (*Snapshot, error) {
 	m.publishLocked(room, EventMemberLeft, map[string]any{"memberId": memberID})
 
 	if len(room.members) == 0 {
+		// The last member leaving closes the room; that is still a successful
+		// leave, so callers are not told the room was missing.
 		m.closeRoomLocked(room)
-		return nil, ErrRoomNotFound
+		return nil, nil
 	}
 	if room.host == memberID {
 		room.host = room.order[0]

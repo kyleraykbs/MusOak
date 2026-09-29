@@ -119,7 +119,6 @@ func (s *Server) handleRoomLeave(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
-
 func (s *Server) handleRoomEnqueue(w http.ResponseWriter, r *http.Request) {
 	member, ok := s.callerMember(r, false)
 	if !ok {

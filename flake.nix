@@ -63,7 +63,7 @@
             pname = "prismusic";
             inherit version;
             src = lib.cleanSource ./.;
-            vendorHash = "sha256-YRe55i9oXFG7mibRc4In8rXUJsFA+N0KNL/7HheCvbU=";
+            vendorHash = "sha256-yjUzphFaFxmjTgDb0UuI/ZkyOccYOpcstLhXTeLcMTA=";
             subPackages = [
               "cmd/prism"
               "cmd/prismusicd"
@@ -81,7 +81,6 @@
             meta = {
               description = "Self-hosted music streaming with cross-provider matching and listen-together";
               homepage = "https://codeberg.org/kyleraykbs/prismusic";
-              license = lib.licenses.mit;
               mainProgram = "prism";
             };
           };
@@ -126,7 +125,7 @@
             inherit prism prismusicd;
           };
 
-          formatter = pkgs.nixfmt-rfc-style;
+          formatter = pkgs.nixfmt;
 
           devShells.default = pkgs.mkShell {
             packages = with pkgs; [

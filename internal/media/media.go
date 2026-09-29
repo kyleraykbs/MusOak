@@ -68,17 +68,27 @@ type Store interface {
 	store.TrackRepo
 }
 
+// Download retry policy: transient provider failures (a flaky yt-dlp run, a
+// provider hiccup) are retried with backoff.
+const (
+	downloadAttempts = 3
+	downloadBackoff  = 2 * time.Second
+)
+
 // Manager downloads, stores and serves renditions.
 type Manager struct {
-	dir       string
-	db        Store
-	providers *provider.Registry
-	logger    *slog.Logger
+	dir        string
+	quotaBytes int64
+	db         Store
+	providers  *provider.Registry
+	logger     *slog.Logger
 
 	sf syncgroup
 
-	mu     sync.Mutex
-	status map[uuid.UUID]Status
+	mu               sync.Mutex
+	status           map[uuid.UUID]Status
+	downloadAttempts int
+	downloadBackoff  time.Duration
 }
 
 // syncgroup is the singleflight surface the manager uses.
@@ -86,18 +96,23 @@ type syncgroup interface {
 	Do(key string, fn func() (any, error)) (v any, err error, shared bool)
 }
 
-// New returns a manager storing files in dir.
-func New(dir string, db Store, providers *provider.Registry, logger *slog.Logger) *Manager {
+// New returns a manager storing files in dir. quotaBytes caps the directory;
+// zero means no cap. When the cache grows past the quota, the least recently
+// served renditions are evicted.
+func New(dir string, quotaBytes int64, db Store, providers *provider.Registry, logger *slog.Logger) *Manager {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Manager{
-		dir:       dir,
-		db:        db,
-		providers: providers,
-		logger:    logger,
-		sf:        &singleflight.Group{},
-		status:    make(map[uuid.UUID]Status),
+		dir:              dir,
+		quotaBytes:       quotaBytes,
+		db:               db,
+		providers:        providers,
+		logger:           logger,
+		sf:               &singleflight.Group{},
+		status:           make(map[uuid.UUID]Status),
+		downloadAttempts: downloadAttempts,
+		downloadBackoff:  downloadBackoff,
 	}
 }
 
@@ -160,7 +175,7 @@ func (m *Manager) fetch(ctx context.Context, variantID uuid.UUID) (string, error
 	tmp := final + ".part"
 	removeTmp := func() { _ = os.Remove(tmp) }
 
-	if err := m.providers.Download(ctx, variant.Provider, variant.ProviderTrackID, tmp); err != nil {
+	if err := m.downloadWithRetry(ctx, variant.Provider, variant.ProviderTrackID, tmp); err != nil {
 		removeTmp()
 		m.fail(variantID, err)
 		return "", err
@@ -216,7 +231,96 @@ func (m *Manager) fetch(ctx context.Context, variantID uuid.UUID) (string, error
 		Bytes:      file.Bytes,
 		Path:       final,
 	})
+	m.evict(ctx)
 	return final, nil
+}
+
+// SetDownloadRetry tunes the retry schedule. Tests use it to keep the suite
+// fast; deployments with an unreliable provider may raise the attempts.
+func (m *Manager) SetDownloadRetry(attempts int, backoff time.Duration) {
+	if attempts < 1 {
+		attempts = 1
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.downloadAttempts = attempts
+	m.downloadBackoff = backoff
+}
+
+// ensureAttempts reads the retry policy under the lock.
+func (m *Manager) ensureAttempts() (int, time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.downloadAttempts, m.downloadBackoff
+}
+
+// downloadWithRetry retries transient provider failures. A provider that cannot
+// download at all (Spotify) is never retried, and neither is a cancelled
+// context.
+func (m *Manager) downloadWithRetry(ctx context.Context, providerName, providerTrackID, dest string) error {
+	attempts, backoff := m.ensureAttempts()
+	delay := backoff
+	var err error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		err = m.providers.Download(ctx, providerName, providerTrackID, dest)
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, provider.ErrDownloadUnsupported) || errors.Is(err, provider.ErrNotEnabled) || ctx.Err() != nil {
+			return err
+		}
+		if attempt == attempts {
+			break
+		}
+		m.logger.Warn("media: download failed, retrying",
+			"provider", providerName, "provider_track_id", providerTrackID,
+			"attempt", attempt, "of", attempts, "error", err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+		delay *= 2
+	}
+	return err
+}
+
+// evict brings the media directory back under its quota, least recently served
+// first.
+func (m *Manager) evict(ctx context.Context) {
+	if m.quotaBytes <= 0 {
+		return
+	}
+	total, err := m.db.MediaBytes(ctx)
+	if err != nil {
+		m.logger.Warn("media: quota check failed", "error", err)
+		return
+	}
+	if total <= m.quotaBytes {
+		return
+	}
+
+	files, err := m.db.MediaFilesByLastUse(ctx)
+	if err != nil {
+		m.logger.Warn("media: eviction list failed", "error", err)
+		return
+	}
+	for _, file := range files {
+		if total <= m.quotaBytes {
+			break
+		}
+		if err := os.Remove(file.Path); err != nil && !os.IsNotExist(err) {
+			m.logger.Warn("media: could not remove", "path", file.Path, "error", err)
+			continue
+		}
+		if err := m.db.DeleteMediaFile(ctx, file.VariantID); err != nil {
+			m.logger.Warn("media: could not forget", "variant", file.VariantID, "error", err)
+			continue
+		}
+		total -= file.Bytes
+		m.logger.Info("media: evicted the least recently used rendition",
+			"variant", file.VariantID, "bytes", file.Bytes, "remaining", total)
+	}
 }
 
 // ready reports a completed file if one exists on disk.

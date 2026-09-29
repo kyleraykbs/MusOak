@@ -586,10 +586,13 @@ func TestRoomClosesWhenEverybodyLeaves(t *testing.T) {
 	if remaining.Host != "guest" {
 		t.Errorf("host = %q, want the promoted guest", remaining.Host)
 	}
-	if _, err := f.m.Leave(snapshot.ID, "guest"); !errors.Is(err, ErrRoomNotFound) {
-		t.Fatalf("last leave: err = %v, want ErrRoomNotFound (room closed)", err)
+	if _, err := f.m.Leave(snapshot.ID, "guest"); err != nil {
+		t.Fatalf("last leave: %v (leaving a room that closes is still a success)", err)
 	}
 	if rooms := f.m.List(); len(rooms) != 0 {
 		t.Errorf("rooms = %d, want none", len(rooms))
+	}
+	if _, err := f.m.Get(snapshot.ID); !errors.Is(err, ErrRoomNotFound) {
+		t.Errorf("the closed room is still there: %v", err)
 	}
 }

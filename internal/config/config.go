@@ -52,6 +52,22 @@ type Match struct {
 	Threshold float64 `json:"threshold"`
 }
 
+// RateLimit bounds the endpoints that cost real work or invite abuse. Zero
+// disables a limit.
+type RateLimit struct {
+	// SearchPerMinute is the per-client search budget.
+	SearchPerMinute int `json:"searchPerMinute"`
+	// LoginPerMinute is the per-client budget for register and login.
+	LoginPerMinute int `json:"loginPerMinute"`
+}
+
+// Media tunes the on-disk media cache.
+type Media struct {
+	// QuotaMB caps the media directory. Zero means no limit. When the cache
+	// grows past it, the least recently used renditions are evicted.
+	QuotaMB int `json:"quotaMB"`
+}
+
 // Client configures client-side behaviour (the CLI, or any other API client)
 // rather than the server.
 type Client struct {
@@ -73,6 +89,8 @@ type Config struct {
 	PrefetchCount        int            `json:"prefetchCount"`
 	ListenTogether       ListenTogether `json:"listenTogether"`
 	Match                Match          `json:"match"`
+	RateLimit            RateLimit      `json:"rateLimit"`
+	Media                Media          `json:"media"`
 	Client               Client         `json:"client"`
 }
 
@@ -97,6 +115,11 @@ func Default() *Config {
 		},
 		Match:  Match{Threshold: DefaultMatchThreshold},
 		Client: Client{CacheDir: DefaultCacheDir()},
+		RateLimit: RateLimit{
+			SearchPerMinute: 30,
+			LoginPerMinute:  10,
+		},
+		Media: Media{QuotaMB: 0},
 	}
 }
 
@@ -229,6 +252,15 @@ func (c *Config) Validate() error {
 
 	if c.Match.Threshold <= 0 || c.Match.Threshold > 1 {
 		return fmt.Errorf("match.threshold must be in (0, 1], got %g", c.Match.Threshold)
+	}
+	if c.RateLimit.SearchPerMinute < 0 {
+		return fmt.Errorf("rateLimit.searchPerMinute must be >= 0, got %d", c.RateLimit.SearchPerMinute)
+	}
+	if c.RateLimit.LoginPerMinute < 0 {
+		return fmt.Errorf("rateLimit.loginPerMinute must be >= 0, got %d", c.RateLimit.LoginPerMinute)
+	}
+	if c.Media.QuotaMB < 0 {
+		return fmt.Errorf("media.quotaMB must be >= 0, got %d", c.Media.QuotaMB)
 	}
 
 	if len(c.DefaultProviderOrder) == 0 {

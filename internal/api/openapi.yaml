@@ -1,0 +1,1034 @@
+openapi: 3.0.3
+info:
+  title: Prismusic API
+  version: "2.0.0"
+  description: |
+    Everything the Prismusic server does is reachable here. The CLI and the
+    Discord bot are ordinary clients: they authenticate, search, make media
+    ready, join rooms and follow the event stream.
+
+    Two conventions matter:
+
+    * `GET /api/v1/media/{variantId}` serves bytes and supports Range requests;
+      it never starts a download. Ask for one with
+      `POST /api/v1/media/{variantId}/download` first.
+    * Room commands are REST calls; room state changes arrive on
+      `GET /api/v1/ws` as events. The server owns the room timeline, clients
+      follow `track_started.startedAt`.
+servers:
+  - url: /
+    description: the same host and port this document came from
+
+tags:
+  - name: library
+  - name: media
+  - name: rooms
+  - name: auth
+
+paths:
+  /healthz:
+    get:
+      summary: Liveness probe
+      operationId: healthz
+      responses:
+        "200":
+          description: The server is up.
+          content:
+            text/plain:
+              schema: { type: string, example: "ok\n" }
+
+  /api/v1/openapi.yaml:
+    get:
+      summary: This specification
+      operationId: getOpenAPISpec
+      responses:
+        "200":
+          description: The OpenAPI document.
+          content:
+            application/yaml:
+              schema: { type: string }
+
+  /api/v1/providers:
+    get:
+      tags: [library]
+      summary: List enabled providers and their capabilities
+      operationId: listProviders
+      responses:
+        "200":
+          description: Enabled providers.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [providers]
+                properties:
+                  providers:
+                    type: array
+                    items: { $ref: "#/components/schemas/Provider" }
+
+  /api/v1/search:
+    get:
+      tags: [library]
+      summary: Search every provider and merge the hits into canonical tracks
+      operationId: search
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: { type: string }
+        - name: limit
+          in: query
+          description: Results per provider (maximum 50).
+          schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+      responses:
+        "200":
+          description: |
+            Merged results. A provider that failed is reported in
+            `providerErrors`; the other providers' hits are still returned.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SearchResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/v1/tracks/{trackId}:
+    get:
+      tags: [library]
+      summary: One canonical track
+      operationId: getTrack
+      parameters: [{ $ref: "#/components/parameters/TrackID" }]
+      responses:
+        "200":
+          description: The track.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Track" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/tracks/{trackId}/variants:
+    get:
+      tags: [library]
+      summary: Every provider rendition of a track
+      operationId: listTrackVariants
+      parameters: [{ $ref: "#/components/parameters/TrackID" }]
+      responses:
+        "200":
+          description: The renditions, with their download state.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [variants]
+                properties:
+                  variants:
+                    type: array
+                    items: { $ref: "#/components/schemas/Variant" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/tracks/{trackId}/resolve:
+    post:
+      tags: [library]
+      summary: Make a track playable
+      description: |
+        If the track only has metadata-only renditions (Spotify), a matching
+        rendition is searched for on the downloadable providers and attached to
+        the same canonical track.
+      operationId: resolveTrack
+      parameters: [{ $ref: "#/components/parameters/TrackID" }]
+      responses:
+        "200":
+          description: The track's renditions after resolution.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [variants, playable]
+                properties:
+                  playable:
+                    type: boolean
+                    description: Whether a downloadable rendition now exists.
+                  variants:
+                    type: array
+                    items: { $ref: "#/components/schemas/Variant" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/media/{variantId}:
+    get:
+      tags: [media]
+      summary: Stream a finished rendition
+      description: |
+        Returns the stored Ogg/Opus file with Range support and an ETag of its
+        sha256. Only complete files are ever served.
+      operationId: getMedia
+      parameters: [{ $ref: "#/components/parameters/VariantID" }]
+      responses:
+        "200":
+          description: The whole file.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            audio/ogg:
+              schema: { type: string, format: binary }
+        "206":
+          description: The requested byte range.
+          content:
+            audio/ogg:
+              schema: { type: string, format: binary }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/media/{variantId}/status:
+    get:
+      tags: [media]
+      summary: Download state of a rendition
+      operationId: getMediaStatus
+      parameters: [{ $ref: "#/components/parameters/VariantID" }]
+      responses:
+        "200":
+          description: The current state.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MediaStatus" }
+
+  /api/v1/media/{variantId}/download:
+    post:
+      tags: [media]
+      summary: Start (or join) a download
+      description: |
+        Idempotent and deduplicated: concurrent callers share one transfer.
+        Without `wait` the call returns immediately with the current state, and
+        the status endpoint reports progress; with `wait=1` it blocks until the
+        rendition is ready or failed.
+      operationId: startMediaDownload
+      parameters:
+        - { $ref: "#/components/parameters/VariantID" }
+        - name: wait
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        "200":
+          description: The rendition is ready (only with `wait`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MediaStatus" }
+        "202":
+          description: The download is running; poll the status endpoint.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MediaStatus" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: The rendition cannot be downloaded (Spotify audio is DRM-protected); resolve the track first.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "502":
+          description: The provider failed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/library/import:
+    post:
+      tags: [library]
+      summary: Add local files to the library
+      description: |
+        Files are transcoded to Ogg/Opus, matched onto canonical tracks like
+        any provider's rendition, and reported as local variants.
+      operationId: importLibrary
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                path:
+                  type: string
+                  description: One file to import.
+                dir:
+                  type: string
+                  description: A directory to scan; mutually exclusive with `path`.
+      responses:
+        "200":
+          description: What was imported, plus per-file failures.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ImportResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/v1/auth/register:
+    post:
+      tags: [auth]
+      summary: Create an account
+      operationId: register
+      requestBody: { $ref: "#/components/requestBodies/Credentials" }
+      responses:
+        "201":
+          description: The account and a session token.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403":
+          description: Registration is closed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: The username is taken.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      summary: Log in
+      operationId: login
+      requestBody: { $ref: "#/components/requestBodies/Credentials" }
+      responses:
+        "200":
+          description: The account and a session token.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/v1/auth/logout:
+    post:
+      tags: [auth]
+      summary: Revoke the current session
+      operationId: logout
+      responses:
+        "204": { description: The session is gone. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/me:
+    get:
+      tags: [auth]
+      summary: Describe the caller
+      operationId: getMe
+      responses:
+        "200":
+          description: Identity and server policy.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Me" }
+
+  /api/v1/me/favorites:
+    get:
+      tags: [auth]
+      summary: List favorites
+      operationId: listFavorites
+      responses:
+        "200":
+          description: The favorited tracks, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tracks]
+                properties:
+                  tracks:
+                    type: array
+                    items: { $ref: "#/components/schemas/Track" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [auth]
+      summary: Favorite a track
+      operationId: addFavorite
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [trackId]
+              properties:
+                trackId: { type: string, format: uuid }
+      responses:
+        "204": { description: Favorited (idempotent). }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/me/favorites/{trackId}:
+    delete:
+      tags: [auth]
+      summary: Unfavorite a track
+      operationId: removeFavorite
+      parameters: [{ $ref: "#/components/parameters/TrackID" }]
+      responses:
+        "204": { description: Removed. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/me/providers/ranking:
+    get:
+      tags: [auth]
+      summary: Your provider preference
+      description: |
+        `effective` is what decides which rendition is played: your own ranking,
+        or the aggregate when you have none.
+      operationId: getRanking
+      responses:
+        "200":
+          description: The ranking.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Ranking" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    put:
+      tags: [auth]
+      summary: Set your provider preference
+      operationId: setRanking
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ranking]
+              properties:
+                ranking:
+                  type: array
+                  items: { type: string }
+      responses:
+        "200":
+          description: The stored ranking and the aggregate it changes.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Ranking" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/clock:
+    get:
+      summary: Server clock and room rules
+      description: |
+        Clients sample this (or ping the event socket) to estimate their offset
+        from the server clock, which is what room positions are expressed in.
+      operationId: getClock
+      responses:
+        "200":
+          description: The server time in milliseconds since the epoch.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [nowMs]
+                properties:
+                  nowMs: { type: integer, format: int64 }
+                  listenTogether: { $ref: "#/components/schemas/SkipRules" }
+
+  /api/v1/rooms:
+    get:
+      tags: [rooms]
+      summary: List rooms
+      operationId: listRooms
+      responses:
+        "200":
+          description: Every room.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [rooms]
+                properties:
+                  rooms:
+                    type: array
+                    items: { $ref: "#/components/schemas/Room" }
+    post:
+      tags: [rooms]
+      summary: Open a room
+      description: The caller becomes the host. Guests receive a member id here.
+      operationId: createRoom
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                controls:
+                  type: string
+                  enum: [host, everyone]
+                  default: everyone
+      responses:
+        "201":
+          description: The room and the caller's member id.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RoomEnvelope" }
+
+  /api/v1/rooms/{roomId}:
+    get:
+      tags: [rooms]
+      summary: Room state
+      operationId: getRoom
+      parameters: [{ $ref: "#/components/parameters/RoomID" }]
+      responses:
+        "200":
+          description: The room, including the current track and its position.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Room" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/rooms/{roomId}/join:
+    post:
+      tags: [rooms]
+      summary: Join a room
+      operationId: joinRoom
+      parameters: [{ $ref: "#/components/parameters/RoomID" }]
+      responses:
+        "200":
+          description: The room and the caller's member id.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RoomEnvelope" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/rooms/{roomId}/leave:
+    post:
+      tags: [rooms]
+      summary: Leave a room
+      operationId: leaveRoom
+      parameters: [{ $ref: "#/components/parameters/RoomID" }]
+      responses:
+        "204": { description: Gone. The last member leaving closes the room. }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/v1/rooms/{roomId}/queue:
+    post:
+      tags: [rooms]
+      summary: Add a track to the queue
+      description: An idle room starts playing as soon as it is queued.
+      operationId: queueTrack
+      parameters: [{ $ref: "#/components/parameters/RoomID" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [trackId]
+              properties:
+                trackId: { type: string, format: uuid }
+      responses:
+        "200":
+          description: The room after the change.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Room" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/rooms/{roomId}/queue/{itemId}:
+    delete:
+      tags: [rooms]
+      summary: Remove a queued entry
+      operationId: removeQueueItem
+      parameters:
+        - { $ref: "#/components/parameters/RoomID" }
+        - name: itemId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: The room after the change.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Room" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/rooms/{roomId}/queue/reorder:
+    post:
+      tags: [rooms]
+      summary: Reorder the queue
+      operationId: reorderQueue
+      parameters: [{ $ref: "#/components/parameters/RoomID" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [itemIds]
+              properties:
+                itemIds:
+                  type: array
+                  items: { type: string }
+      responses:
+        "200":
+          description: The room after the change.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Room" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/v1/rooms/{roomId}/pause:
+    post:
+      tags: [rooms]
+      summary: Pause the room
+      operationId: pauseRoom
+      parameters: [{ $ref: "#/components/parameters/RoomID" }]
+      responses:
+        "200": { $ref: "#/components/responses/RoomState" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: Nothing is playing.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/rooms/{roomId}/resume:
+    post:
+      tags: [rooms]
+      summary: Resume a paused room
+      operationId: resumeRoom
+      parameters: [{ $ref: "#/components/parameters/RoomID" }]
+      responses:
+        "200": { $ref: "#/components/responses/RoomState" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: Nothing is playing.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/rooms/{roomId}/skip:
+    post:
+      tags: [rooms]
+      summary: Skip the current track
+      operationId: skipTrack
+      parameters: [{ $ref: "#/components/parameters/RoomID" }]
+      responses:
+        "200": { $ref: "#/components/responses/RoomState" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: Nothing is playing.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/rooms/{roomId}/seek:
+    post:
+      tags: [rooms]
+      summary: Seek the room
+      operationId: seekRoom
+      parameters: [{ $ref: "#/components/parameters/RoomID" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [positionMs]
+              properties:
+                positionMs: { type: integer, format: int64, minimum: 0 }
+      responses:
+        "200": { $ref: "#/components/responses/RoomState" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/v1/rooms/{roomId}/vote:
+    post:
+      tags: [rooms]
+      summary: Score the current track
+      description: |
+        Votes run from 1 (bad) to 5 (great) and can be changed while the track
+        plays. When enough members have voted and the mean is below the
+        threshold, the server skips the track.
+      operationId: voteTrack
+      parameters: [{ $ref: "#/components/parameters/RoomID" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [score]
+              properties:
+                score: { type: integer, minimum: 1, maximum: 5 }
+      responses:
+        "200": { $ref: "#/components/responses/RoomState" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/v1/rooms/{roomId}/ready:
+    post:
+      tags: [rooms]
+      summary: Report that this member can play the prepared track
+      description: |
+        The duration is what this client will actually play, which may come from
+        a local file. The room starts when every member is ready, or when the
+        readiness timeout passes.
+      operationId: reportReady
+      parameters: [{ $ref: "#/components/parameters/RoomID" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [trackId, variantId]
+              properties:
+                trackId: { type: string, format: uuid }
+                variantId: { type: string, format: uuid }
+                durationMs:
+                  type: integer
+                  format: int64
+                  description: Length of this member's rendition.
+      responses:
+        "200": { $ref: "#/components/responses/RoomState" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: That track is not the one being prepared.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/ws:
+    get:
+      tags: [rooms]
+      summary: Room events and clock sync
+      description: |
+        A WebSocket carrying every room event. Send
+        `{"type":"ping","clientSentAt":<ms>}` to measure the clock offset: the
+        reply carries `serverReceivedAt` and `serverSentAt`, so
+        `offset = serverReceivedAt - (clientSentAt + clientReceivedAt) / 2`.
+      operationId: eventStream
+      parameters:
+        - name: roomId
+          in: query
+          description: Only receive this room's events.
+          schema: { type: string }
+      responses:
+        "101": { description: Switching protocols. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+components:
+  parameters:
+    TrackID:
+      name: trackId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    VariantID:
+      name: variantId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    RoomID:
+      name: roomId
+      in: path
+      required: true
+      schema: { type: string }
+
+  headers:
+    ETag:
+      description: sha256 of the file's contents.
+      schema: { type: string }
+
+  requestBodies:
+    Credentials:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [username, password]
+            properties:
+              username: { type: string }
+              password: { type: string, format: password }
+
+  responses:
+    RoomState:
+      description: The room after the command.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Room" }
+    BadRequest:
+      description: The request was malformed.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: A login is required (or the guest has no personal data).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: Not a member of this room, or the room is host-controlled.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: No such track, rendition or room.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: Too many requests; see Retry-After.
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+
+    Provider:
+      type: object
+      required: [name, capabilities]
+      properties:
+        name: { type: string, example: ytmusic }
+        capabilities: { $ref: "#/components/schemas/Capabilities" }
+        missingDeps:
+          type: array
+          description: External binaries this provider needs but cannot find.
+          items: { type: string }
+
+    Capabilities:
+      type: object
+      required: [search, download]
+      properties:
+        search: { type: boolean }
+        download:
+          type: boolean
+          description: False for metadata-only providers such as Spotify.
+
+    Track:
+      type: object
+      required: [id, title, artists, albums]
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string }
+        durationMs: { type: integer, format: int64 }
+        artists: { type: array, items: { type: string } }
+        albums: { type: array, items: { type: string } }
+        createdAt: { type: string, format: date-time }
+
+    Variant:
+      type: object
+      required: [id, trackId, provider, downloadable, media]
+      properties:
+        id: { type: string, format: uuid }
+        trackId: { type: string, format: uuid }
+        provider: { type: string, example: ytmusic }
+        providerTrackId: { type: string }
+        title: { type: string }
+        artists: { type: array, items: { type: string } }
+        album: { type: string }
+        durationMs: { type: integer, format: int64 }
+        downloadable:
+          type: boolean
+          description: Whether its audio can be fetched at all.
+        isrc: { type: string }
+        media: { $ref: "#/components/schemas/MediaStatus" }
+
+    MediaStatus:
+      type: object
+      required: [variantId, state]
+      properties:
+        variantId: { type: string, format: uuid }
+        state:
+          type: string
+          enum: [none, downloading, ready, failed]
+        progress:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+        error: { type: string }
+        durationMs: { type: integer, format: int64 }
+        bytes: { type: integer, format: int64 }
+
+    RankedVariant:
+      type: object
+      required: [track, variants]
+      properties:
+        track: { $ref: "#/components/schemas/Track" }
+        variants: { type: array, items: { $ref: "#/components/schemas/Variant" } }
+
+    SearchResponse:
+      type: object
+      required: [query, groups]
+      properties:
+        query: { type: string }
+        groups:
+          type: array
+          description: Canonical tracks, merged across providers.
+          items: { $ref: "#/components/schemas/RankedVariant" }
+        providerErrors:
+          type: array
+          description: Providers that failed; the rest of the results stand.
+          items:
+            type: object
+            required: [provider, error]
+            properties:
+              provider: { type: string }
+              error: { type: string }
+
+    ImportResult:
+      type: object
+      required: [imported]
+      properties:
+        imported:
+          type: array
+          items:
+            type: object
+            required: [track, variant]
+            properties:
+              track: { $ref: "#/components/schemas/Track" }
+              variant: { $ref: "#/components/schemas/Variant" }
+        failures: { type: array, items: { type: string } }
+
+    User:
+      type: object
+      required: [id, username]
+      properties:
+        id: { type: string, format: uuid }
+        username: { type: string }
+
+    AuthResponse:
+      type: object
+      required: [token, user]
+      properties:
+        token:
+          type: string
+          description: Bearer token for the Authorization header.
+        user: { $ref: "#/components/schemas/User" }
+
+    Me:
+      type: object
+      properties:
+        authenticated: { type: boolean }
+        guest:
+          type: boolean
+          description: True when the server allows anonymous reading.
+        user: { $ref: "#/components/schemas/User" }
+        requireLogin: { type: boolean }
+        registrationOpen: { type: boolean }
+
+    Ranking:
+      type: object
+      required: [ranking, effective, aggregate, default]
+      properties:
+        ranking: { type: array, items: { type: string } }
+        effective:
+          type: array
+          description: What decides which rendition this user plays.
+          items: { type: string }
+        aggregate:
+          type: array
+          description: Mean position order across all ranked users.
+          items: { type: string }
+        default:
+          type: array
+          description: Configured fallback order.
+          items: { type: string }
+
+    SkipRules:
+      type: object
+      properties:
+        skipThreshold: { type: number, format: double }
+        minVotersForSkip: { type: integer }
+        voterFractionForSkip: { type: number, format: double }
+        readyTimeoutSeconds: { type: integer }
+
+    RoomMember:
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: string }
+        userId: { type: string, format: uuid }
+        name: { type: string }
+        joinedAtMs: { type: integer, format: int64 }
+
+    QueueItem:
+      type: object
+      required: [id, trackId, title]
+      properties:
+        id: { type: string }
+        trackId: { type: string, format: uuid }
+        title: { type: string }
+        addedBy: { type: string }
+        addedAtMs: { type: integer, format: int64 }
+
+    ReadyReport:
+      type: object
+      required: [memberId, trackId, variantId]
+      properties:
+        memberId: { type: string }
+        trackId: { type: string, format: uuid }
+        variantId: { type: string, format: uuid }
+        durationMs: { type: integer, format: int64 }
+        atMs: { type: integer, format: int64 }
+
+    RoomPlayback:
+      type: object
+      required: [item, startedAtMs, timelineMs, positionMs]
+      properties:
+        item: { $ref: "#/components/schemas/QueueItem" }
+        startedAtMs:
+          type: integer
+          format: int64
+          description: Server clock instant the track started; zero while preparing.
+        timelineMs:
+          type: integer
+          format: int64
+          description: Longest rendition in the room; the room plays exactly this long.
+        positionMs: { type: integer, format: int64 }
+        paused: { type: boolean }
+        variants:
+          type: object
+          description: Member id to the rendition the server picked for it.
+          additionalProperties: { type: string }
+        ready: { type: array, items: { $ref: "#/components/schemas/ReadyReport" } }
+        awaiting:
+          type: array
+          description: Members that have not reported readiness yet.
+          items: { type: string }
+        catchingUp:
+          type: array
+          description: Members that were not ready when the track started.
+          items: { type: string }
+        votes:
+          type: object
+          additionalProperties: { type: integer }
+        meanScore: { type: number, format: double }
+
+    Room:
+      type: object
+      required: [id, name, host, controls, members, queue]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        host: { type: string }
+        controls: { type: string, enum: [host, everyone] }
+        createdAtMs: { type: integer, format: int64 }
+        members: { type: array, items: { $ref: "#/components/schemas/RoomMember" } }
+        queue: { type: array, items: { $ref: "#/components/schemas/QueueItem" } }
+        current: { $ref: "#/components/schemas/RoomPlayback" }
+        serverNowMs: { type: integer, format: int64 }
+        skip: { $ref: "#/components/schemas/SkipRules" }
+
+    RoomEnvelope:
+      type: object
+      required: [room, memberId]
+      properties:
+        room: { $ref: "#/components/schemas/Room" }
+        memberId:
+          type: string
+          description: This caller's member id, for guests to send as X-Member-Id.
