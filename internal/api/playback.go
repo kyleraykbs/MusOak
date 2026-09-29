@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"codeberg.org/kyleraykbs/prismusic/internal/store"
 )
@@ -66,6 +67,12 @@ func (s *Server) handlePlaybackStateSave(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if err := s.store.SetPlaybackState(r.Context(), user.ID, stored); err != nil {
+		writeStoreError(w, err, "the playback state could not be stored")
+		return
+	}
+	// Saving state is the signal that this account is playing something right
+	// now: it is what "online" is derived from.
+	if err := s.store.TouchUser(r.Context(), user.ID, time.Now()); err != nil {
 		writeStoreError(w, err, "the playback state could not be stored")
 		return
 	}
