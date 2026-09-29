@@ -65,6 +65,8 @@ func (s *Server) routeTable() []route {
 		{"POST /api/v1/me/favorites", s.handleFavoriteAdd},
 		{"DELETE /api/v1/me/favorites/{trackId}", s.handleFavoriteRemove},
 		{"GET /api/v1/me/providers/ranking", s.handleRankingGet},
+		{"GET /api/v1/me/playback", s.handlePlaybackState},
+		{"PUT /api/v1/me/playback", s.handlePlaybackStateSave},
 		{"PUT /api/v1/me/providers/ranking", s.handleRankingPut},
 
 		{"GET /api/v1/me/playlists", s.handlePlaylistList},

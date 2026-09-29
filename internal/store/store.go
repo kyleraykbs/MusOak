@@ -302,6 +302,7 @@ var migrations = []migration{
 	{version: 6, name: "artwork", sql: schemaV6},
 	{version: 7, name: "external playlists", sql: schemaV7},
 	{version: 8, name: "playlist artwork", sql: schemaV8},
+	{version: 9, name: "playback state", sql: schemaV9},
 }
 
 func (d *DB) migrate(ctx context.Context) error {

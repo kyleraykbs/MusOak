@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"codeberg.org/kyleraykbs/prismusic/internal/config"
@@ -61,6 +62,20 @@ func (c *testClient) do(method, path, token string, body any) *httptest.Response
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	rec := httptest.NewRecorder()
+	c.Server.Handler().ServeHTTP(rec, req)
+	return rec
+}
+
+// doRaw sends a body exactly as given, for requests that must not be marshalled
+// first — a body that is not JSON on purpose, for instance.
+func (c *testClient) doRaw(method, path, token, body string) *httptest.ResponseRecorder {
+	c.t.Helper()
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	c.Server.Handler().ServeHTTP(rec, req)
 	return rec

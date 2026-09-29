@@ -439,6 +439,48 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
+  /api/v1/me/playback:
+    get:
+      tags: [auth]
+      summary: What you were last playing
+      description: |
+        The queue, the song and the timestamp saved from an earlier session, as a
+        document the server keeps exactly as it arrives. With nothing stored the
+        state is an empty object, so restoring is the same code path either way.
+      operationId: getPlaybackState
+      responses:
+        "200":
+          description: The saved state, or an empty object.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlaybackState" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    put:
+      tags: [auth]
+      summary: Save what you are playing
+      description: |
+        Replaces the caller's saved state. The document is a JSON object the
+        server does not interpret: what "the queue you were on" means is the
+        client's to describe.
+      operationId: setPlaybackState
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PlaybackState" }
+      responses:
+        "200":
+          description: The saved state.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlaybackState" }
+        "400":
+          description: The state was not a JSON object, or was too large.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
   /api/v1/me/playlists:
     get:
       tags: [auth]
@@ -1511,6 +1553,20 @@ components:
         providerErrors:
           type: array
           items: { $ref: "#/components/schemas/ProviderProblem" }
+
+    PlaybackState:
+      type: object
+      description: |
+        What the caller was last playing: the queue, the song and the timestamp.
+        The server stores the document as it arrives and does not interpret it.
+      required: [state]
+      properties:
+        state:
+          type: object
+          additionalProperties: true
+        updatedAt:
+          type: integer
+          format: int64
 
     PlaylistArtwork:
       type: object
