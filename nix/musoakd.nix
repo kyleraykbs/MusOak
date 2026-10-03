@@ -110,6 +110,14 @@ in
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
 
+      # The generated configuration is written to /etc, so ExecStart names the
+      # same path whatever the options say. Systemd therefore sees an unchanged
+      # unit and leaves the daemon running with the configuration it started
+      # with - the new file sits on disk, unread, until somebody restarts it by
+      # hand. Triggering on the generated file is what makes a config change a
+      # restart. A file the operator pointed at is theirs to reload.
+      restartTriggers = lib.optionals (cfg.configFile == null) [ generatedConfig ];
+
       environment = cfg.environment;
 
       serviceConfig = {
