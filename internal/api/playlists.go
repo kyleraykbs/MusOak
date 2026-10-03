@@ -4,12 +4,13 @@ import (
 	"encoding/base64"
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/artwork"
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/artwork"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 type playlistResponse struct {
@@ -18,9 +19,15 @@ type playlistResponse struct {
 	TrackCount int             `json:"trackCount"`
 	DurationMs int64           `json:"durationMs"`
 	ArtworkURL string          `json:"artworkUrl,omitempty"`
-	CreatedAt  string          `json:"createdAt"`
-	UpdatedAt  string          `json:"updatedAt"`
-	Tracks     []trackResponse `json:"tracks,omitempty"`
+	// Public decides whether anybody else may see this playlist. Public is what
+	// a new playlist is.
+	Public bool `json:"public"`
+	// Mine says whether the caller owns it, which is what decides if the client
+	// offers to edit it.
+	Mine      bool            `json:"mine"`
+	CreatedAt string          `json:"createdAt"`
+	UpdatedAt string          `json:"updatedAt"`
+	Tracks    []trackResponse `json:"tracks,omitempty"`
 }
 
 // playlistArtworkRequest is an image, base64, with the type it claims to be.
@@ -43,6 +50,9 @@ type playlistDetailResponse struct {
 
 type playlistCreateRequest struct {
 	Name string `json:"name"`
+	// Public is a pointer so "absent" keeps what the playlist already is, and a
+	// new playlist is public unless this says otherwise.
+	Public *bool `json:"public"`
 }
 
 type playlistItemsRequest struct {
@@ -54,18 +64,27 @@ type playlistReorderRequest struct {
 	Order []int `json:"order"`
 }
 
-// playlistID parses the path value and returns the playlist when it belongs to
-// the caller. Somebody else's playlist is reported as missing, so the endpoint
-// does not leak whose playlists exist.
-func (s *Server) ownedPlaylist(w http.ResponseWriter, r *http.Request, userID uuid.UUID) (*store.Playlist, bool) {
+// playlistIDFromPath parses the playlist a request names.
+func playlistIDFromPath(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
 	raw := r.PathValue("playlistId")
 	if len(raw) == 0 || len(raw) > maxMediaVariantIDLen {
 		writeError(w, http.StatusBadRequest, "invalid playlist id")
-		return nil, false
+		return uuid.Nil, false
 	}
 	id, err := uuid.Parse(raw)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid playlist id")
+		return uuid.Nil, false
+	}
+	return id, true
+}
+
+// playlistID parses the path value and returns the playlist when it belongs to
+// the caller. Somebody else's playlist is reported as missing, so the endpoint
+// does not leak whose playlists exist.
+func (s *Server) ownedPlaylist(w http.ResponseWriter, r *http.Request, userID uuid.UUID) (*store.Playlist, bool) {
+	id, ok := playlistIDFromPath(w, r)
+	if !ok {
 		return nil, false
 	}
 
@@ -81,10 +100,12 @@ func (s *Server) ownedPlaylist(w http.ResponseWriter, r *http.Request, userID uu
 	return playlist, true
 }
 
-func playlistSummary(playlist *store.Playlist) playlistResponse {
+func playlistSummary(playlist *store.Playlist, viewer uuid.UUID) playlistResponse {
 	response := playlistResponse{
 		ID:         playlist.ID.String(),
 		Name:       playlist.Name,
+		Public:     playlist.Public,
+		Mine:       playlist.UserID == viewer,
 		TrackCount: playlist.TrackCount,
 		DurationMs: playlist.DurationMs,
 		CreatedAt:  playlist.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
@@ -111,7 +132,7 @@ func (s *Server) handlePlaylistArtwork(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req playlistArtworkRequest
-	if !decodeJSON(w, r, &req) {
+	if !decodeImageJSON(w, r, &req) {
 		return
 	}
 
@@ -150,7 +171,7 @@ func (s *Server) handlePlaylistArtwork(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err, "the cover could not be recorded")
 		return
 	}
-	writeJSON(w, http.StatusOK, playlistSummary(updated))
+	writeJSON(w, http.StatusOK, playlistSummary(updated, user.ID))
 }
 
 // uploadSource is the pseudo-URL an uploaded cover is cached under.
@@ -173,7 +194,7 @@ func (s *Server) handlePlaylistList(w http.ResponseWriter, r *http.Request) {
 
 	out := make([]playlistResponse, 0, len(playlists))
 	for i := range playlists {
-		out = append(out, playlistSummary(&playlists[i]))
+		out = append(out, playlistSummary(&playlists[i], user.ID))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"playlists": out})
 }
@@ -198,12 +219,42 @@ func (s *Server) handlePlaylistCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	playlist := &store.Playlist{UserID: user.ID, Name: name}
+	// A playlist is something to share, so public is what it is unless the
+	// caller says otherwise.
+	public := true
+	if req.Public != nil {
+		public = *req.Public
+	}
+	playlist := &store.Playlist{UserID: user.ID, Name: name, Public: public}
 	if err := s.store.CreatePlaylist(r.Context(), playlist); err != nil {
 		writeStoreError(w, err, "could not create the playlist")
 		return
 	}
-	writeJSON(w, http.StatusCreated, playlistSummary(playlist))
+	writeJSON(w, http.StatusCreated, playlistSummary(playlist, user.ID))
+}
+
+// handlePlaylistShared returns a playlist the caller is allowed to see: their
+// own, or one its owner made public. A private playlist somebody else owns is
+// reported exactly like a missing one.
+func (s *Server) handlePlaylistShared(w http.ResponseWriter, r *http.Request) {
+	user, ok := s.requireUser(w, r)
+	if !ok {
+		return
+	}
+	id, ok := playlistIDFromPath(w, r)
+	if !ok {
+		return
+	}
+	playlist, err := s.store.Playlist(r.Context(), id)
+	if err != nil || (playlist.UserID != user.ID && !playlist.Public) {
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			writeStoreError(w, err, "playlist not found")
+			return
+		}
+		writeError(w, http.StatusNotFound, "playlist not found")
+		return
+	}
+	s.writePlaylistDetail(w, r, playlist, user.ID)
 }
 
 // handlePlaylistGet returns one playlist with its tracks.
@@ -216,11 +267,11 @@ func (s *Server) handlePlaylistGet(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	s.writePlaylistDetail(w, r, playlist)
+	s.writePlaylistDetail(w, r, playlist, user.ID)
 }
 
 // writePlaylistDetail renders a playlist and resolves its entries.
-func (s *Server) writePlaylistDetail(w http.ResponseWriter, r *http.Request, playlist *store.Playlist) {
+func (s *Server) writePlaylistDetail(w http.ResponseWriter, r *http.Request, playlist *store.Playlist, viewer uuid.UUID) {
 	items, err := s.store.PlaylistItems(r.Context(), playlist.ID)
 	if err != nil {
 		writeStoreError(w, err, "playlist unavailable")
@@ -228,7 +279,7 @@ func (s *Server) writePlaylistDetail(w http.ResponseWriter, r *http.Request, pla
 	}
 
 	detail := playlistDetailResponse{
-		playlistResponse: playlistSummary(playlist),
+		playlistResponse: playlistSummary(playlist, viewer),
 		Items:            make([]playlistItemResponse, 0, len(items)),
 	}
 	detail.TrackCount = len(items)
@@ -248,10 +299,15 @@ func (s *Server) writePlaylistDetail(w http.ResponseWriter, r *http.Request, pla
 		}
 		detail.Items = append(detail.Items, playlistItemResponse{Position: item.Position, Track: response})
 	}
+	refs := make([]*trackResponse, 0, len(detail.Items))
+	for i := range detail.Items {
+		refs = append(refs, &detail.Items[i].Track)
+	}
+	s.withPlays(r.Context(), s.currentUser(r), refs)
 	writeJSON(w, http.StatusOK, detail)
 }
 
-// handlePlaylistRename renames a playlist.
+// handlePlaylistRename renames a playlist, changes who may see it, or both.
 func (s *Server) handlePlaylistRename(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.requireUser(w, r)
 	if !ok {
@@ -266,20 +322,32 @@ func (s *Server) handlePlaylistRename(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := strings.TrimSpace(req.Name)
-	if name == "" {
-		writeError(w, http.StatusBadRequest, "name is required")
+	if name == "" && req.Public == nil {
+		writeError(w, http.StatusBadRequest, "nothing to change: a name or a visibility is needed")
 		return
 	}
-	if err := s.store.RenamePlaylist(r.Context(), playlist.ID, name); err != nil {
-		writeStoreError(w, err, "could not rename the playlist")
-		return
+	if name != "" {
+		if len(name) > 200 {
+			writeError(w, http.StatusBadRequest, "name is too long")
+			return
+		}
+		if err := s.store.RenamePlaylist(r.Context(), playlist.ID, name); err != nil {
+			writeStoreError(w, err, "could not rename the playlist")
+			return
+		}
+	}
+	if req.Public != nil && *req.Public != playlist.Public {
+		if err := s.store.SetPlaylistVisibility(r.Context(), playlist.ID, *req.Public); err != nil {
+			writeStoreError(w, err, "could not change who can see the playlist")
+			return
+		}
 	}
 	updated, err := s.store.Playlist(r.Context(), playlist.ID)
 	if err != nil {
 		writeStoreError(w, err, "playlist unavailable")
 		return
 	}
-	writeJSON(w, http.StatusOK, playlistSummary(updated))
+	writeJSON(w, http.StatusOK, playlistSummary(updated, user.ID))
 }
 
 // handlePlaylistDelete removes a playlist.
@@ -346,7 +414,56 @@ func (s *Server) handlePlaylistAdd(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err, "could not update the playlist")
 		return
 	}
-	s.writePlaylistDetail(w, r, playlist)
+	// What was just collected is worth having on disk.
+	s.nudgePrefetch()
+	s.writePlaylistDetail(w, r, playlist, user.ID)
+}
+
+type playlistImportRequest struct {
+	// Provider is the platform the playlist comes from: ytmusic or spotify.
+	Provider string `json:"provider"`
+	// ID is the provider's playlist id, when the caller has it.
+	ID string `json:"id"`
+	// URL is the link the caller copied instead, which is the usual case.
+	URL string `json:"url"`
+	// Name overrides the playlist's own name.
+	Name string `json:"name"`
+}
+
+// providerPlaylistIDFrom reads a playlist id out of whatever the caller had: an
+// id, or the link they copied from the platform.
+func providerPlaylistIDFrom(providerName, id, link string) string {
+	if trimmed := strings.TrimSpace(id); trimmed != "" {
+		return trimmed
+	}
+	value := strings.TrimSpace(link)
+	if value == "" {
+		return ""
+	}
+	switch providerName {
+	case "ytmusic":
+		// https://music.youtube.com/playlist?list=PL... - and the id on its own.
+		if parsed, err := url.Parse(value); err == nil {
+			if list := parsed.Query().Get("list"); list != "" {
+				return list
+			}
+		}
+		return ""
+	case "spotify":
+		// https://open.spotify.com/playlist/ID?si=... or spotify:playlist:ID
+		if strings.HasPrefix(value, "spotify:playlist:") {
+			return strings.TrimPrefix(value, "spotify:playlist:")
+		}
+		if parsed, err := url.Parse(value); err == nil {
+			parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+			if len(parts) >= 2 && parts[0] == "playlist" {
+				return parts[1]
+			}
+		}
+		return ""
+	}
+	// A provider that takes an id and nothing else gets the value as it is.
+	return value
 }
 
 // handlePlaylistRemove drops one entry by position.
@@ -368,7 +485,7 @@ func (s *Server) handlePlaylistRemove(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err, "playlist entry not found")
 		return
 	}
-	s.writePlaylistDetail(w, r, playlist)
+	s.writePlaylistDetail(w, r, playlist, user.ID)
 }
 
 // handlePlaylistReorder applies a new order.
@@ -393,7 +510,7 @@ func (s *Server) handlePlaylistReorder(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err, "could not reorder the playlist")
 		return
 	}
-	s.writePlaylistDetail(w, r, playlist)
+	s.writePlaylistDetail(w, r, playlist, user.ID)
 }
 
 // parsePathInt reads a non-negative integer path value.

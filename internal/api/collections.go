@@ -8,8 +8,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/library"
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/library"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 type albumVariantResponse struct {
@@ -162,7 +162,13 @@ func (s *Server) handleAlbumSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	limit := clampLimit(intParam(r, "limit", defaultSearchLimit))
 
-	albums, problems, err := s.library.SearchAlbums(r.Context(), query, limit)
+	providers, err := s.providerNames(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	albums, problems, err := s.library.SearchAlbums(r.Context(), query, limit, providers)
 	if err != nil {
 		writeStoreError(w, err, "album search failed")
 		return
@@ -198,7 +204,13 @@ func (s *Server) handleArtistSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	limit := clampLimit(intParam(r, "limit", defaultSearchLimit))
 
-	artists, problems, err := s.library.SearchArtists(r.Context(), query, limit)
+	providers, err := s.providerNames(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	artists, problems, err := s.library.SearchArtists(r.Context(), query, limit, providers)
 	if err != nil {
 		writeStoreError(w, err, "artist search failed")
 		return
@@ -251,6 +263,7 @@ func (s *Server) handleAlbum(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err, "album unavailable")
 		return
 	}
+	s.withPlays(r.Context(), s.currentUser(r), trackRefs(response.Tracks))
 	writeJSON(w, http.StatusOK, response)
 }
 

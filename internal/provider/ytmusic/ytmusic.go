@@ -14,9 +14,9 @@ import (
 	"strconv"
 	"strings"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/ffmpeg"
-	"codeberg.org/kyleraykbs/prismusic/internal/provider"
-	"codeberg.org/kyleraykbs/prismusic/support"
+	"codeberg.org/kyleraykbs/musoak/internal/ffmpeg"
+	"codeberg.org/kyleraykbs/musoak/internal/provider"
+	"codeberg.org/kyleraykbs/musoak/support"
 )
 
 // Name is the provider id used everywhere (config, database, API).
@@ -40,14 +40,34 @@ type Provider struct {
 	// Executable names, overridable in tests.
 	python string
 	ytdlp  string
+
+	// How yt-dlp proves it is not a bot: cookies from a signed-in browser, or
+	// from a cookies.txt exported out of one. YouTube asks for this more and
+	// more, and a download that cannot answer fails with "Sign in to confirm
+	// you're not a bot".
+	cookiesFromBrowser string
+	cookiesFile        string
+}
+
+// Options are the provider's tunables, so it does not have to know the shape of
+// the server's configuration.
+type Options struct {
+	CookiesFromBrowser string
+	CookiesFile        string
 }
 
 // New returns the provider using the binaries from PATH.
-func New(logger *slog.Logger) *Provider {
+func New(logger *slog.Logger, opts Options) *Provider {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Provider{logger: logger, python: "python3", ytdlp: "yt-dlp"}
+	return &Provider{
+		logger:             logger,
+		python:             "python3",
+		ytdlp:              "yt-dlp",
+		cookiesFromBrowser: strings.TrimSpace(opts.CookiesFromBrowser),
+		cookiesFile:        strings.TrimSpace(opts.CookiesFile),
+	}
 }
 
 // Name implements provider.Provider.
@@ -308,21 +328,35 @@ func (p *Provider) songSearch(ctx context.Context, kind, argument string, limit 
 		return nil, fmt.Errorf("ytmusic %s %q: parse helper output: %w", kind, argument, err)
 	}
 
-	tracks := make([]provider.Track, 0, len(hits))
+	// YT Music mixes songs and music videos in the same lists - its radio
+	// especially - and a video's audio is the video: intro, skits and all. Songs
+	// win wherever there is one, and videos are kept only when they are all the
+	// provider offered.
+	songs := make([]provider.Track, 0, len(hits))
+	videos := make([]provider.Track, 0)
 	for _, hit := range hits {
 		if hit.ID == "" {
 			continue
 		}
-		tracks = append(tracks, provider.Track{
+		track := provider.Track{
 			ProviderTrackID: hit.ID,
 			Title:           hit.Title,
 			Artists:         hit.Artists,
 			Album:           hit.Album,
 			DurationMs:      hit.DurationMs,
 			ArtworkURL:      hit.ArtworkURL,
-		})
+			Video:           hit.Video,
+		}
+		if hit.Video {
+			videos = append(videos, track)
+			continue
+		}
+		songs = append(songs, track)
 	}
-	return tracks, nil
+	if len(songs) == 0 {
+		return videos, nil
+	}
+	return songs, nil
 }
 
 // run feeds the embedded helper to python3 on stdin and returns its stdout.
@@ -399,6 +433,8 @@ type searchHit struct {
 	Album      string   `json:"album"`
 	DurationMs int64    `json:"durationMs"`
 	ArtworkURL string   `json:"artworkUrl"`
+	// Video is set by the helper for a music video rather than the recording.
+	Video bool `json:"video"`
 }
 
 // Download fetches the best available audio and leaves an Ogg/Opus file at
@@ -436,6 +472,14 @@ func (p *Provider) fetch(ctx context.Context, url, dir string, extra ...string) 
 		"--no-warnings",
 		"-f", "bestaudio",
 		"-o", filepath.Join(dir, "%(id)s.%(ext)s"),
+	}
+	// Without these YouTube answers "Sign in to confirm you're not a bot" and
+	// there is nothing to download.
+	if p.cookiesFromBrowser != "" {
+		args = append(args, "--cookies-from-browser", p.cookiesFromBrowser)
+	}
+	if p.cookiesFile != "" {
+		args = append(args, "--cookies", p.cookiesFile)
 	}
 	args = append(args, extra...)
 	args = append(args, url)

@@ -1,5 +1,5 @@
 {
-  description = "Prismusic — self-hosted music streaming, cross-provider matching and listen-together";
+  description = "MusOak — self-hosted music streaming, cross-provider matching and listen-together";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -18,29 +18,29 @@
 
       flake = {
         nixosModules = {
-          prismusicd =
+          musoakd =
             { config, lib, pkgs, ... }:
-            import ./nix/prismusicd.nix {
+            import ./nix/musoakd.nix {
               inherit config lib pkgs;
-              defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.prismusicd;
+              defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.musoakd;
             };
-          prism =
+          musoak =
             { config, lib, pkgs, ... }:
-            import ./nix/prism-nixos.nix {
+            import ./nix/musoak-nixos.nix {
               inherit config lib pkgs;
-              defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.prism;
+              defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.musoak;
             };
-          default = self.nixosModules.prismusicd;
+          default = self.nixosModules.musoakd;
         };
 
         homeManagerModules = {
-          prism =
+          musoak =
             { config, lib, pkgs, ... }:
-            import ./nix/prism-hm.nix {
+            import ./nix/musoak-hm.nix {
               inherit config lib pkgs;
-              defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.prism;
+              defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.musoak;
             };
-          default = self.homeManagerModules.prism;
+          default = self.homeManagerModules.musoak;
         };
       };
 
@@ -49,7 +49,7 @@
         let
           version = "2.0.0";
 
-          # Things every running piece of prismusic needs on PATH: the python
+          # Things every running piece of musoak needs on PATH: the python
           # helper that talks to YT Music, the downloader and its transcoders.
           providerRuntime = [
             (pkgs.python3.withPackages (ps: [ ps.ytmusicapi ]))
@@ -59,14 +59,14 @@
           providerPath = lib.makeBinPath providerRuntime;
 
           # The Go build, with the tests that ship with it.
-          prismusic-unwrapped = pkgs.buildGoModule {
-            pname = "prismusic";
+          musoak-unwrapped = pkgs.buildGoModule {
+            pname = "musoak";
             inherit version;
             src = lib.cleanSource ./.;
             vendorHash = "sha256-qAU2YSYCvMRLuU+LJxnw1WhikvmFAQr50HcbHL6og6Q=";
             subPackages = [
-              "cmd/prism"
-              "cmd/prismusicd"
+              "cmd/musoak"
+              "cmd/musoakd"
             ];
             # The tests render audio fixtures and drive a real mpv.
             nativeCheckInputs = [
@@ -80,8 +80,8 @@
             '';
             meta = {
               description = "Self-hosted music streaming with cross-provider matching and listen-together";
-              homepage = "https://codeberg.org/kyleraykbs/prismusic";
-              mainProgram = "prism";
+              homepage = "https://codeberg.org/kyleraykbs/musoak";
+              mainProgram = "musoak";
             };
           };
 
@@ -92,37 +92,37 @@
             pkgs.runCommand "${name}-${version}" { nativeBuildInputs = [ pkgs.makeWrapper ]; }
               ''
                 mkdir -p $out/bin
-                cp ${prismusic-unwrapped}/bin/${name} $out/bin/${name}
+                cp ${musoak-unwrapped}/bin/${name} $out/bin/${name}
                 chmod +w $out/bin/${name}
                 wrapProgram $out/bin/${name} \
                   --prefix PATH : ${providerPath}${lib.optionalString (extraPath != "") ":" + extraPath}
               '';
 
-          prism = wrapBinary "prism" (lib.makeBinPath [ pkgs.mpv ]);
-          prismusicd = wrapBinary "prismusicd" "";
+          musoak = wrapBinary "musoak" (lib.makeBinPath [ pkgs.mpv ]);
+          musoakd = wrapBinary "musoakd" "";
         in
         {
           packages = {
-            inherit prism prismusicd;
-            default = prism;
+            inherit musoak musoakd;
+            default = musoak;
           };
 
           apps = {
-            prism = {
+            musoak = {
               type = "app";
-              program = "${prism}/bin/prism";
-              meta.description = "Prismusic client";
+              program = "${musoak}/bin/musoak";
+              meta.description = "MusOak client";
             };
-            prismusicd = {
+            musoakd = {
               type = "app";
-              program = "${prismusicd}/bin/prismusicd";
-              meta.description = "Prismusic server";
+              program = "${musoakd}/bin/musoakd";
+              meta.description = "MusOak server";
             };
-            default = self'.apps.prism;
+            default = self'.apps.musoak;
           };
 
           checks = {
-            inherit prism prismusicd;
+            inherit musoak musoakd;
           };
 
           formatter = pkgs.nixfmt;

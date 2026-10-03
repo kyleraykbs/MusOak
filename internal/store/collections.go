@@ -91,6 +91,29 @@ CREATE TABLE artist_variants (
 CREATE INDEX artist_variants_artist_id ON artist_variants(artist_id);
 `
 
+// schemaV15 gives an album one tracklist and one cover.
+//
+// The relationship lived in two tables: the track path wrote track_albums while
+// an album sync wrote album_tracks, and AlbumTracks read the second one - so an
+// artist's page showed an album's tracks only for the albums a sync had added,
+// and every album a track created read as empty. Fold them together, drop the
+// second, and give the albums that never got a cover the cover of their tracks.
+const schemaV15 = `
+INSERT OR IGNORE INTO track_albums (track_id, album_id, position)
+SELECT track_id, album_id, position FROM album_tracks;
+
+DROP TABLE album_tracks;
+
+UPDATE albums
+SET artwork_url = COALESCE((
+    SELECT t.artwork_url FROM track_albums ta
+    JOIN tracks t ON t.id = ta.track_id
+    WHERE ta.album_id = albums.id AND t.artwork_url <> ''
+    LIMIT 1
+), artwork_url)
+WHERE artwork_url = '';
+`
+
 // AlbumVariant is one provider's release of a canonical album.
 type AlbumVariant struct {
 	ID              uuid.UUID
@@ -141,6 +164,9 @@ type AlbumRepo interface {
 	// AppendAlbumTracks adds the tracks that are not in the album yet, keeping
 	// the existing order, and reports how many were added.
 	AppendAlbumTracks(ctx context.Context, albumID uuid.UUID, trackIDs []uuid.UUID) (int, error)
+	// SetAlbumVariantTrackCount records how many tracks a provider release
+	// holds, so a client can tell a partial album from a complete one.
+	SetAlbumVariantTrackCount(ctx context.Context, variantID uuid.UUID, count int) error
 	AlbumTracks(ctx context.Context, albumID uuid.UUID) ([]Track, error)
 	AlbumsForArtist(ctx context.Context, artistID uuid.UUID) ([]Album, error)
 	AttachAlbumArtist(ctx context.Context, albumID, artistID uuid.UUID) error
@@ -381,13 +407,28 @@ func (d *DB) AlbumByProviderID(ctx context.Context, provider, providerAlbumID st
 	return d.Album(ctx, variant.AlbumID)
 }
 
+// SetAlbumVariantTrackCount records a release's tracklist size. A count already
+// at least that large is left alone: the first answer stands.
+func (d *DB) SetAlbumVariantTrackCount(ctx context.Context, variantID uuid.UUID, count int) error {
+	if count <= 0 {
+		return nil
+	}
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE album_variants SET track_count = ? WHERE id = ? AND track_count < ?`,
+		count, variantID.String(), count)
+	return mapErr(err)
+}
+
 // SetAlbumTracks replaces an album's tracklist.
 func (d *DB) SetAlbumTracks(ctx context.Context, albumID uuid.UUID, trackIDs []uuid.UUID) error {
 	return d.withTx(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM album_tracks WHERE album_id = ?`, albumID.String()); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM track_albums WHERE album_id = ?`, albumID.String()); err != nil {
 			return mapErr(err)
 		}
-		return insertAlbumTracks(ctx, tx, albumID, trackIDs, 0)
+		if err := insertAlbumTracks(ctx, tx, albumID, trackIDs, 0); err != nil {
+			return err
+		}
+		return adoptAlbumArtwork(ctx, tx, albumID)
 	})
 }
 
@@ -398,7 +439,7 @@ func (d *DB) AppendAlbumTracks(ctx context.Context, albumID uuid.UUID, trackIDs 
 	err := d.withTx(ctx, func(tx *sql.Tx) error {
 		var next int
 		if err := tx.QueryRowContext(ctx,
-			`SELECT COALESCE(MAX(position) + 1, 0) FROM album_tracks WHERE album_id = ?`,
+			`SELECT COALESCE(MAX(position) + 1, 0) FROM track_albums WHERE album_id = ?`,
 			albumID.String()).Scan(&next); err != nil {
 			return mapErr(err)
 		}
@@ -406,7 +447,7 @@ func (d *DB) AppendAlbumTracks(ctx context.Context, albumID uuid.UUID, trackIDs 
 		for _, trackID := range trackIDs {
 			var exists int
 			if err := tx.QueryRowContext(ctx,
-				`SELECT COUNT(*) FROM album_tracks WHERE album_id = ? AND track_id = ?`,
+				`SELECT COUNT(*) FROM track_albums WHERE album_id = ? AND track_id = ?`,
 				albumID.String(), trackID.String()).Scan(&exists); err != nil {
 				return mapErr(err)
 			}
@@ -418,7 +459,7 @@ func (d *DB) AppendAlbumTracks(ctx context.Context, albumID uuid.UUID, trackIDs 
 			return err
 		}
 		added = len(fresh)
-		return nil
+		return adoptAlbumArtwork(ctx, tx, albumID)
 	})
 	return added, err
 }
@@ -426,12 +467,28 @@ func (d *DB) AppendAlbumTracks(ctx context.Context, albumID uuid.UUID, trackIDs 
 func insertAlbumTracks(ctx context.Context, tx txLike, albumID uuid.UUID, trackIDs []uuid.UUID, start int) error {
 	for i, trackID := range trackIDs {
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO album_tracks (album_id, track_id, position) VALUES (?, ?, ?)`,
-			albumID.String(), trackID.String(), start+i); err != nil {
+			`INSERT INTO track_albums (track_id, album_id, position) VALUES (?, ?, ?)`,
+			trackID.String(), albumID.String(), start+i); err != nil {
 			return mapErr(err)
 		}
 	}
 	return nil
+}
+
+// adoptAlbumArtwork gives an album the cover of one of its tracks when it has
+// none of its own. A track carries the release's image, so an album that a
+// track created would otherwise be a blank square on every page that lists it.
+func adoptAlbumArtwork(ctx context.Context, tx txLike, albumID uuid.UUID) error {
+	_, err := tx.ExecContext(ctx, `
+		UPDATE albums
+		SET artwork_url = COALESCE((
+			SELECT t.artwork_url FROM track_albums ta
+			JOIN tracks t ON t.id = ta.track_id
+			WHERE ta.album_id = albums.id AND t.artwork_url <> ''
+			LIMIT 1
+		), artwork_url)
+		WHERE id = ? AND artwork_url = ''`, albumID.String())
+	return mapErr(err)
 }
 
 // AlbumTracks lists an album's tracks in album order.
@@ -439,8 +496,8 @@ func (d *DB) AlbumTracks(ctx context.Context, albumID uuid.UUID) ([]Track, error
 	rows, err := d.db.QueryContext(ctx, `
 		SELECT t.id, t.title, t.duration_ms, t.created_at, t.artwork_url
 		FROM tracks t
-		JOIN album_tracks at ON at.track_id = t.id
-		WHERE at.album_id = ? ORDER BY at.position`, albumID.String())
+		JOIN track_albums ta ON ta.track_id = t.id
+		WHERE ta.album_id = ? ORDER BY ta.position`, albumID.String())
 	if err != nil {
 		return nil, mapErr(err)
 	}

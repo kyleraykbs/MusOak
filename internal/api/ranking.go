@@ -4,7 +4,7 @@ import (
 	"errors"
 	"net/http"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/ranking"
+	"codeberg.org/kyleraykbs/musoak/internal/ranking"
 )
 
 type rankingResponse struct {

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 // flakyProvider fails the first failures calls, then serves the fixture.

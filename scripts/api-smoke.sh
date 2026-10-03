@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Exercises the whole REST API with curl against a running prismusicd.
+# Exercises the whole REST API with curl against a running musoakd.
 #
 #   nix develop                                  # provides ffmpeg, jq, curl
-#   prismusicd --config /tmp/smoke.json &        # or: prism serve --config ...
+#   musoakd --config /tmp/smoke.json &        # or: musoak serve --config ...
 #   scripts/api-smoke.sh http://127.0.0.1:8080
 #
 # Every check prints ok/FAIL and the script exits non-zero if anything failed.

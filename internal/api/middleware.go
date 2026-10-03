@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"strings"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/auth"
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/auth"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 type contextKey int

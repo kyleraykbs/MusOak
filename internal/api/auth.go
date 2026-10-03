@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strings"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/auth"
+	"codeberg.org/kyleraykbs/musoak/internal/auth"
 )
 
 type credentialsRequest struct {
@@ -80,6 +80,9 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		body["username"] = user.Username
 		body["displayName"] = user.DisplayName
 		body["iconUrl"] = user.IconURL
+		body["iconVersion"] = user.IconVersion
+		// Empty when the account never chose; the client's own default applies.
+		body["searchPlatforms"] = nonNilStrings(user.SearchPlatforms)
 	} else {
 		body["authenticated"] = false
 		body["guest"] = true

@@ -1,4 +1,4 @@
-// Package config loads and validates Prismusic's JSON configuration.
+// Package config loads and validates MusOak's JSON configuration.
 //
 // The file is strict: unknown keys are an error, so a typo can never be
 // silently ignored. Absent keys keep their defaults, which makes an empty
@@ -16,10 +16,10 @@ import (
 	"strings"
 )
 
-const appName = "prismusic"
+const appName = "musoak"
 
 // DefaultListen is the address the HTTP server binds to.
-const DefaultListen = ":8080"
+const DefaultListen = ":4420"
 
 // ProviderSpec configures a provider that needs nothing but a switch.
 type ProviderSpec struct {
@@ -33,10 +33,43 @@ type SpotifySpec struct {
 	ClientSecret string `json:"clientSecret"`
 }
 
+// YTMusicSpec configures the YT Music provider. Audio comes from yt-dlp, and
+// YouTube increasingly answers it with "Sign in to confirm you're not a bot":
+// cookies from a browser that is signed in are what gets past that.
+type YTMusicSpec struct {
+	Enabled bool `json:"enabled"`
+	// CookiesFromBrowser is yt-dlp's own syntax: a browser name ("firefox",
+	// "chrome"), or one with a profile path for a fork that keeps its own
+	// ("firefox:/home/you/.librewolf/abc.default-release").
+	CookiesFromBrowser string `json:"cookiesFromBrowser"`
+	// CookiesFile is a Netscape-format cookies.txt exported from a browser,
+	// which is the form the yt-dlp wiki recommends when the browser is awkward
+	// to reach.
+	CookiesFile string `json:"cookiesFile"`
+}
+
+// YouTubeSpec configures the plain YouTube provider. It is on by default so
+// the platform exists to search; its hits are videos rather than recordings,
+// so clients leave it out of their own filters until somebody asks for it.
+// Like YT Music it downloads through yt-dlp, and the cookie fields are its
+// escape hatch when YouTube demands a signed-in session.
+type YouTubeSpec struct {
+	Enabled bool `json:"enabled"`
+	// CookiesFromBrowser is yt-dlp's own syntax: a browser name ("firefox",
+	// "chrome"), or one with a profile path for a fork that keeps its own
+	// ("firefox:/home/you/.librewolf/abc.default-release").
+	CookiesFromBrowser string `json:"cookiesFromBrowser"`
+	// CookiesFile is a Netscape-format cookies.txt exported from a browser,
+	// which is the form the yt-dlp wiki recommends when the browser is awkward
+	// to reach.
+	CookiesFile string `json:"cookiesFile"`
+}
+
 // Providers holds the per-provider configuration.
 type Providers struct {
-	YTMusic ProviderSpec `json:"ytmusic"`
-	Spotify SpotifySpec  `json:"spotify"`
+	YTMusic YTMusicSpec `json:"ytmusic"`
+	YouTube YouTubeSpec `json:"youtube"`
+	Spotify SpotifySpec `json:"spotify"`
 }
 
 // ListenTogether holds the room tunables.
@@ -66,6 +99,10 @@ type Media struct {
 	// QuotaMB caps the media directory. Zero means no limit. When the cache
 	// grows past it, the least recently used renditions are evicted.
 	QuotaMB int `json:"quotaMB"`
+	// PrefetchPlaylists keeps the songs in people's playlists downloaded before
+	// anybody plays them, one at a time in the background. It is what makes a
+	// first play cost nothing, at the price of fetching songs nobody may reach.
+	PrefetchPlaylists bool `json:"prefetchPlaylists"`
 }
 
 // Client configures client-side behaviour (the CLI, or any other API client)
@@ -92,6 +129,11 @@ type Config struct {
 	RateLimit            RateLimit      `json:"rateLimit"`
 	Media                Media          `json:"media"`
 	Client               Client         `json:"client"`
+
+	// TrustedProxies are the reverse proxies whose X-Forwarded-For is believed
+	// when resolving the client address for rate limiting. It is empty by
+	// default: a directly-reachable server trusts no forwarded header.
+	TrustedProxies []string `json:"trustedProxies"`
 }
 
 // DefaultMatchThreshold is the score above which two renditions are the same
@@ -101,11 +143,17 @@ const DefaultMatchThreshold = 0.8
 // Default returns the built-in configuration.
 func Default() *Config {
 	return &Config{
-		Listen:               DefaultListen,
-		StorageDir:           DefaultStorageDir(),
-		RegistrationOpen:     true,
-		Providers:            Providers{YTMusic: ProviderSpec{Enabled: true}},
-		DefaultProviderOrder: []string{"ytmusic", "spotify"},
+		Listen:           DefaultListen,
+		StorageDir:       DefaultStorageDir(),
+		RegistrationOpen: true,
+		Providers: Providers{
+			YTMusic: YTMusicSpec{Enabled: true},
+			// Plain YouTube is on so the platform exists to search; clients
+			// leave it out of their own filters until somebody asks for it,
+			// which is what keeps video results out of the way by default.
+			YouTube: YouTubeSpec{Enabled: true},
+		},
+		DefaultProviderOrder: []string{"ytmusic", "youtube", "spotify"},
 		PrefetchCount:        3,
 		ListenTogether: ListenTogether{
 			SkipThreshold:        2.0,
@@ -119,11 +167,11 @@ func Default() *Config {
 			SearchPerMinute: 30,
 			LoginPerMinute:  10,
 		},
-		Media: Media{QuotaMB: 0},
+		Media: Media{QuotaMB: 0, PrefetchPlaylists: true},
 	}
 }
 
-// DefaultPath is $XDG_CONFIG_HOME/prismusic/config.json. It is empty when no
+// DefaultPath is $XDG_CONFIG_HOME/musoak/config.json. It is empty when no
 // config directory can be determined.
 func DefaultPath() string {
 	dir, err := os.UserConfigDir()
@@ -133,7 +181,7 @@ func DefaultPath() string {
 	return filepath.Join(dir, appName, "config.json")
 }
 
-// DefaultStorageDir is $XDG_DATA_HOME/prismusic. It is empty when no data
+// DefaultStorageDir is $XDG_DATA_HOME/musoak. It is empty when no data
 // directory can be determined.
 func DefaultStorageDir() string {
 	dir := os.Getenv("XDG_DATA_HOME")
@@ -147,7 +195,7 @@ func DefaultStorageDir() string {
 	return filepath.Join(dir, appName)
 }
 
-// DefaultCacheDir is $XDG_CACHE_HOME/prismusic, where a client keeps the
+// DefaultCacheDir is $XDG_CACHE_HOME/musoak, where a client keeps the
 // renditions it has downloaded. It is empty when no cache directory can be
 // determined.
 func DefaultCacheDir() string {
@@ -160,7 +208,7 @@ func DefaultCacheDir() string {
 
 // ConfigEnvVar points at a configuration file, for deployments that install
 // one system-wide (the NixOS module does). An explicit --config still wins.
-const ConfigEnvVar = "PRISMUSIC_CONFIG"
+const ConfigEnvVar = "MUSOAK_CONFIG"
 
 // ResolvePath decides which configuration file to load: the explicit flag, then
 // the environment, then the per-user XDG location.
@@ -262,6 +310,9 @@ func (c *Config) Validate() error {
 	if c.Media.QuotaMB < 0 {
 		return fmt.Errorf("media.quotaMB must be >= 0, got %d", c.Media.QuotaMB)
 	}
+	if _, err := c.TrustedProxyNets(); err != nil {
+		return err
+	}
 
 	if len(c.DefaultProviderOrder) == 0 {
 		return fmt.Errorf("defaultProviderOrder must not be empty")
@@ -279,11 +330,26 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+// TrustedProxyNets parses TrustedProxies into the networks used to decide
+// whether the socket peer is a reverse proxy whose X-Forwarded-For is
+// believed. An entry that is not a CIDR is an error naming it.
+func (c *Config) TrustedProxyNets() ([]*net.IPNet, error) {
+	nets := make([]*net.IPNet, 0, len(c.TrustedProxies))
+	for _, cidr := range c.TrustedProxies {
+		_, n, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("trustedProxies: %q is not a valid CIDR", cidr)
+		}
+		nets = append(nets, n)
+	}
+	return nets, nil
+}
+
 // KnownProvider reports whether name is a provider the ranking system accepts.
 // "local" is the on-disk library.
 func KnownProvider(name string) bool {
 	switch name {
-	case "local", "ytmusic", "spotify":
+	case "local", "ytmusic", "youtube", "spotify":
 		return true
 	}
 	return false

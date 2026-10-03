@@ -23,7 +23,7 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/sync/singleflight"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 // maxImageBytes bounds one download. Covers are a few hundred kilobytes; a
@@ -43,7 +43,7 @@ var (
 
 // UserAgent identifies this client to the provider CDNs; some of them refuse
 // requests without one.
-const userAgent = "prismusic/2 (+https://codeberg.org/kyleraykbs/prismusic)"
+const userAgent = "musoak/2 (+https://codeberg.org/kyleraykbs/musoak)"
 
 // Item is a cached image.
 type Item struct {
@@ -144,8 +144,9 @@ func (f *Fetcher) Store(source string, data []byte, extension string) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	// Old files under another extension would win over this one.
-	for _, ext := range contentTypes {
+	// The file this replaces may be under another extension, and serving looks
+	// for the oldest of them first: leaving it there would hide the new one.
+	for _, ext := range storedExtensions {
 		_ = os.Remove(filepath.Join(f.dir, hex.EncodeToString(sum[:])+ext))
 	}
 	if err := os.Rename(tmp.Name(), path); err != nil {
@@ -160,16 +161,31 @@ func (f *Fetcher) cached(ctx context.Context, source string) (*Item, error) {
 	sum := sha256.Sum256([]byte(source))
 	key := hex.EncodeToString(sum[:])
 
-	// A previous run may have stored it under any extension.
-	for _, ext := range []string{".jpg", ".png", ".webp", ".gif", ".avif", ".img"} {
+	// A previous run may have stored it under any extension, and a replace that
+	// predates the removal in Store can have left two. The newest is the one
+	// stored last, which is the one that was asked for: serving any other would
+	// be showing an image its owner has already replaced.
+	var (
+		newest    *Item
+		newestAge time.Time
+	)
+	for _, ext := range storedExtensions {
 		path := filepath.Join(f.dir, key+ext)
 		info, err := os.Stat(path)
 		if err != nil || info.Size() == 0 {
 			continue
 		}
-		if contentType, ok := contentTypeFor(ext); ok {
-			return &Item{Path: path, ContentType: contentType, Bytes: info.Size(), Source: source}, nil
+		contentType, ok := contentTypeFor(ext)
+		if !ok {
+			continue
 		}
+		if newest == nil || info.ModTime().After(newestAge) {
+			newest = &Item{Path: path, ContentType: contentType, Bytes: info.Size(), Source: source}
+			newestAge = info.ModTime()
+		}
+	}
+	if newest != nil {
+		return newest, nil
 	}
 
 	if err := os.MkdirAll(f.dir, 0o755); err != nil {
@@ -260,9 +276,18 @@ var contentTypes = map[string]string{
 	".avif": "image/avif",
 }
 
+// storedExtensions is every suffix a cached image may be under, and the order
+// serving looks for them. One image is one file: storing a new one removes the
+// rest, or the copy it replaced stays on disk and is served in its place -
+// which is what a gif uploaded over a png used to run into.
+//
+// A list rather than the map, because the map's order is random and this is an
+// order: "image/jpeg" has two suffixes and the first one wins.
+var storedExtensions = []string{".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".img"}
+
 func extensionFor(contentType string) (string, bool) {
-	for ext, known := range contentTypes {
-		if known == contentType {
+	for _, ext := range storedExtensions {
+		if known, ok := contentTypes[ext]; ok && known == contentType {
 			return ext, true
 		}
 	}

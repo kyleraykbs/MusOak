@@ -1,9 +1,9 @@
-# NixOS service for prismusicd.
+# NixOS service for musoakd.
 #
-#   services.prismusicd = {
+#   services.musoakd = {
 #     enable = true;
-#     storageDir = "/var/lib/prismusicd";
-#     listen = ":8080";
+#     storageDir = "/var/lib/musoakd";
+#     listen = ":4420";
 #   };
 {
   config,
@@ -14,37 +14,37 @@
 let
   serverOptions = import ./server-options.nix { inherit lib; };
 
-  cfg = config.services.prismusicd;
+  cfg = config.services.musoakd;
 
   # The configuration the server actually reads: an explicit file when the
   # user has one (that is where secrets belong), the generated JSON otherwise.
   configFile =
-    if cfg.configFile != null then cfg.configFile else "/etc/prismusicd/config.json";
+    if cfg.configFile != null then cfg.configFile else "/etc/musoakd/config.json";
 
-  generatedConfig = (pkgs.formats.json { }).generate "prismusicd-config.json" (
+  generatedConfig = (pkgs.formats.json { }).generate "musoakd-config.json" (
     serverOptions.configJSON cfg
   );
 in
 {
-  options.services.prismusicd = {
-    enable = lib.mkEnableOption "the prismusic server";
+  options.services.musoakd = {
+    enable = lib.mkEnableOption "the musoak server";
 
     package = lib.mkOption {
       type = lib.types.package;
       default = defaultPackage;
-      defaultText = lib.literalExpression "prismusic.packages.\${system}.prismusicd";
-      description = "The prismusicd package to run.";
+      defaultText = lib.literalExpression "musoak.packages.\${system}.musoakd";
+      description = "The musoakd package to run.";
     };
 
     user = lib.mkOption {
       type = lib.types.str;
-      default = "prismusicd";
+      default = "musoakd";
       description = "User the service runs as.";
     };
 
     group = lib.mkOption {
       type = lib.types.str;
-      default = "prismusicd";
+      default = "musoakd";
       description = "Group the service runs as.";
     };
 
@@ -57,7 +57,7 @@ in
     configFile = lib.mkOption {
       type = lib.types.nullOr lib.types.path;
       default = null;
-      example = "/run/secrets/prismusicd.json";
+      example = "/run/secrets/musoakd.json";
       description = ''
         Configuration file to use instead of the generated one. Use this when
         the configuration contains secrets (the Spotify client secret), since
@@ -91,7 +91,7 @@ in
   }
   // {
     storageDir = serverOptions.storageDir // {
-      default = "/var/lib/prismusicd";
+      default = "/var/lib/musoakd";
     };
   };
 
@@ -100,12 +100,12 @@ in
       isSystemUser = true;
       group = cfg.group;
       home = cfg.storageDir;
-      description = "prismusic server";
+      description = "musoak server";
     };
     users.groups.${cfg.group} = { };
 
-    systemd.services.prismusicd = {
-      description = "Prismusic server";
+    systemd.services.musoakd = {
+      description = "MusOak server";
       wantedBy = [ "multi-user.target" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
@@ -113,12 +113,12 @@ in
       environment = cfg.environment;
 
       serviceConfig = {
-        ExecStart = "${cfg.package}/bin/prismusicd --config ${configFile}";
+        ExecStart = "${cfg.package}/bin/musoakd --config ${configFile}";
         User = cfg.user;
         Group = cfg.group;
         Restart = "on-failure";
         RestartSec = 2;
-        StateDirectory = "prismusicd";
+        StateDirectory = "musoakd";
         StateDirectoryMode = "0750";
         WorkingDirectory = cfg.storageDir;
         # The media library and the database are the only writable places, and
@@ -152,7 +152,7 @@ in
     # The generated configuration is written to /etc so it is obvious and
     # inspectable; a user-provided file is used exactly as it is.
     environment.etc = lib.mkIf (cfg.configFile == null) {
-      "prismusicd/config.json".source = generatedConfig;
+      "musoakd/config.json".source = generatedConfig;
     };
 
     networking.firewall.allowedTCPPorts = lib.mkIf cfg.openFirewall [

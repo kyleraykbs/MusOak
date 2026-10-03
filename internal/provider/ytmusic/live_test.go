@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/ffmpeg"
-	"codeberg.org/kyleraykbs/prismusic/internal/provider"
+	"codeberg.org/kyleraykbs/musoak/internal/ffmpeg"
+	"codeberg.org/kyleraykbs/musoak/internal/provider"
 )
 
 // TestLiveSearchAndDownload exercises the real ytmusicapi, yt-dlp and ffmpeg

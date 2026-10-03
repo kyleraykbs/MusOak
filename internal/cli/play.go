@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"codeberg.org/kyleraykbs/prismusic/pkg/client"
+	"codeberg.org/kyleraykbs/musoak/pkg/client"
 )
 
 // cmdPlay plays the local queue through mpv, gaplessly: the next tracks are
@@ -14,7 +14,7 @@ import (
 func (a *App) cmdPlay(ctx context.Context, args []string) error {
 	queue := a.state.Queue
 	if len(queue) == 0 {
-		return errors.New("prism: the queue is empty; add tracks with \"prism queue add\"")
+		return errors.New("musoak: the queue is empty; add tracks with \"musoak queue add\"")
 	}
 
 	sink, err := NewMpvSink(ctx, a.socketPath(), a.logger)
@@ -61,7 +61,7 @@ func (a *App) cmdPlay(ctx context.Context, args []string) error {
 
 		slot := <-slots[queued]
 		if slot.err != nil {
-			return fmt.Errorf("prism: %s: %w", slot.item.Title, slot.err)
+			return fmt.Errorf("musoak: %s: %w", slot.item.Title, slot.err)
 		}
 		if !ui.interactive {
 			a.printf("%3d. %s\n", queued, slot.item.Title)
@@ -157,20 +157,30 @@ func pickVariant(order []string, variants []client.Variant) (client.Variant, boo
 		}
 	}
 
+	// A rendition's place is its slot when it has one - the account's own
+	// upload and the household's favourite are positions in the same order -
+	// and its provider's name otherwise.
+	place := func(variant client.Variant) string {
+		if variant.Slot != "" {
+			return variant.Slot
+		}
+		return variant.Provider
+	}
+
 	best := -1
 	bestPos := 0
 	for i, variant := range variants {
 		if !variant.Downloadable {
 			continue
 		}
-		pos, known := position[variant.Provider]
+		pos, known := position[place(variant)]
 		if !known {
 			pos = len(order)
 		}
 		switch {
 		case best == -1:
 		case pos < bestPos:
-		case pos == bestPos && variant.Provider < variants[best].Provider:
+		case pos == bestPos && place(variant) < place(variants[best]):
 		default:
 			continue
 		}

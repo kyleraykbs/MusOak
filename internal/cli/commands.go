@@ -11,8 +11,8 @@ import (
 	"strconv"
 	"strings"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/api"
-	"codeberg.org/kyleraykbs/prismusic/pkg/client"
+	"codeberg.org/kyleraykbs/musoak/internal/api"
+	"codeberg.org/kyleraykbs/musoak/pkg/client"
 )
 
 func parseIndex(raw string) (int, error) {
@@ -30,7 +30,7 @@ func (a *App) cmdSearch(ctx context.Context, args []string) error {
 	}
 	query := strings.TrimSpace(strings.Join(set.Args(), " "))
 	if query == "" {
-		return errors.New("prism: search needs a query")
+		return errors.New("musoak: search needs a query")
 	}
 
 	result, err := a.client.Search(ctx, query, *limit)
@@ -69,7 +69,7 @@ func (a *App) cmdSearch(ctx context.Context, args []string) error {
 		a.printf("  ! %s: %s\n", problem.Provider, problem.Error)
 	}
 	if len(result.Groups) > 0 {
-		a.printf("\nqueue one with: prism queue add <index>\n")
+		a.printf("\nqueue one with: musoak queue add <index>\n")
 	}
 	return nil
 }
@@ -95,7 +95,7 @@ func (a *App) cmdQueue(ctx context.Context, args []string) error {
 		return a.queueList()
 	case "add":
 		if len(args) < 2 {
-			return errors.New("prism: queue add needs a track id or search index")
+			return errors.New("musoak: queue add needs a track id or search index")
 		}
 		item, err := a.resolveTrack(ctx, args[1])
 		if err != nil {
@@ -109,11 +109,11 @@ func (a *App) cmdQueue(ctx context.Context, args []string) error {
 		return nil
 	case "rm", "remove":
 		if len(args) < 2 {
-			return errors.New("prism: queue rm needs an index")
+			return errors.New("musoak: queue rm needs an index")
 		}
 		index, err := parseIndex(args[1])
 		if err != nil || index < 0 || index >= len(a.state.Queue) {
-			return fmt.Errorf("prism: no queue entry %q", args[1])
+			return fmt.Errorf("musoak: no queue entry %q", args[1])
 		}
 		item := a.state.Queue[index]
 		a.state.Queue = append(a.state.Queue[:index], a.state.Queue[index+1:]...)
@@ -128,7 +128,7 @@ func (a *App) cmdQueue(ctx context.Context, args []string) error {
 	case "play":
 		return a.cmdPlay(ctx, nil)
 	default:
-		return fmt.Errorf("prism: unknown queue command %q", args[0])
+		return fmt.Errorf("musoak: unknown queue command %q", args[0])
 	}
 }
 
@@ -147,10 +147,10 @@ func (a *App) queueList() error {
 
 func (a *App) cmdLibrary(ctx context.Context, args []string) error {
 	if len(args) < 2 {
-		return errors.New("prism: usage: prism library import <file|dir>")
+		return errors.New("musoak: usage: musoak library import <file|dir>")
 	}
 	if args[0] != "import" {
-		return fmt.Errorf("prism: unknown library command %q", args[0])
+		return fmt.Errorf("musoak: unknown library command %q", args[0])
 	}
 
 	path := args[1]
@@ -219,7 +219,7 @@ func (a *App) cmdFavorites(ctx context.Context, args []string) error {
 	switch args[0] {
 	case "add":
 		if len(args) < 2 {
-			return errors.New("prism: fav add needs a track id or search index")
+			return errors.New("musoak: fav add needs a track id or search index")
 		}
 		item, err := a.resolveTrack(ctx, args[1])
 		if err != nil {
@@ -232,7 +232,7 @@ func (a *App) cmdFavorites(ctx context.Context, args []string) error {
 		return nil
 	case "rm", "remove":
 		if len(args) < 2 {
-			return errors.New("prism: fav rm needs a track id or search index")
+			return errors.New("musoak: fav rm needs a track id or search index")
 		}
 		item, err := a.resolveTrack(ctx, args[1])
 		if err != nil {
@@ -244,7 +244,7 @@ func (a *App) cmdFavorites(ctx context.Context, args []string) error {
 		a.printf("unfavorited %s\n", item.Title)
 		return nil
 	default:
-		return fmt.Errorf("prism: unknown fav command %q", args[0])
+		return fmt.Errorf("musoak: unknown fav command %q", args[0])
 	}
 }
 
@@ -313,22 +313,22 @@ func (a *App) cmdLogin(ctx context.Context, args []string) error {
 			register = true
 		case argument == "--password" || argument == "-password":
 			if i+1 >= len(args) {
-				return errors.New("prism: --password needs a value")
+				return errors.New("musoak: --password needs a value")
 			}
 			password = args[i+1]
 			i++
 		case strings.HasPrefix(argument, "--password="):
 			password = strings.TrimPrefix(argument, "--password=")
 		case strings.HasPrefix(argument, "-"):
-			return fmt.Errorf("prism: unknown login option %q", argument)
+			return fmt.Errorf("musoak: unknown login option %q", argument)
 		case username == "":
 			username = argument
 		default:
-			return fmt.Errorf("prism: unexpected login argument %q", argument)
+			return fmt.Errorf("musoak: unexpected login argument %q", argument)
 		}
 	}
 	if username == "" {
-		return errors.New("prism: usage: prism login <username> [--register] [--password PW]")
+		return errors.New("musoak: usage: musoak login <username> [--register] [--password PW]")
 	}
 
 	secret := password
@@ -364,7 +364,7 @@ func readPassword(out interface{ Write([]byte) (int, error) }) (string, error) {
 	fmt.Fprint(out, "password: ")
 	var line string
 	if _, err := fmt.Fscanln(os.Stdin, &line); err != nil {
-		return "", fmt.Errorf("prism: read password: %w", err)
+		return "", fmt.Errorf("musoak: read password: %w", err)
 	}
 	return line, nil
 }
@@ -403,7 +403,7 @@ func (a *App) cmdMe(ctx context.Context, args []string) error {
 // --- serve -----------------------------------------------------------------
 
 // cmdServe runs the server in the foreground. With client.serverURL empty the
-// CLI already embeds one, so `prism serve` exists for running that server on
+// CLI already embeds one, so `musoak serve` exists for running that server on
 // its own, on the configured listen address.
 func (a *App) cmdServe(ctx context.Context, args []string) error {
 	server, err := api.New(a.cfg, a.logger)
@@ -412,7 +412,7 @@ func (a *App) cmdServe(ctx context.Context, args []string) error {
 	}
 	defer func() {
 		if err := server.Close(); err != nil {
-			a.logger.Error("prism: closing the server", "error", err)
+			a.logger.Error("musoak: closing the server", "error", err)
 		}
 	}()
 
@@ -449,7 +449,7 @@ func (a *App) cmdRoom(ctx context.Context, args []string) error {
 		return nil
 	case "join":
 		if len(args) < 2 {
-			return errors.New("prism: usage: prism room join <room-id>")
+			return errors.New("musoak: usage: musoak room join <room-id>")
 		}
 		return a.roomJoin(ctx, args[1])
 	case "leave":
@@ -464,13 +464,13 @@ func (a *App) cmdRoom(ctx context.Context, args []string) error {
 		return nil
 	case "queue":
 		if len(args) < 3 {
-			return errors.New("prism: usage: prism room queue add <track-id|index> | prism room queue playlist <id|name>")
+			return errors.New("musoak: usage: musoak room queue add <track-id|index> | musoak room queue playlist <id|name>")
 		}
 		if args[1] == "playlist" {
 			return a.roomQueuePlaylist(ctx, args[2])
 		}
 		if args[1] != "add" {
-			return fmt.Errorf("prism: unknown room queue command %q", args[1])
+			return fmt.Errorf("musoak: unknown room queue command %q", args[1])
 		}
 		item, err := a.resolveTrack(ctx, args[2])
 		if err != nil {
@@ -488,7 +488,7 @@ func (a *App) cmdRoom(ctx context.Context, args []string) error {
 	case "vote", "skip", "pause", "resume", "seek", "remove", "now", "reorder":
 		return a.roomControl(ctx, args)
 	default:
-		return fmt.Errorf("prism: unknown room command %q", args[0])
+		return fmt.Errorf("musoak: unknown room command %q", args[0])
 	}
 }
 
@@ -519,11 +519,11 @@ func (a *App) roomControl(ctx context.Context, args []string) error {
 	switch args[0] {
 	case "vote":
 		if len(args) < 2 {
-			return errors.New("prism: usage: prism room vote <1-5>")
+			return errors.New("musoak: usage: musoak room vote <1-5>")
 		}
 		score, err := parseIndex(args[1])
 		if err != nil {
-			return fmt.Errorf("prism: vote must be 1-5")
+			return fmt.Errorf("musoak: vote must be 1-5")
 		}
 		snapshot, err := room.Vote(ctx, score)
 		if err != nil {
@@ -542,11 +542,11 @@ func (a *App) roomControl(ctx context.Context, args []string) error {
 		return err
 	case "seek":
 		if len(args) < 2 {
-			return errors.New("prism: usage: prism room seek <milliseconds>")
+			return errors.New("musoak: usage: musoak room seek <milliseconds>")
 		}
 		position, err := parseIndex(args[1])
 		if err != nil {
-			return fmt.Errorf("prism: seek needs milliseconds")
+			return fmt.Errorf("musoak: seek needs milliseconds")
 		}
 		if _, err := room.Seek(ctx, int64(position)); err != nil {
 			return err
@@ -560,7 +560,7 @@ func (a *App) roomControl(ctx context.Context, args []string) error {
 		a.printRoom(snapshot)
 		return nil
 	default:
-		return fmt.Errorf("prism: unknown room command %q", args[0])
+		return fmt.Errorf("musoak: unknown room command %q", args[0])
 	}
 }
 
@@ -609,7 +609,7 @@ func (a *App) joinedRoom(ctx context.Context, required bool) (*client.RoomClient
 		_ = a.state.save()
 	}
 	if required {
-		return nil, errors.New("prism: not in a room; use \"prism room join <room-id>\"")
+		return nil, errors.New("musoak: not in a room; use \"musoak room join <room-id>\"")
 	}
 	return nil, nil
 }
@@ -646,5 +646,5 @@ func pausedSuffix(paused bool) string {
 }
 
 func (a *App) socketPath() string {
-	return filepath.Join(os.TempDir(), fmt.Sprintf("prism-mpv-%d.sock", os.Getpid()))
+	return filepath.Join(os.TempDir(), fmt.Sprintf("musoak-mpv-%d.sock", os.Getpid()))
 }

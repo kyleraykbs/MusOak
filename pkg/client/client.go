@@ -1,4 +1,4 @@
-// Package client is the public Go SDK for Prismusic.
+// Package client is the public Go SDK for MusOak.
 //
 // Everything the server does is an API call, so the CLI, a Discord bot or any
 // other tool is a plain client: authenticate, search, make media ready, queue
@@ -22,7 +22,7 @@ import (
 // DefaultTimeout bounds a single API request, not a media transfer.
 const DefaultTimeout = 30 * time.Second
 
-// Client talks to one Prismusic server.
+// Client talks to one MusOak server.
 type Client struct {
 	baseURL string
 	token   string
@@ -51,7 +51,7 @@ func WithHTTPClient(hc *http.Client) Option {
 	return func(c *Client) { c.http = hc }
 }
 
-// New returns a client for a server, e.g. "http://localhost:8080".
+// New returns a client for a server, e.g. "http://localhost:4420".
 func New(baseURL string, opts ...Option) *Client {
 	c := &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
@@ -86,9 +86,9 @@ type APIError struct {
 
 func (e *APIError) Error() string {
 	if e.Message == "" {
-		return fmt.Sprintf("prismusic: server returned %s", http.StatusText(e.Status))
+		return fmt.Sprintf("musoak: server returned %s", http.StatusText(e.Status))
 	}
-	return fmt.Sprintf("prismusic: %s (%d)", e.Message, e.Status)
+	return fmt.Sprintf("musoak: %s (%d)", e.Message, e.Status)
 }
 
 // IsNotFound reports whether err is a 404 from the server.
@@ -160,7 +160,7 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 		if err == io.EOF {
 			return nil
 		}
-		return fmt.Errorf("prismusic: decode %s %s: %w", method, path, err)
+		return fmt.Errorf("musoak: decode %s %s: %w", method, path, err)
 	}
 	return nil
 }
@@ -223,7 +223,11 @@ type Variant struct {
 	DurationMs      int64       `json:"durationMs"`
 	Downloadable    bool        `json:"downloadable"`
 	ISRC            string      `json:"isrc,omitempty"`
-	Media           MediaStatus `json:"media"`
+	// Slot is the account-order position this rendition fills when it is not a
+	// provider's own: "self" for the caller's upload, "uploaded" for somebody
+	// else's. Empty for a provider rendition, whose position is its provider.
+	Slot  string      `json:"slot,omitempty"`
+	Media MediaStatus `json:"media"`
 }
 
 // MediaStatus is a variant's download state.
@@ -425,7 +429,7 @@ func (c *Client) WaitForMedia(ctx context.Context, variantID string) (*MediaStat
 		case MediaReady:
 			return status, nil
 		case MediaFailed:
-			return status, fmt.Errorf("prismusic: download failed: %s", status.Error)
+			return status, fmt.Errorf("musoak: download failed: %s", status.Error)
 		}
 		select {
 		case <-ctx.Done():

@@ -6,44 +6,44 @@ import (
 	"fmt"
 	"strings"
 
-	"codeberg.org/kyleraykbs/prismusic/pkg/client"
+	"codeberg.org/kyleraykbs/musoak/pkg/client"
 )
 
 // --- albums ----------------------------------------------------------------
 
 func (a *App) cmdAlbum(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("prism: usage: prism album search|show|sync|queue|play <...>")
+		return errors.New("musoak: usage: musoak album search|show|sync|queue|play <...>")
 	}
 
 	switch args[0] {
 	case "search":
 		if len(args) < 2 {
-			return errors.New("prism: usage: prism album search <query>")
+			return errors.New("musoak: usage: musoak album search <query>")
 		}
 		return a.albumSearch(ctx, strings.Join(args[1:], " "))
 
 	case "show":
 		if len(args) < 2 {
-			return errors.New("prism: usage: prism album show <album-id|index>")
+			return errors.New("musoak: usage: musoak album show <album-id|index>")
 		}
 		return a.albumShow(ctx, args[1])
 
 	case "sync":
 		if len(args) < 2 {
-			return errors.New("prism: usage: prism album sync <album-id|index> [--providers a,b] [--resolve]")
+			return errors.New("musoak: usage: musoak album sync <album-id|index> [--providers a,b] [--resolve]")
 		}
 		return a.albumSync(ctx, args[1], args[2:])
 
 	case "queue":
 		if len(args) < 2 {
-			return errors.New("prism: usage: prism album queue <album-id|index>")
+			return errors.New("musoak: usage: musoak album queue <album-id|index>")
 		}
 		return a.albumQueue(ctx, args[1])
 
 	case "play":
 		if len(args) < 2 {
-			return errors.New("prism: usage: prism album play <album-id|index>")
+			return errors.New("musoak: usage: musoak album play <album-id|index>")
 		}
 		if err := a.albumQueue(ctx, args[1]); err != nil {
 			return err
@@ -53,7 +53,7 @@ func (a *App) cmdAlbum(ctx context.Context, args []string) error {
 		return a.cmdPlay(ctx, nil)
 
 	default:
-		return fmt.Errorf("prism: unknown album command %q", args[0])
+		return fmt.Errorf("musoak: unknown album command %q", args[0])
 	}
 }
 
@@ -84,7 +84,7 @@ func (a *App) albumSearch(ctx context.Context, query string) error {
 	for _, problem := range problems {
 		a.printf("  ! %s: %s\n", problem.Provider, problem.Error)
 	}
-	a.printf("\nsync one with: prism album sync <index>\n")
+	a.printf("\nsync one with: musoak album sync <index>\n")
 	return nil
 }
 
@@ -92,17 +92,17 @@ func (a *App) albumSearch(ctx context.Context, query string) error {
 func (a *App) resolveAlbum(argument string) (string, string, error) {
 	argument = strings.TrimSpace(argument)
 	if argument == "" {
-		return "", "", errors.New("prism: an album id or index is required")
+		return "", "", errors.New("musoak: an album id or index is required")
 	}
 	if index, err := parseIndex(argument); err == nil {
 		if index < 0 || index >= len(a.state.LastAlbums) {
-			return "", "", fmt.Errorf("prism: no album search result %d; run \"prism album search\" first", index)
+			return "", "", fmt.Errorf("musoak: no album search result %d; run \"musoak album search\" first", index)
 		}
 		item := a.state.LastAlbums[index]
 		return item.TrackID, item.Title, nil
 	}
 	if !looksLikeID(argument) {
-		return "", "", fmt.Errorf("prism: %q is not an album id or index", argument)
+		return "", "", fmt.Errorf("musoak: %q is not an album id or index", argument)
 	}
 	return argument, "", nil
 }
@@ -135,7 +135,7 @@ func (a *App) printAlbum(album *client.Album, withTracks bool) {
 		return
 	}
 	if len(album.Tracks) == 0 {
-		a.printf("  no tracklist yet; run \"prism album sync %s\"\n", album.ID)
+		a.printf("  no tracklist yet; run \"musoak album sync %s\"\n", album.ID)
 		return
 	}
 	for i, track := range album.Tracks {
@@ -190,7 +190,7 @@ func (a *App) albumQueue(ctx context.Context, argument string) error {
 		return err
 	}
 	if len(album.Tracks) == 0 {
-		return fmt.Errorf("prism: %q has no tracklist yet; run \"prism album sync %s\"", album.Title, album.ID)
+		return fmt.Errorf("musoak: %q has no tracklist yet; run \"musoak album sync %s\"", album.Title, album.ID)
 	}
 	for _, track := range album.Tracks {
 		a.state.Queue = append(a.state.Queue, queueItem{TrackID: track.ID, Title: track.Title})
@@ -206,30 +206,30 @@ func (a *App) albumQueue(ctx context.Context, argument string) error {
 
 func (a *App) cmdArtist(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("prism: usage: prism artist search|show|sync <...>")
+		return errors.New("musoak: usage: musoak artist search|show|sync <...>")
 	}
 
 	switch args[0] {
 	case "search":
 		if len(args) < 2 {
-			return errors.New("prism: usage: prism artist search <query>")
+			return errors.New("musoak: usage: musoak artist search <query>")
 		}
 		return a.artistSearch(ctx, strings.Join(args[1:], " "))
 
 	case "show":
 		if len(args) < 2 {
-			return errors.New("prism: usage: prism artist show <artist-id|index>")
+			return errors.New("musoak: usage: musoak artist show <artist-id|index>")
 		}
 		return a.artistShow(ctx, args[1])
 
 	case "sync":
 		if len(args) < 2 {
-			return errors.New("prism: usage: prism artist sync <artist-id|index> [--albums] [--resolve] [--providers a,b]")
+			return errors.New("musoak: usage: musoak artist sync <artist-id|index> [--albums] [--resolve] [--providers a,b]")
 		}
 		return a.artistSync(ctx, args[1], args[2:])
 
 	default:
-		return fmt.Errorf("prism: unknown artist command %q", args[0])
+		return fmt.Errorf("musoak: unknown artist command %q", args[0])
 	}
 }
 
@@ -255,24 +255,24 @@ func (a *App) artistSearch(ctx context.Context, query string) error {
 	for _, problem := range problems {
 		a.printf("  ! %s: %s\n", problem.Provider, problem.Error)
 	}
-	a.printf("\nsync one with: prism artist sync <index> --albums\n")
+	a.printf("\nsync one with: musoak artist sync <index> --albums\n")
 	return nil
 }
 
 func (a *App) resolveArtist(argument string) (string, string, error) {
 	argument = strings.TrimSpace(argument)
 	if argument == "" {
-		return "", "", errors.New("prism: an artist id or index is required")
+		return "", "", errors.New("musoak: an artist id or index is required")
 	}
 	if index, err := parseIndex(argument); err == nil {
 		if index < 0 || index >= len(a.state.LastArtists) {
-			return "", "", fmt.Errorf("prism: no artist search result %d; run \"prism artist search\" first", index)
+			return "", "", fmt.Errorf("musoak: no artist search result %d; run \"musoak artist search\" first", index)
 		}
 		item := a.state.LastArtists[index]
 		return item.TrackID, item.Title, nil
 	}
 	if !looksLikeID(argument) {
-		return "", "", fmt.Errorf("prism: %q is not an artist id or index", argument)
+		return "", "", fmt.Errorf("musoak: %q is not an artist id or index", argument)
 	}
 	return argument, "", nil
 }
@@ -291,7 +291,7 @@ func (a *App) artistShow(ctx context.Context, argument string) error {
 		a.printf("  %-10s %s\n", variant.Provider, variant.Name)
 	}
 	if len(artist.Albums) == 0 {
-		a.printf("  no albums yet; run \"prism artist sync %s --albums\"\n", artist.ID)
+		a.printf("  no albums yet; run \"musoak artist sync %s --albums\"\n", artist.ID)
 		return nil
 	}
 	for i, album := range artist.Albums {
@@ -344,14 +344,14 @@ func parseSyncFlags(flags []string) (client.SyncOptions, error) {
 			opts.SyncAlbums = true
 		case argument == "--providers":
 			if i+1 >= len(flags) {
-				return opts, errors.New("prism: --providers needs a comma separated list")
+				return opts, errors.New("musoak: --providers needs a comma separated list")
 			}
 			opts.Providers = splitList(flags[i+1])
 			i++
 		case strings.HasPrefix(argument, "--providers="):
 			opts.Providers = splitList(strings.TrimPrefix(argument, "--providers="))
 		default:
-			return opts, fmt.Errorf("prism: unknown sync option %q", argument)
+			return opts, fmt.Errorf("musoak: unknown sync option %q", argument)
 		}
 	}
 	return opts, nil

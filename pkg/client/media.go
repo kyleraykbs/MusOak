@@ -89,6 +89,11 @@ const (
 	defaultResyncEvery = 15 * time.Second
 	// defaultDriftToleranceMs is the drift worth correcting with a small seek.
 	defaultDriftToleranceMs = 150
+	// prefetchAhead is how many of the room's upcoming songs this member keeps
+	// ready. The server prepares the one it is about to play and assigns a
+	// rendition of it; the songs after that are nobody's job until they are
+	// reached, and a room moves faster than a download does.
+	prefetchAhead = 3
 )
 
 // Participant follows a room on behalf of one member: it downloads what the
@@ -112,7 +117,10 @@ type Participant struct {
 	mu          sync.Mutex
 	offsetMs    int64
 	assignments map[string]CacheEntry
-	playback    *playbackState
+	// warming is the songs being fetched ahead right now, so the same one is
+	// not asked for twice while it is on its way.
+	warming  map[string]bool
+	playback *playbackState
 }
 
 type playbackState struct {
@@ -139,6 +147,7 @@ func NewParticipant(room *RoomClient, cache *Cache, sink Sink, logger *slog.Logg
 		resyncEvery:    defaultResyncEvery,
 		driftTolerance: defaultDriftToleranceMs,
 		assignments:    map[string]CacheEntry{},
+		warming:        map[string]bool{},
 	}
 }
 
@@ -301,18 +310,120 @@ func (p *Participant) prepare(ctx context.Context, data TrackPrepared) error {
 
 	// If the room is already playing this track — we joined late, or the server
 	// assigned our rendition after the start — play from the room position.
-	if snapshot, err := p.room.Snapshot(ctx); err == nil && snapshot.Current != nil {
-		current := snapshot.Current
-		if current.Item.TrackID == data.Item.TrackID && current.StartedAtMs != 0 {
-			p.mu.Lock()
-			alreadyPlaying := p.playback != nil && p.playback.trackID == data.Item.TrackID
-			p.mu.Unlock()
-			if !alreadyPlaying {
-				p.adoptSnapshot(ctx, snapshot)
+	if snapshot, err := p.room.Snapshot(ctx); err == nil {
+		// The songs after this one are worth having too: the server prepares
+		// them one at a time, and a skip should not wait on a download.
+		p.warmAhead(ctx, snapshot, data.Item.ID)
+		if current := snapshot.Current; current != nil {
+			if current.Item.TrackID == data.Item.TrackID && current.StartedAtMs != 0 {
+				p.mu.Lock()
+				alreadyPlaying := p.playback != nil && p.playback.trackID == data.Item.TrackID
+				p.mu.Unlock()
+				if !alreadyPlaying {
+					p.adoptSnapshot(ctx, snapshot)
+				}
 			}
 		}
 	}
 	return nil
+}
+
+// warmAhead gets the room's next few songs onto disk, skipping the one being
+// prepared, which is already on its way.
+//
+// These are not readiness reports: the server decides what is prepared and
+// when, and this only means the file is already here by then. The room's own
+// order is what to follow, because that is what will be played.
+func (p *Participant) warmAhead(ctx context.Context, snapshot *Room, preparingItemID string) {
+	if snapshot == nil {
+		return
+	}
+	currentID := preparingItemID
+	if snapshot.Current != nil {
+		currentID = snapshot.Current.Item.ID
+	}
+	ahead := 0
+	for _, item := range snapshot.Queue {
+		if item.ID == currentID || item.TrackID == "" {
+			continue
+		}
+		p.warm(ctx, item.TrackID)
+		ahead++
+		if ahead == prefetchAhead {
+			return
+		}
+	}
+}
+
+// warm fetches one song the room will reach, unless this member already holds
+// it or somebody is already fetching it. Nothing waits on it: a song that
+// cannot be fetched says so when it is reached.
+func (p *Participant) warm(ctx context.Context, trackID string) {
+	if trackID == "" {
+		return
+	}
+	if _, ok := p.cache.LookupTrack(trackID); ok {
+		return
+	}
+	if !p.claimWarm(trackID) {
+		return
+	}
+	go func() {
+		defer p.releaseWarm(trackID)
+		if _, err := p.fetchAny(ctx, trackID); err != nil {
+			p.logger.Debug("participant: could not warm an upcoming song", "track", trackID, "error", err)
+		}
+	}()
+}
+
+// fetchAny downloads some rendition of a track nobody has assigned this member
+// yet. Which one matters less than having one: the room plays whatever a member
+// reports, and the rendition the server assigns later is used as it is when the
+// file is already here.
+func (p *Participant) fetchAny(ctx context.Context, trackID string) (CacheEntry, error) {
+	variants, err := p.room.client.TrackVariants(ctx, trackID)
+	if err != nil {
+		return CacheEntry{}, err
+	}
+	variantID := ""
+	for _, variant := range variants {
+		if variant.Downloadable {
+			variantID = variant.ID
+			break
+		}
+	}
+	if variantID == "" {
+		return CacheEntry{}, errors.New("no downloadable rendition")
+	}
+	entry, err := p.cache.Fetch(ctx, p.room.client, variantID)
+	if err != nil {
+		return CacheEntry{}, err
+	}
+	// The index is what says which track a file belongs to, so that the next
+	// look for this song finds it.
+	entry.TrackID = trackID
+	if err := p.cache.Put(entry); err != nil {
+		return CacheEntry{}, err
+	}
+	return entry, nil
+}
+
+// claimWarm reports whether this song should be fetched here, taking the claim
+// when it should.
+func (p *Participant) claimWarm(trackID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.warming[trackID] {
+		return false
+	}
+	p.warming[trackID] = true
+	return true
+}
+
+func (p *Participant) releaseWarm(trackID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.warming, trackID)
 }
 
 func (p *Participant) start(ctx context.Context, started TrackStarted) error {

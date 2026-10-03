@@ -8,19 +8,19 @@ let
   serverOptions = import ./server-options.nix { inherit lib; };
 in
 {
-  enable = lib.mkEnableOption "the prism music client";
+  enable = lib.mkEnableOption "the musoak music client";
 
   package = lib.mkOption {
     type = lib.types.package;
-    description = "The prism package to install.";
+    description = "The musoak package to install.";
   };
 
   serverURL = lib.mkOption {
     type = lib.types.str;
     default = "";
-    example = "http://localhost:8080";
+    example = "http://localhost:4420";
     description = ''
-      Server to talk to. Empty means prism runs its own server in-process, so a
+      Server to talk to. Empty means musoak runs its own server in-process, so a
       standalone installation needs no daemon at all.
     '';
   };
@@ -28,10 +28,10 @@ in
   cacheDir = lib.mkOption {
     type = lib.types.nullOr lib.types.str;
     default = null;
-    example = "/home/alice/.cache/prismusic";
+    example = "/home/alice/.cache/musoak";
     description = ''
       Where downloaded renditions and the local queue live. Null leaves it to
-      prism, which uses $XDG_CACHE_HOME/prismusic.
+      musoak, which uses $XDG_CACHE_HOME/musoak.
     '';
   };
 
@@ -50,7 +50,7 @@ in
       ;
   };
 
-  # configJSON is the configuration file prism reads.
+  # configJSON is the configuration file musoak reads.
   configJSON =
     cfg:
     lib.recursiveUpdate (serverOptions.configJSON cfg.server) {

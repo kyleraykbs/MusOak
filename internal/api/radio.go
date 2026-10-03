@@ -7,9 +7,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/provider"
-	"codeberg.org/kyleraykbs/prismusic/internal/radio"
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/provider"
+	"codeberg.org/kyleraykbs/musoak/internal/radio"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 type radioRequest struct {
@@ -87,6 +87,8 @@ func (s *Server) handleRadio(w http.ResponseWriter, r *http.Request) {
 		}
 		response.Tracks = append(response.Tracks, built)
 	}
+	refs := append([]*trackResponse{&response.Seed}, trackRefs(response.Tracks)...)
+	s.withPlays(r.Context(), s.currentUser(r), refs)
 	for _, problem := range result.Errors {
 		response.ProviderErrors = append(response.ProviderErrors, providerProblem{
 			Provider: problem.Provider,
@@ -136,7 +138,10 @@ func (s *Server) saveRadio(r *http.Request, userID uuid.UUID, name string, resul
 	}
 
 	playlist.TrackCount = len(ids)
-	summary := playlistSummary(playlist)
+	// A new playlist is public until its owner says otherwise, which is the
+	// column's own default; the row is what says so, and it was just written.
+	playlist.Public = true
+	summary := playlistSummary(playlist, userID)
 	return &summary, nil
 }
 

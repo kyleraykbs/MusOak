@@ -2,7 +2,9 @@ package api
 
 import (
 	"context"
+	"mime"
 	"net/http"
+	"strings"
 
 	"github.com/google/uuid"
 )
@@ -32,7 +34,46 @@ func (s *Server) handleMediaFile(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// The bytes are Opus in an Ogg container, served as audio/ogg - and a
+	// browser left to itself names a download of that ".ogg". Say the name the
+	// file actually has: the extension the library stores it under, and the song
+	// it belongs to. "inline" so the same response still plays in an audio
+	// element.
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("inline", map[string]string{
+		"filename": s.mediaFileName(r.Context(), id),
+	}))
 	s.media.ServeFile(w, r, id)
+}
+
+// mediaFileName is what a download of a rendition should be called:
+// "Artist - Title.opus", the way the file is stored. A variant that cannot be
+// read still gets a name, its own id.
+func (s *Server) mediaFileName(ctx context.Context, variantID uuid.UUID) string {
+	variant, err := s.store.Variant(ctx, variantID)
+	if err != nil {
+		return variantID.String() + ".opus"
+	}
+	return opusFileName(strings.Join(variant.Artists, ", "), variant.Title, variantID)
+}
+
+// opusFileName builds a name a file system will accept out of the song's own.
+func opusFileName(artists, title string, variantID uuid.UUID) string {
+	base := strings.TrimSpace(title)
+	if artist := strings.TrimSpace(artists); artist != "" && base != "" {
+		base = artist + " - " + base
+	}
+	if base == "" {
+		base = variantID.String()
+	}
+	var cleaned strings.Builder
+	for _, r := range base {
+		if r < 0x20 || strings.ContainsRune(`\/:*?"<>|`, r) {
+			cleaned.WriteRune('_')
+			continue
+		}
+		cleaned.WriteRune(r)
+	}
+	return strings.TrimSpace(cleaned.String()) + ".opus"
 }
 
 // handleMediaStatus reports a variant's download state and progress.

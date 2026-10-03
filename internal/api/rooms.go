@@ -3,11 +3,12 @@ package api
 import (
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/rooms"
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/rooms"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 // memberHeader carries a guest's room member id. Authenticated users are
@@ -51,12 +52,20 @@ type readyRequest struct {
 	DurationMs int64  `json:"durationMs"`
 }
 
+// roomOutRequest is a member saying whether they are playing the room's track.
+type roomOutRequest struct {
+	Out bool `json:"out"`
+}
+
 // callerMember builds the member identity for a room command. Authenticated
 // callers are their account; guests carry their member id in a header.
 func (s *Server) callerMember(r *http.Request, allowNew bool) (rooms.Member, bool) {
 	if user := s.currentUser(r); user != nil {
 		id := user.ID
-		return rooms.Member{ID: id.String(), UserID: &id, Name: user.Username}, true
+		return rooms.Member{
+			ID: id.String(), UserID: &id, Name: memberName(user),
+			IconURL: user.IconURL, IconVersion: user.IconVersion,
+		}, true
 	}
 	if id := r.Header.Get(memberHeader); id != "" {
 		return rooms.Member{ID: id, Name: r.Header.Get("X-Member-Name")}, true
@@ -67,6 +76,31 @@ func (s *Server) callerMember(r *http.Request, allowNew bool) (rooms.Member, boo
 	return rooms.Member{}, false
 }
 
+// guestMemberID is the member a browser joined as, when this request is that
+// same browser arriving as its account instead. It is empty for a guest - who
+// is its own member - and for a client that never carried a member id.
+func guestMemberID(r *http.Request, member rooms.Member) string {
+	if member.UserID == nil {
+		return ""
+	}
+	id := r.Header.Get(memberHeader)
+	if id == "" || id == member.ID {
+		return ""
+	}
+	return id
+}
+
+// memberName is what a room shows for somebody: the display name they chose,
+// which is the name people know them by, rather than the handle they sign in
+// with.
+func memberName(user *store.User) string {
+	if name := strings.TrimSpace(user.DisplayName); name != "" {
+		return name
+	}
+	return user.Username
+}
+
+// handleRoomCreate makes a room, with the caller as its host.
 func (s *Server) handleRoomCreate(w http.ResponseWriter, r *http.Request) {
 	var req createRoomRequest
 	if r.ContentLength > 0 && !decodeJSON(w, r, &req) {
@@ -108,7 +142,10 @@ func (s *Server) handleRoomJoin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "member identity required")
 		return
 	}
-	room, err := s.rooms.Join(r.PathValue("roomId"), member, req.Password)
+	// A signed-in caller is its account, which is a different member id from the
+	// one the browser joined as: name that one so the account takes its place
+	// rather than sitting beside it.
+	room, err := s.rooms.Join(r.PathValue("roomId"), member, req.Password, guestMemberID(r, member))
 	if err != nil {
 		writeRoomError(w, err)
 		return
@@ -251,6 +288,28 @@ func (s *Server) handleRoomVote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, room)
+}
+
+// handleRoomOut records that a member is sitting the room's track out, or is
+// back in. The room plays for as long as the shortest file in it, so a member
+// holding a short or broken copy can step out of that reckoning without
+// leaving the room.
+func (s *Server) handleRoomOut(w http.ResponseWriter, r *http.Request) {
+	member, ok := s.callerMember(r, false)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "member identity required")
+		return
+	}
+	var req roomOutRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	room, err := s.rooms.SetOut(r.PathValue("roomId"), member.ID, req.Out)
+	if err != nil {
+		writeRoomError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"room": room})
 }
 
 func (s *Server) handleRoomReady(w http.ResponseWriter, r *http.Request) {

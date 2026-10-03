@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/provider"
+	"codeberg.org/kyleraykbs/musoak/internal/provider"
 )
 
 // stubPython writes an executable that ignores its stdin and runs body.
@@ -23,9 +23,63 @@ func stubPython(t *testing.T, body string) string {
 
 func testProvider(t *testing.T, python string) *Provider {
 	t.Helper()
-	p := New(nil)
+	p := New(nil, Options{})
 	p.python = python
 	return p
+}
+
+// stubYtdlp writes an executable that records the arguments it was given.
+func stubYtdlp(t *testing.T, record string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "yt-dlp")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + record + "\nexit 1\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// YouTube answers yt-dlp with "Sign in to confirm you're not a bot" and there is
+// nothing to download until it can show cookies: the ones the provider is
+// configured with have to reach the command.
+func TestDownloadPassesConfiguredCookies(t *testing.T) {
+	record := filepath.Join(t.TempDir(), "args")
+	p := testProvider(t, stubPython(t, `exit 0`))
+	p.ytdlp = stubYtdlp(t, record)
+	p.cookiesFromBrowser = "firefox:/home/you/.librewolf/abc.default-release"
+	p.cookiesFile = "/home/you/cookies.txt"
+
+	// The stub writes no audio, so this fails at the end; the command it ran is
+	// what this test is about.
+	_ = p.Download(context.Background(), "abc", filepath.Join(t.TempDir(), "out.opus"))
+
+	got, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("yt-dlp was not run: %v", err)
+	}
+	args := string(got)
+	for _, want := range []string{
+		"--cookies-from-browser\nfirefox:/home/you/.librewolf/abc.default-release\n",
+		"--cookies\n/home/you/cookies.txt\n",
+	} {
+		if !strings.Contains(args, want) {
+			t.Errorf("yt-dlp was not given %q:\n%s", strings.TrimSpace(want), args)
+		}
+	}
+}
+
+// Without them the command stays as it was, so a plain setup is unaffected.
+func TestDownloadWithoutCookiesRunsThePlainCommand(t *testing.T) {
+	record := filepath.Join(t.TempDir(), "args")
+	p := testProvider(t, stubPython(t, `exit 0`))
+	p.ytdlp = stubYtdlp(t, record)
+
+	_ = p.Download(context.Background(), "abc", filepath.Join(t.TempDir(), "out.opus"))
+
+	got, _ := os.ReadFile(record)
+	if strings.Contains(string(got), "--cookies") {
+		t.Errorf("cookies were passed with none configured:\n%s", got)
+	}
 }
 
 func TestSearchParsesHelperOutput(t *testing.T) {
@@ -55,6 +109,46 @@ func TestSearchParsesHelperOutput(t *testing.T) {
 	}
 	if len(tracks[1].Artists) != 2 {
 		t.Errorf("second artists = %v", tracks[1].Artists)
+	}
+}
+
+// YT Music's radio mixes songs and music videos, and a video's audio is the
+// video: intro and all. A song wins wherever there is one.
+func TestSearchKeepsSongsOverMusicVideos(t *testing.T) {
+	fixture := filepath.Join(t.TempDir(), "hits.json")
+	const body = `[{"id":"vid1","title":"Song (Official Music Video)","video":true},
+	                 {"id":"song","title":"Song"},
+	                 {"id":"vid2","title":"Another video","video":true}]`
+	if err := os.WriteFile(fixture, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("YT_FIXTURE", fixture)
+
+	p := testProvider(t, stubPython(t, `cat "$YT_FIXTURE"`))
+	tracks, err := p.Search(context.Background(), "query", provider.SearchOpts{Limit: 3})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(tracks) != 1 || tracks[0].ProviderTrackID != "song" || tracks[0].Video {
+		t.Fatalf("tracks = %+v, want only the song", tracks)
+	}
+}
+
+// With nothing but videos on offer they are still better than nothing.
+func TestSearchKeepsMusicVideosWhenTheyAreAllThereIs(t *testing.T) {
+	fixture := filepath.Join(t.TempDir(), "hits.json")
+	if err := os.WriteFile(fixture, []byte(`[{"id":"vid","title":"Only a video","video":true}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("YT_FIXTURE", fixture)
+
+	p := testProvider(t, stubPython(t, `cat "$YT_FIXTURE"`))
+	tracks, err := p.Search(context.Background(), "query", provider.SearchOpts{Limit: 3})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(tracks) != 1 || !tracks[0].Video {
+		t.Fatalf("tracks = %+v, want the video kept and marked", tracks)
 	}
 }
 
@@ -103,12 +197,12 @@ func TestMissingDepsListsBinaries(t *testing.T) {
 }
 
 func TestCapabilities(t *testing.T) {
-	caps := New(nil).Capabilities()
+	caps := New(nil, Options{}).Capabilities()
 	if !caps.Search || !caps.Download {
 		t.Errorf("caps = %+v, want search and download", caps)
 	}
-	if New(nil).Name() != Name {
-		t.Errorf("name = %q", New(nil).Name())
+	if New(nil, Options{}).Name() != Name {
+		t.Errorf("name = %q", New(nil, Options{}).Name())
 	}
 }
 

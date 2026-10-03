@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"testing"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/provider"
+	"codeberg.org/kyleraykbs/musoak/internal/provider"
 )
 
 // fakeCollectionsProvider serves album and artist browsing.

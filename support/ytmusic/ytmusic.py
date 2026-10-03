@@ -84,6 +84,10 @@ def owner_of(item):
 
 
 def song(item):
+    # YT Music mixes songs and music videos in the same lists, and a video's
+    # audio is the video: intros, skits and all. Only MUSIC_VIDEO_TYPE_ATV is the
+    # album recording, so the caller is told which is which.
+    video_type = (item.get("videoType") or "").strip()
     return {
         "id": item.get("videoId", "") or "",
         "title": item.get("title", "") or "",
@@ -91,6 +95,7 @@ def song(item):
         "album": album_of(item),
         "durationMs": duration_ms(item),
         "artworkUrl": artwork_of(item),
+        "video": bool(video_type) and video_type != "MUSIC_VIDEO_TYPE_ATV",
     }
 
 

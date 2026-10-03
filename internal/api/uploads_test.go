@@ -10,13 +10,19 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/provider"
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/provider"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 // unreadableAudio is a payload no probe can read: a create with it pins the
 // client-reported duration regardless of the tooling on the machine.
 var unreadableAudio = []byte("definitely not audio")
+
+// uploadAudio is an unreadable payload distinct to tag. The create endpoint
+// refuses bytes it already holds, so uploads sharing one test need their own.
+func uploadAudio(tag string) []byte {
+	return []byte("definitely not audio: " + tag)
+}
 
 // uploadRequest is the create body for a song upload.
 func uploadRequest(title string, data []byte, durationMs int64) map[string]any {
@@ -105,7 +111,7 @@ func TestUploadCreateAndList(t *testing.T) {
 	if mine := listUploads(t, c, kyle, "/api/v1/uploads"); len(mine) != 1 || mine[0].ID != upload.ID {
 		t.Fatalf("my uploads = %+v", mine)
 	}
-	theirs := createUpload(t, c, bob, uploadRequest("Green Fields", unreadableAudio, 2500))
+	theirs := createUpload(t, c, bob, uploadRequest("Green Fields", uploadAudio("green fields"), 2500))
 	if mine := listUploads(t, c, bob, "/api/v1/uploads"); len(mine) != 1 || mine[0].ID != theirs.ID {
 		t.Fatalf("bob's uploads = %+v", mine)
 	}
@@ -236,6 +242,105 @@ func TestUploadAssociationPatch(t *testing.T) {
 	}
 }
 
+// TestOneAssociationPerUserPerSong is the rule: a second upload of a song takes
+// the association, and the one that had it stands on its own again. The lookup
+// endpoint reports which upload would be replaced, so a dialog can say so first.
+func TestOneAssociationPerUserPerSong(t *testing.T) {
+	c := newHTTPTestServer(t, nil)
+	kyle := c.register("kyle", "hunter2hunter2")
+	bob := c.register("bob", "hunter2hunter2")
+	ctx := context.Background()
+
+	target := seedWithVariant(t, c, "Target Song", "ytmusic")
+
+	lookup := func(token string) *uploadResponse {
+		t.Helper()
+		rec := c.do(http.MethodGet, "/api/v1/uploads/association?trackId="+target, token, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("lookup = %d: %s", rec.Code, rec.Body.String())
+		}
+		var out struct {
+			Upload *uploadResponse `json:"upload"`
+		}
+		c.decode(rec, &out)
+		return out.Upload
+	}
+
+	// Nothing associated yet.
+	if found := lookup(kyle); found != nil {
+		t.Fatalf("lookup = %+v, want nothing before the first association", found)
+	}
+
+	first := createUpload(t, c, kyle, uploadRequest("Blue Horizon", unreadableAudio, 2500))
+	if rec := c.do(http.MethodPatch, "/api/v1/uploads/"+first.ID, kyle, map[string]any{"associateTrackId": target}); rec.Code != http.StatusOK {
+		t.Fatalf("first association = %d: %s", rec.Code, rec.Body.String())
+	}
+	if found := lookup(kyle); found == nil || found.ID != first.ID {
+		t.Fatalf("lookup = %+v, want the first upload", found)
+	}
+
+	// A second upload of the same song takes the association.
+	second := createUpload(t, c, kyle, uploadRequest("Blue Horizon Again", uploadAudio("blue horizon again"), 2600))
+	if rec := c.do(http.MethodPatch, "/api/v1/uploads/"+second.ID, kyle, map[string]any{"associateTrackId": target}); rec.Code != http.StatusOK {
+		t.Fatalf("second association = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	released, err := c.store.Upload(ctx, uuid.MustParse(first.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if released.Variant.TrackID.String() == target {
+		t.Fatalf("the first upload kept the association: %+v", released.Variant)
+	}
+	// Released, not mangled: it stands on its own with its own metadata.
+	if released.Variant.Title != "Blue Horizon" || len(released.Variant.Artists) != 1 ||
+		released.Variant.Artists[0] != "The Waves" {
+		t.Errorf("the released upload lost its metadata: %+v", released.Variant)
+	}
+	if found := lookup(kyle); found == nil || found.ID != second.ID {
+		t.Fatalf("lookup = %+v, want the second upload", found)
+	}
+
+	// Another user's association on the same song is theirs to keep.
+	other := createUpload(t, c, bob, uploadRequest("Bob's Take", uploadAudio("bob's take"), 2500))
+	if rec := c.do(http.MethodPatch, "/api/v1/uploads/"+other.ID, bob, map[string]any{"associateTrackId": target}); rec.Code != http.StatusOK {
+		t.Fatalf("bob's association = %d: %s", rec.Code, rec.Body.String())
+	}
+	kept, err := c.store.Upload(ctx, uuid.MustParse(second.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kept.Variant.TrackID.String() != target {
+		t.Errorf("bob's association released kyle's: %+v", kept.Variant)
+	}
+
+	// An upload created straight onto the song replaces one the same way.
+	third := uploadRequest("Blue Horizon Third", uploadAudio("blue horizon third"), 2700)
+	third["associateTrackId"] = target
+	created := createUpload(t, c, kyle, third)
+	if created.TrackID != target {
+		t.Fatalf("create with association = %+v", created)
+	}
+	if found := lookup(kyle); found == nil || found.ID != created.ID {
+		t.Fatalf("lookup = %+v, want the upload just created", found)
+	}
+	afterCreate, err := c.store.Upload(ctx, uuid.MustParse(second.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterCreate.Variant.TrackID.String() == target {
+		t.Errorf("creating an upload on the song left the earlier association: %+v", afterCreate.Variant)
+	}
+
+	// The lookup is the caller's own: nobody else's uploads, and no guests.
+	if rec := c.do(http.MethodGet, "/api/v1/uploads/association?trackId="+target, "", nil); rec.Code != http.StatusUnauthorized {
+		t.Errorf("anonymous lookup = %d, want 401", rec.Code)
+	}
+	if rec := c.do(http.MethodGet, "/api/v1/uploads/association?trackId=nope", kyle, nil); rec.Code != http.StatusBadRequest {
+		t.Errorf("bad trackId = %d, want 400", rec.Code)
+	}
+}
+
 func TestUploadDeleteFreesTheRows(t *testing.T) {
 	c := newHTTPTestServer(t, nil)
 	kyle := c.register("kyle", "hunter2hunter2")
@@ -278,7 +383,7 @@ func TestUploadDeleteFreesTheRows(t *testing.T) {
 	}
 
 	// A remove action only ever removes the caller's own uploads.
-	theirs := createUpload(t, c, bob, uploadRequest("Green Fields", unreadableAudio, 2500))
+	theirs := createUpload(t, c, bob, uploadRequest("Green Fields", uploadAudio("green fields"), 2500))
 	if rec := c.do(http.MethodDelete, "/api/v1/uploads/"+theirs.ID, kyle, nil); rec.Code != http.StatusNotFound {
 		t.Errorf("deleting somebody else's upload = %d, want 404", rec.Code)
 	}
@@ -338,5 +443,38 @@ func TestSearchPinsUserUploadsFirst(t *testing.T) {
 		if group.UserUpload {
 			t.Errorf("zebra matched an upload: %+v", group)
 		}
+	}
+}
+
+func TestUserUploadsListing(t *testing.T) {
+	c := newHTTPTestServer(t, nil)
+	kyle := c.register("kyle", "hunter2hunter2")
+	bob := c.register("bob", "hunter2hunter2")
+
+	kyleUpload := createUpload(t, c, kyle, uploadRequest("Blue Horizon", unreadableAudio, 2500))
+	bobUpload := createUpload(t, c, bob, uploadRequest("Green Fields", uploadAudio("green fields"), 2500))
+
+	// The owner sees their own.
+	mine := listUploads(t, c, kyle, "/api/v1/users/"+kyleUpload.Uploader.UserID+"/uploads")
+	if len(mine) != 1 || mine[0].ID != kyleUpload.ID {
+		t.Fatalf("kyle's uploads = %+v", mine)
+	}
+
+	// Someone else sees the same list: uploaded songs are visible to every user.
+	theirs := listUploads(t, c, kyle, "/api/v1/users/"+bobUpload.Uploader.UserID+"/uploads")
+	if len(theirs) != 1 || theirs[0].ID != bobUpload.ID {
+		t.Fatalf("bob's uploads as kyle = %+v", theirs)
+	}
+
+	// A guest sees them too: the endpoint needs no account.
+	guest := listUploads(t, c, "", "/api/v1/users/"+bobUpload.Uploader.UserID+"/uploads")
+	if len(guest) != 1 || guest[0].ID != bobUpload.ID {
+		t.Fatalf("bob's uploads as guest = %+v", guest)
+	}
+
+	// An id that names nobody is a 404.
+	rec := c.do(http.MethodGet, "/api/v1/users/"+uuid.NewString()+"/uploads", "", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("unknown user = %d, want 404", rec.Code)
 	}
 }

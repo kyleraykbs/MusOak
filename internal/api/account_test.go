@@ -1,11 +1,43 @@
 package api
 
 import (
+	"encoding/base64"
 	"net/http"
+	"strings"
 	"testing"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/config"
+	"codeberg.org/kyleraykbs/musoak/internal/config"
 )
+
+// A photograph is bigger than the bound the small JSON bodies use. The image
+// endpoints carry it anyway, and only refuse what is genuinely too big - and
+// say so about the image, not about JSON.
+func TestIconUploadCarriesAnImagePastTheSmallBodyLimit(t *testing.T) {
+	c := newHTTPTestServer(t, nil)
+	token := c.register("bigicon", "hunter2hunter2")
+
+	// 1.5 MB of bytes: past the 1 MiB small-body limit, well inside 8 MB.
+	photo := make([]byte, 1536<<10)
+	for i := range photo {
+		photo[i] = byte(i % 251)
+	}
+	rec := c.do(http.MethodPost, "/api/v1/me/icon", token,
+		map[string]string{"data": base64.StdEncoding.EncodeToString(photo), "contentType": "image/jpeg"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("icon = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Past the image cap: refused as an image, with the status a client can act on.
+	oversized := make([]byte, maxArtworkBytes+1)
+	rec = c.do(http.MethodPost, "/api/v1/me/icon", token,
+		map[string]string{"data": base64.StdEncoding.EncodeToString(oversized), "contentType": "image/jpeg"})
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized icon = %d, want 413: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "the image is too large") {
+		t.Errorf("oversized icon = %s, want it named as an image", rec.Body.String())
+	}
+}
 
 func TestAccountProfileRoundTripsThroughMe(t *testing.T) {
 	c := newHTTPTestServer(t, nil)
@@ -74,6 +106,82 @@ func TestAccountProfileRoundTripsThroughMe(t *testing.T) {
 	c.decode(rec, &renamed)
 	if renamed.User.DisplayName != "K. Ray" || renamed.User.IconURL != iconed.User.IconURL {
 		t.Fatalf("user after second patch = %+v", renamed.User)
+	}
+}
+
+// An account's search platforms are a preference the client reads back and
+// edits: it saves them without a password, an unknown name is refused, and an
+// empty list means "no preference".
+func TestSearchPlatformsRoundTripThroughMe(t *testing.T) {
+	// The default order names providers this test does not enable; ytmusic is
+	// the one the preference below is allowed to name.
+	c := newHTTPTestServer(t, func(cfg *config.Config) {
+		cfg.Providers.YTMusic.Enabled = true
+	})
+	token := c.register("kyle", "hunter2hunter2")
+
+	type meResponse struct {
+		DisplayName     string   `json:"displayName"`
+		SearchPlatforms []string `json:"searchPlatforms"`
+	}
+	getMe := func() meResponse {
+		t.Helper()
+		rec := c.do(http.MethodGet, "/api/v1/me", token, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("me = %d: %s", rec.Code, rec.Body.String())
+		}
+		var me meResponse
+		c.decode(rec, &me)
+		return me
+	}
+
+	// Never set reads back as an empty list, not null: the client's own default
+	// then applies.
+	me := getMe()
+	if me.SearchPlatforms == nil || len(me.SearchPlatforms) != 0 {
+		t.Fatalf("unset searchPlatforms = %#v, want an empty list", me.SearchPlatforms)
+	}
+
+	// The display name and the platforms are independent keys.
+	rec := c.do(http.MethodPatch, "/api/v1/me", token, map[string]string{"displayName": "Kyle Ray"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("name patch = %d: %s", rec.Code, rec.Body.String())
+	}
+	rec = c.do(http.MethodPatch, "/api/v1/me", token, map[string]any{"searchPlatforms": []string{"ytmusic"}})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("platforms patch = %d: %s", rec.Code, rec.Body.String())
+	}
+	var patched accountUserEnvelope
+	c.decode(rec, &patched)
+	if len(patched.User.SearchPlatforms) != 1 || patched.User.SearchPlatforms[0] != "ytmusic" {
+		t.Fatalf("patched searchPlatforms = %#v", patched.User.SearchPlatforms)
+	}
+	if me = getMe(); me.DisplayName != "Kyle Ray" {
+		t.Fatalf("displayName after the platforms patch = %q, want it untouched", me.DisplayName)
+	}
+	if len(me.SearchPlatforms) != 1 || me.SearchPlatforms[0] != "ytmusic" {
+		t.Fatalf("searchPlatforms = %#v, want [ytmusic]", me.SearchPlatforms)
+	}
+
+	// A name that is not an enabled provider is refused and changes nothing.
+	rec = c.do(http.MethodPatch, "/api/v1/me", token, map[string]any{"searchPlatforms": []string{"ytmusic", "deezer"}})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("unknown provider = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "deezer") {
+		t.Errorf("the refusal must name the provider: %s", rec.Body.String())
+	}
+	if me = getMe(); len(me.SearchPlatforms) != 1 || me.SearchPlatforms[0] != "ytmusic" {
+		t.Fatalf("searchPlatforms after a refused patch = %#v", me.SearchPlatforms)
+	}
+
+	// An empty list clears the preference back to "not set".
+	rec = c.do(http.MethodPatch, "/api/v1/me", token, map[string]any{"searchPlatforms": []string{}})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("clear = %d: %s", rec.Code, rec.Body.String())
+	}
+	if me = getMe(); me.SearchPlatforms == nil || len(me.SearchPlatforms) != 0 {
+		t.Fatalf("cleared searchPlatforms = %#v, want an empty list", me.SearchPlatforms)
 	}
 }
 

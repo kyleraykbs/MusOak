@@ -205,6 +205,58 @@ func (d *DB) AllUploads(ctx context.Context) ([]Upload, error) {
 		`SELECT `+uploadColumns+` `+uploadFrom+` ORDER BY u.created_at DESC`)
 }
 
+// UploadGroup is a set of one user's uploads whose stored bytes are identical,
+// keyed by the content hash they share.
+type UploadGroup struct {
+	SHA256  string
+	Uploads []Upload
+}
+
+// DuplicateUploads groups a user's uploads by the content hash of the file each
+// one holds, keeping only the hashes more than one upload shares. The create
+// endpoint refuses bytes it already has, so this finds the copies stored before
+// that check existed.
+func (d *DB) DuplicateUploads(ctx context.Context, userID uuid.UUID) ([]UploadGroup, error) {
+	rows, err := d.db.QueryContext(ctx, `
+		SELECT m.sha256
+		FROM uploads u
+		JOIN media_files m ON m.variant_id = u.variant_id
+		WHERE u.user_id = ?
+		GROUP BY m.sha256
+		HAVING COUNT(*) > 1
+		ORDER BY m.sha256`, userID.String())
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+
+	var hashes []string
+	for rows.Next() {
+		var hash string
+		if err := rows.Scan(&hash); err != nil {
+			return nil, mapErr(err)
+		}
+		hashes = append(hashes, hash)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapErr(err)
+	}
+
+	var groups []UploadGroup
+	for _, hash := range hashes {
+		uploads, err := d.queryUploads(ctx, `
+			SELECT `+uploadColumns+` `+uploadFrom+`
+			JOIN media_files m ON m.variant_id = u.variant_id
+			WHERE u.user_id = ? AND m.sha256 = ?
+			ORDER BY u.created_at DESC`, userID.String(), hash)
+		if err != nil {
+			return nil, err
+		}
+		groups = append(groups, UploadGroup{SHA256: hash, Uploads: uploads})
+	}
+	return groups, nil
+}
+
 // SearchUploads finds user uploads whose own metadata mentions the query,
 // newest first. Search surfaces them above provider results.
 func (d *DB) SearchUploads(ctx context.Context, query string, limit int) ([]Upload, error) {

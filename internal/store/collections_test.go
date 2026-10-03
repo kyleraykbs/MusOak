@@ -209,7 +209,7 @@ func TestArtistVariants(t *testing.T) {
 // TestAlbumMigrationKeepsExistingCredits checks the album table rebuild: albums
 // that only existed as track credits must survive with their links intact.
 func TestAlbumMigrationKeepsExistingCredits(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "prismusic.db")
+	path := filepath.Join(t.TempDir(), "musoak.db")
 	ctx := context.Background()
 
 	db, err := Open(path)

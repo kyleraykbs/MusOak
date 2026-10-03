@@ -9,8 +9,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/provider"
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/provider"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 const threshold = 0.8
@@ -20,7 +20,10 @@ type fakeProvider struct {
 	name string
 	caps provider.Caps
 	hits []provider.Track
-	err  error
+	// byQuery answers per query, for tests about what a search asks for. A
+	// query it does not name gets nothing back.
+	byQuery map[string][]provider.Track
+	err     error
 }
 
 func (f *fakeProvider) Name() string { return f.name }
@@ -31,6 +34,9 @@ func (f *fakeProvider) Capabilities() provider.Caps {
 func (f *fakeProvider) Search(ctx context.Context, q string, opts provider.SearchOpts) ([]provider.Track, error) {
 	if f.err != nil {
 		return nil, f.err
+	}
+	if f.byQuery != nil {
+		return f.byQuery[q], nil
 	}
 	return f.hits, nil
 }
@@ -162,6 +168,60 @@ func TestScoreFixtures(t *testing.T) {
 			name:  "duration beyond tolerance is never the same recording",
 			a:     fixture(studio, "Rick Astley", album, duration),
 			b:     fixture(studio, "Rick Astley", album, duration+6000),
+			match: false,
+		},
+		{
+			// YouTube Music spells a song twice when it is not written in
+			// Latin letters. That is the same recording, and Spotify's public
+			// pages give no album to help.
+			name:  "youtube appends a romanisation to a non-latin title",
+			a:     fixture("トーキョーレギー", "Masayoshi Takanaka", "", 260_333),
+			b:     fixture("トーキョーレギー - Tokyo Reggie", "Masayoshi Takanaka", "", 261_000),
+			match: true,
+		},
+		{
+			// Spotify's public playlist pages join a track's credits into one
+			// line, so a name with a comma in it arrives as two people.
+			name: "the same credits arrive split differently",
+			a: Candidate{
+				Title: "EARFQUAKE", Artists: []string{"Tyler, The Creator"},
+				Album: "IGOR", DurationMs: 190_072,
+			},
+			b: Candidate{
+				Title: "EARFQUAKE", Artists: []string{"Tyler", "The Creator"},
+				Album: "IGOR", DurationMs: 191_000,
+			},
+			match: true,
+		},
+		{
+			// The same recording with the year written on the other side of
+			// the word, which is how Spotify's pages spell it.
+			name:  "a remaster named year first",
+			a:     fixture("Modern Love - 2018 Remaster", "David Bowie", "", 288_339),
+			b:     fixture("Modern Love", "David Bowie", "", 289_000),
+			match: true,
+		},
+		{
+			// One side credits the featured artist, the other leaves it in the
+			// title only.
+			name: "a feature credited on one side",
+			a: Candidate{
+				Title: "Jamba (feat. Hodgy)", Artists: []string{"Tyler", "The Creator", "Hodgy"},
+				DurationMs: 212_500,
+			},
+			b: Candidate{
+				Title: "Jamba (feat. Hodgy)", Artists: []string{"Tyler, The Creator"},
+				DurationMs: 213_000,
+			},
+			match: true,
+		},
+		{
+			// The romanisation rule must not touch a Latin title: this suffix
+			// names a different recording, and the durations agree here, so the
+			// title is the only thing keeping them apart.
+			name:  "a latin title keeps its version suffix",
+			a:     fixture("Song", "Artist", "Album", duration),
+			b:     fixture("Song - Live at Wembley", "Artist", "Album", duration),
 			match: false,
 		},
 	}
@@ -407,5 +467,184 @@ func TestResolveKeepsWorkingWhenAProviderFails(t *testing.T) {
 	}
 	if _, err := m.Resolve(ctx, track.ID); !errors.Is(err, ErrNoPlayableVariant) {
 		t.Fatalf("err = %v, want ErrNoPlayableVariant rather than a provider error", err)
+	}
+}
+
+// A library can hold one song twice: a provider's metadata arrives spelled
+// differently enough not to match, so a second row is made and the rendition
+// ends up on only one of them. Resolving the row a playlist points at has to
+// join the two, or that entry can never be played.
+func TestResolveJoinsADuplicateTrack(t *testing.T) {
+	hit := ytHit("Never Gonna Give You Up", "Rick Astley", "Whenever You Need Somebody", 213_000)
+	yt := &fakeProvider{
+		name: "ytmusic",
+		caps: provider.Caps{Search: true, Download: true},
+		hits: []provider.Track{hit},
+	}
+	sp := &fakeProvider{name: "spotify", caps: provider.Caps{Search: true}}
+	m, db := newTestMatcher(t, yt, sp)
+	ctx := context.Background()
+
+	// The recording, matched once already: the rendition lives on this row.
+	withSource, _, err := m.Attach(ctx, "ytmusic", hit)
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	// A second row for the same song, with nothing to play.
+	dupe := &store.Track{ID: uuid.New(), Title: "Never Gonna Give You Up", DurationMs: 213_400}
+	if err := db.CreateTrack(ctx, dupe); err != nil {
+		t.Fatalf("CreateTrack: %v", err)
+	}
+	if err := db.SetTrackArtists(ctx, dupe.ID, []string{"Rick Astley"}); err != nil {
+		t.Fatalf("SetTrackArtists: %v", err)
+	}
+	if err := db.SetTrackAlbums(ctx, dupe.ID, []string{"Whenever You Need Somebody"}); err != nil {
+		t.Fatalf("SetTrackAlbums: %v", err)
+	}
+
+	variants, err := m.Resolve(ctx, dupe.ID)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if !hasDownloadable(variants) {
+		t.Fatalf("no downloadable variant after resolve: %+v", variants)
+	}
+
+	// The two rows are one, and it is the one that had no source, so whatever
+	// pointed at it still does.
+	if _, err := db.Track(ctx, withSource.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("the other row survived the merge: %v", err)
+	}
+	if _, err := db.Track(ctx, dupe.ID); err != nil {
+		t.Errorf("the resolved row went missing: %v", err)
+	}
+	kept, err := db.VariantsForTrack(ctx, dupe.ID)
+	if err != nil {
+		t.Fatalf("VariantsForTrack: %v", err)
+	}
+	if len(kept) != 1 || !kept[0].Downloadable {
+		t.Errorf("variants = %+v, want the rendition moved onto the resolved row", kept)
+	}
+}
+
+// A pick made in the source dialog has to stick to the song it was made for,
+// even when the rendition already belongs to another row for the same
+// recording. That is the duplicate case again, and the two are joined.
+func TestAttachToTrackJoinsADuplicateTrack(t *testing.T) {
+	hit := ytHit("Never Gonna Give You Up", "Rick Astley", "Whenever You Need Somebody", 213_000)
+	yt := &fakeProvider{name: "ytmusic", caps: provider.Caps{Search: true, Download: true}}
+	m, db := newTestMatcher(t, yt)
+	ctx := context.Background()
+
+	// The rendition, already attached to one row.
+	withSource, _, err := m.Attach(ctx, "ytmusic", hit)
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	// The song somebody is looking at, which is a second row for it.
+	other := &store.Track{ID: uuid.New(), Title: "Never Gonna Give You Up", DurationMs: 213_400}
+	if err := db.CreateTrack(ctx, other); err != nil {
+		t.Fatalf("CreateTrack: %v", err)
+	}
+
+	kept, variant, err := m.AttachToTrack(ctx, other.ID, "ytmusic", hit)
+	if err != nil {
+		t.Fatalf("AttachToTrack: %v", err)
+	}
+	if kept.ID != other.ID {
+		t.Errorf("kept = %s, want the track the pick was made for (%s)", kept.ID, other.ID)
+	}
+	if variant.TrackID != other.ID {
+		t.Errorf("variant sits on %s, want %s", variant.TrackID, other.ID)
+	}
+	if _, err := db.Track(ctx, withSource.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("the other row survived the merge: %v", err)
+	}
+	variants, err := db.VariantsForTrack(ctx, other.ID)
+	if err != nil {
+		t.Fatalf("VariantsForTrack: %v", err)
+	}
+	if len(variants) != 1 || !variants[0].Downloadable {
+		t.Errorf("variants = %+v, want the picked rendition on this row", variants)
+	}
+}
+
+// Two candidates can score near enough alike that the difference is noise. The
+// provider's own order is what decides between them, and it is information the
+// scoring otherwise throws away.
+func TestResolvePrefersTheProvidersOwnOrder(t *testing.T) {
+	want := int64(213_500)
+	first := ytHit("Never Gonna Give You Up", "Rick Astley", "Whenever You Need Somebody", 213_000)
+	second := ytHit("Never Gonna Give You Up", "Rick Astley", "Whenever You Need Somebody", want)
+	yt := &fakeProvider{
+		name: "ytmusic",
+		caps: provider.Caps{Search: true, Download: true},
+		hits: []provider.Track{first, second},
+	}
+	m, db := newTestMatcher(t, yt)
+	ctx := context.Background()
+
+	track, _, err := m.Attach(ctx, "spotify", provider.Track{
+		ProviderTrackID: "sp-order",
+		Title:           "Never Gonna Give You Up",
+		Artists:         []string{"Rick Astley"},
+		Album:           "Whenever You Need Somebody",
+		DurationMs:      want,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	variants, err := m.Resolve(ctx, track.ID)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	var matched string
+	for _, variant := range variants {
+		if variant.Provider == "ytmusic" {
+			matched = variant.ProviderTrackID
+		}
+	}
+	// `second` fits the duration better by a hair; `first` is what the provider
+	// answered first, and that is the better guess.
+	if matched != first.ProviderTrackID {
+		t.Errorf("matched %s, want the provider's own first hit (%s)", matched, first.ProviderTrackID)
+	}
+	_ = db
+}
+
+// A query carrying the credits can push the right answer out of the hits
+// entirely - credits are what providers spell differently. The title alone is
+// the other half of the search, and it is asked for when the first finds
+// nothing.
+func TestResolveAsksAgainWithTheTitleAlone(t *testing.T) {
+	hit := ytHit("Never Gonna Give You Up", "Rick Astley", "", 213_000)
+	yt := &fakeProvider{
+		name: "ytmusic",
+		caps: provider.Caps{Search: true, Download: true},
+		byQuery: map[string][]provider.Track{
+			"Never Gonna Give You Up Rick Astley": nil, // the credits find nothing
+			"Never Gonna Give You Up":             {hit},
+		},
+	}
+	m, _ := newTestMatcher(t, yt)
+	ctx := context.Background()
+
+	track, _, err := m.Attach(ctx, "spotify", provider.Track{
+		ProviderTrackID: "sp-plain",
+		Title:           "Never Gonna Give You Up",
+		Artists:         []string{"Rick Astley"},
+		DurationMs:      213_400,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	variants, err := m.Resolve(ctx, track.ID)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if !hasDownloadable(variants) {
+		t.Fatalf("nothing matched, but the title alone finds it: %+v", variants)
 	}
 }

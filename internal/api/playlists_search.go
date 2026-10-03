@@ -7,19 +7,22 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 // providerPlaylistResponse is a provider playlist. Unlike an album it belongs to one
 // provider, so its id is the library's own and the provider is named.
 type providerPlaylistResponse struct {
-	ID          string `json:"id"`
-	Provider    string `json:"provider"`
-	Title       string `json:"title"`
-	Owner       string `json:"owner,omitempty"`
-	Description string `json:"description,omitempty"`
-	TrackCount  int    `json:"trackCount"`
-	ArtworkURL  string `json:"artworkUrl,omitempty"`
+	ID string `json:"id"`
+	// ProviderPlaylistID is the platform's own id. ID is this library's row for
+	// the playlist; importing one by id needs the platform's.
+	ProviderPlaylistID string `json:"providerPlaylistId"`
+	Provider           string `json:"provider"`
+	Title              string `json:"title"`
+	Owner              string `json:"owner,omitempty"`
+	Description        string `json:"description,omitempty"`
+	TrackCount         int    `json:"trackCount"`
+	ArtworkURL         string `json:"artworkUrl,omitempty"`
 	// Synced reports whether the tracklist has been pulled into the library,
 	// which is what playing or importing it needs.
 	Synced bool `json:"synced"`
@@ -42,7 +45,13 @@ func (s *Server) handlePlaylistSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	limit := clampLimit(intParam(r, "limit", defaultSearchLimit))
 
-	playlists, problems, err := s.library.SearchPlaylists(r.Context(), query, limit)
+	providers, err := s.providerNames(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	playlists, problems, err := s.library.SearchPlaylists(r.Context(), query, limit, providers)
 	if err != nil {
 		writeStoreError(w, err, "playlist search failed")
 		return
@@ -109,12 +118,13 @@ func (s *Server) handlePlaylistSync(w http.ResponseWriter, r *http.Request) {
 // buildPlaylist shapes one stored playlist for the API.
 func (s *Server) buildPlaylist(ctx context.Context, playlist *store.ExternalPlaylist) (providerPlaylistResponse, error) {
 	out := providerPlaylistResponse{
-		ID:          playlist.ID.String(),
-		Provider:    playlist.Provider,
-		Title:       playlist.Title,
-		Owner:       playlist.Owner,
-		Description: playlist.Description,
-		TrackCount:  playlist.TrackCount,
+		ID:                 playlist.ID.String(),
+		ProviderPlaylistID: playlist.ProviderPlaylistID,
+		Provider:           playlist.Provider,
+		Title:              playlist.Title,
+		Owner:              playlist.Owner,
+		Description:        playlist.Description,
+		TrackCount:         playlist.TrackCount,
 	}
 	if playlist.ArtworkURL != "" {
 		out.ArtworkURL = artworkPath(store.ArtworkPlaylist, playlist.ID)

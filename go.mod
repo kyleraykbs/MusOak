@@ -1,4 +1,4 @@
-module codeberg.org/kyleraykbs/prismusic
+module codeberg.org/kyleraykbs/musoak
 
 go 1.26.5
 

@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"strings"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 type importRequest struct {

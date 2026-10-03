@@ -1,4 +1,4 @@
-# Prismusic
+# MusOak
 
 A self-hosted music server, client and listening room. It searches several
 providers, merges their results into one canonical library, downloads the audio
@@ -9,8 +9,8 @@ Two binaries, one module:
 
 | binary | what it is |
 | --- | --- |
-| `prismusicd` | the server: HTTP API, event stream, media cache, rooms |
-| `prism` | the CLI: search, queue, play, listen together |
+| `musoakd` | the server: HTTP API, event stream, media cache, rooms |
+| `musoak` | the CLI: search, queue, play, listen together |
 
 The CLI is a plain API client, so a Discord bot (or anything else) is too. With
 `client.serverURL` empty the CLI starts its own server in-process, which means a
@@ -20,13 +20,13 @@ single binary is a complete setup: no daemon, no separate configuration.
 
 ```sh
 # Standalone: the CLI runs its own server, in-process.
-nix run .#prism -- search "Never Gonna Give You Up"
-nix run .#prism -- queue add 0
-nix run .#prism -- play
+nix run .#musoak -- search "Never Gonna Give You Up"
+nix run .#musoak -- queue add 0
+nix run .#musoak -- play
 
 # Or run the server separately and point the client at it.
-nix run .#prismusicd -- --config config.json
-nix run .#prism -- --config config.json search "Something"
+nix run .#musoakd -- --config config.json
+nix run .#musoak -- --config config.json search "Something"
 ```
 
 `config.example.json` is a complete, commented-by-example configuration. Unknown
@@ -35,7 +35,7 @@ keys are an error, so a typo can never be silently ignored.
 ## How it fits together
 
 ```
-provider/          ytmusic (search + download), spotify (metadata only)
+provider/          ytmusic, youtube (search + download), spotify (metadata only)
      |  search hits
      v
 match/             ISRC and title/artist/album/duration scoring -> canonical tracks
@@ -71,8 +71,8 @@ Listen Together details worth knowing before you rely on it:
 ## Playlists, radios, albums and artists
 
 **Playlists** belong to an account: create one, append tracks, remove or reorder
-by position, rename or delete it. `prism playlist queue` feeds one into the
-local queue and `prism room queue playlist` into a listening room.
+by position, rename or delete it. `musoak playlist queue` feeds one into the
+local queue and `musoak room queue playlist` into a listening room.
 
 **Radios** are stations grown from a song. The caller picks the providers, and
 the station interleaves them round-robin, so a two-provider radio really
@@ -80,9 +80,9 @@ alternates. Suggestions are matched into the canonical library on the way in, so
 the seed never repeats and the same recording from two sources is one entry.
 
 ```sh
-prism radio 0 --providers ytmusic --length 25      # saved as a playlist
-prism radio 0 --providers ytmusic,spotify --play   # straight to the speakers
-prism radio 0 --room                               # into the room you are in
+musoak radio 0 --providers ytmusic --length 25      # saved as a playlist
+musoak radio 0 --providers ytmusic,spotify --play   # straight to the speakers
+musoak radio 0 --room                               # into the room you are in
 ```
 
 **Albums and artists** are canonical too. One album exists once, with each
@@ -93,12 +93,12 @@ record found on two providers is one album with two variants.
 **Syncing** goes the other way, from provider to library:
 
 ```sh
-prism album search "Whenever You Need Somebody"
-prism album sync 0 --providers ytmusic        # pull the tracklist, match every track
-prism album sync 0 --providers ytmusic,spotify --resolve
-prism artist search "Rick Astley"
-prism artist sync 0                           # their albums
-prism artist sync 0 --albums                  # and each album's tracklist
+musoak album search "Whenever You Need Somebody"
+musoak album sync 0 --providers ytmusic        # pull the tracklist, match every track
+musoak album sync 0 --providers ytmusic,spotify --resolve
+musoak artist search "Rick Astley"
+musoak artist sync 0                           # their albums
+musoak artist sync 0 --albums                  # and each album's tracklist
 ```
 
 A sync fetches each selected release's tracklist, matches every track into the
@@ -119,31 +119,35 @@ Two things worth knowing:
 
 ## Configuration
 
-`--config FILE` wins, then `$PRISMUSIC_CONFIG`, then
-`$XDG_CONFIG_HOME/prismusic/config.json`. The same file configures the server and
+`--config FILE` wins, then `$MUSOAK_CONFIG`, then
+`$XDG_CONFIG_HOME/musoak/config.json`. The same file configures the server and
 the client; a missing file at the last location is not an error (defaults apply).
 
 | key | default | meaning |
 | --- | --- | --- |
-| `listen` | `":8080"` | HTTP listen address (`prism serve` uses it too). |
-| `storageDir` | `$XDG_DATA_HOME/prismusic` | Database and `media/` live here. |
+| `listen` | `":4420"` | HTTP listen address (`musoak serve` uses it too). |
+| `storageDir` | `$XDG_DATA_HOME/musoak` | Database and `media/` live here. |
 | `requireLogin` | `false` | Reject anonymous requests outright. When false, anonymous callers are guests with read/playback access and no personal data. |
 | `registrationOpen` | `true` | Whether `/auth/register` accepts new accounts. Passwords have no length rule beyond being non-empty: what makes guessing expensive is argon2id (64 MiB, 3 passes) plus `rateLimit.loginPerMinute`. |
 | `providers.ytmusic.enabled` | `true` | YouTube Music: search and download. |
+| `providers.youtube.enabled` | `true` | Plain YouTube: search and download through yt-dlp. Its hits are videos rather than recordings, so clients keep it out of their own filters until asked. |
+| `providers.youtube.cookiesFromBrowser` / `cookiesFile` | `""` | YouTube sign-in cookies for yt-dlp, the same escape hatch YouTube Music takes; see `providers.ytmusic.*` above. |
 | `providers.spotify.enabled` | `false` | Spotify: metadata only (audio is DRM-protected). |
-| `providers.spotify.clientId` / `clientSecret` | `""` | Spotify application credentials. Keep the secret out of the Nix store; use `services.prismusicd.configFile`. |
+| `providers.spotify.clientId` / `clientSecret` | `""` | Spotify application credentials. Keep the secret out of the Nix store; use `services.musoakd.configFile`. |
 | `defaultProviderOrder` | `["ytmusic","spotify"]` | Fallback preference; every entry must be a known provider and cover the enabled ones. |
 | `prefetchCount` | `3` | How many upcoming tracks a client keeps downloaded. |
 | `match.threshold` | `0.8` | Score in (0,1] above which two renditions are the same recording. |
 | `rateLimit.searchPerMinute` | `30` | Per-client search budget; 0 disables it. |
 | `rateLimit.loginPerMinute` | `10` | Per-client register/login budget; 0 disables it. |
+| `trustedProxies` | `[]` | CIDRs of reverse proxies whose `X-Forwarded-For` is believed, so rate limits key on the real client instead of the proxy. Leave empty when clients reach the server directly; set it only when something in front forwards to it (e.g. `["127.0.0.1/32", "10.0.0.0/8"]`). |
 | `media.quotaMB` | `0` | Cap for `media/`; 0 means unlimited. Over it, least recently served renditions are evicted. |
+| `media.prefetchPlaylists` | `true` | Keeps the songs in people's playlists downloaded before anybody plays them: one song at a time in the background, so a first play costs nothing. |
 | `listenTogether.skipThreshold` | `2.0` | Mean vote below which the room skips. |
 | `listenTogether.minVotersForSkip` | `2` | Voters needed before a skip can fire. |
 | `listenTogether.voterFractionForSkip` | `0.5` | Fraction of the room that must have voted. |
 | `listenTogether.readyTimeoutSeconds` | `30` | How long to wait for readiness; `0` waits for everybody. |
 | `client.serverURL` | `""` | Server to talk to. Empty runs the server inside the CLI. |
-| `client.cacheDir` | `$XDG_CACHE_HOME/prismusic` | Client-side media cache, queue and session token. |
+| `client.cacheDir` | `$XDG_CACHE_HOME/musoak` | Client-side media cache, queue and session token. |
 
 Runtime dependencies (bundled by the Nix packages, otherwise on `PATH`):
 `python3` with `ytmusicapi`, `yt-dlp`, `ffmpeg`/`ffprobe`, and `mpv` for the CLI.
@@ -152,27 +156,27 @@ The server logs a clear warning for anything missing at startup.
 ## CLI
 
 ```
-prism search <query>                  merged, cross-provider results
-prism queue add <track-id|index>      queue something (index = last search result)
-prism queue list|rm|clear
-prism play                            gapless playback, prefetching ahead
-prism library import <file|dir>       add local files; they match into the library
-prism fav add|list|rm <track-id|index>
-prism playlist create|list|show|add|rm|reorder|rename|delete|queue|play
-prism radio <track-id|index>          station from a song (--providers, --length, --play, --room)
-prism album search|show|sync|queue|play
-prism artist search|show|sync         (--albums pulls the discography's tracklists)
-prism providers [rank <a,b,c>]        provider capabilities and preference
-prism login <username> [--register]   password on stdin or --password
-prism me | logout
-prism room create|list|join <id>      rooms; join plays along with mpv
-prism room queue add|vote|skip|pause|resume|seek|now
-prism serve                           run the server in the foreground
+musoak search <query>                  merged, cross-provider results
+musoak queue add <track-id|index>      queue something (index = last search result)
+musoak queue list|rm|clear
+musoak play                            gapless playback, prefetching ahead
+musoak library import <file|dir>       add local files; they match into the library
+musoak fav add|list|rm <track-id|index>
+musoak playlist create|list|show|add|rm|reorder|rename|delete|queue|play
+musoak radio <track-id|index>          station from a song (--providers, --length, --play, --room)
+musoak album search|show|sync|queue|play
+musoak artist search|show|sync         (--albums pulls the discography's tracklists)
+musoak providers [rank <a,b,c>]        provider capabilities and preference
+musoak login <username> [--register]   password on stdin or --password
+musoak me | logout
+musoak room create|list|join <id>      rooms; join plays along with mpv
+musoak room queue add|vote|skip|pause|resume|seek|now
+musoak serve                           run the server in the foreground
 ```
 
 ### Player keys
 
-`prism play` keeps a status line while it plays, and takes single keys without
+`musoak play` keeps a status line while it plays, and takes single keys without
 Enter:
 
 | key | action |
@@ -189,7 +193,7 @@ as it is ready. Without a terminal on stdin, playback stays non-interactive and
 prints one line per track.
 
 Headless machines can play through a null sink:
-`PRISM_MPV_ARGS="--ao=null --no-video" prism play`.
+`MUSOAK_MPV_ARGS="--ao=null --no-video" musoak play`.
 
 ## HTTP API
 
@@ -217,35 +221,35 @@ specification and the routes cannot drift apart.
 
 ```nix
 {
-  inputs.prismusic.url = "git+https://codeberg.org/kyleraykbs/prismusic";
+  inputs.musoak.url = "git+https://codeberg.org/kyleraykbs/musoak";
 
   # Server
-  services.prismusicd = {
+  services.musoakd = {
     enable = true;
-    listen = ":8080";
-    storageDir = "/var/lib/prismusicd";        # default; a StateDirectory
+    listen = ":4420";
+    storageDir = "/var/lib/musoakd";        # default; a StateDirectory
     openFirewall = true;
     providers.spotify.enable = true;
     # The generated config lands in the world-readable store, so secrets come
     # from a file instead:
-    configFile = "/run/secrets/prismusicd.json";
+    configFile = "/run/secrets/musoakd.json";
   };
 
-  # CLI, on NixOS (system-wide defaults + PRISMUSIC_CONFIG) ...
-  programs.prism = {
+  # CLI, on NixOS (system-wide defaults + MUSOAK_CONFIG) ...
+  programs.musoak = {
     enable = true;
-    serverURL = "http://127.0.0.1:8080";
-    cacheDir = null;                            # $XDG_CACHE_HOME/prismusic
+    serverURL = "http://127.0.0.1:4420";
+    cacheDir = null;                            # $XDG_CACHE_HOME/musoak
     server.storageDir = null;                   # only used in standalone mode
   };
 
   # ... or in home-manager:
-  # home-manager.users.kyle.programs.prism = { enable = true; serverURL = "http://127.0.0.1:8080"; };
+  # home-manager.users.kyle.programs.musoak = { enable = true; serverURL = "http://127.0.0.1:4420"; };
 }
 ```
 
-The flake exposes `packages.{prism,prismusicd}`, matching `apps`, and
-`nixosModules.prismusicd`, `nixosModules.prism`, `homeManagerModules.prism`. Both
+The flake exposes `packages.{musoak,musoakd}`, matching `apps`, and
+`nixosModules.musoakd`, `nixosModules.musoak`, `homeManagerModules.musoak`. Both
 binaries are wrapped with the tooling they need, so `nix run` works with no
 environment setup. `nix build` also runs the whole Go test suite.
 
@@ -339,18 +343,18 @@ go test ./...                     # unit + integration (drives real mpv, real ff
 go test -tags live ./internal/provider/ytmusic/   # downloads a real track from YT Music
 
 # Standalone: no daemon, the CLI runs its own server in-process.
-nix run .#prism -- search "Never Gonna Give You Up"
-nix run .#prism -- queue add 0
-PRISM_MPV_ARGS="--ao=null --no-video" nix run .#prism -- play   # headless playback
+nix run .#musoak -- search "Never Gonna Give You Up"
+nix run .#musoak -- queue add 0
+MUSOAK_MPV_ARGS="--ao=null --no-video" nix run .#musoak -- play   # headless playback
 
 # Server + client, then the whole REST API with curl.
-nix run .#prismusicd -- --config /tmp/config.json &
-scripts/api-smoke.sh http://127.0.0.1:8080        # 57 checks, exits non-zero on failure
+nix run .#musoakd -- --config /tmp/config.json &
+scripts/api-smoke.sh http://127.0.0.1:4420        # 57 checks, exits non-zero on failure
 
 # Listen together with two clients (two terminals, separate cache dirs).
-prism room create --name party
-prism room queue add 0
-prism room join <room-id>          # plays along; the second client joins mid-track
+musoak room create --name party
+musoak room queue add 0
+musoak room join <room-id>          # plays along; the second client joins mid-track
 ```
 
 The Nix packages are wrapped with the tooling they need, so `nix run` works from

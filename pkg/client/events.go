@@ -49,7 +49,7 @@ func (c *Client) dialSocket(ctx context.Context, path string) (*websocket.Conn, 
 
 	conn, _, err := websocket.Dial(ctx, c.socketURL(path), &websocket.DialOptions{HTTPHeader: header})
 	if err != nil {
-		return nil, fmt.Errorf("prismusic: websocket %s: %w", path, err)
+		return nil, fmt.Errorf("musoak: websocket %s: %w", path, err)
 	}
 	return conn, nil
 }
@@ -119,13 +119,13 @@ type socketPong struct {
 func (c *Client) clockSample(ctx context.Context, conn *websocket.Conn) (*ClockSample, error) {
 	sent := time.Now().UnixMilli()
 	if err := wsjson.Write(ctx, conn, socketPing{Type: "ping", ClientSentAt: sent}); err != nil {
-		return nil, fmt.Errorf("prismusic: clock ping: %w", err)
+		return nil, fmt.Errorf("musoak: clock ping: %w", err)
 	}
 
 	for {
 		var message socketPong
 		if err := wsjson.Read(ctx, conn, &message); err != nil {
-			return nil, fmt.Errorf("prismusic: clock pong: %w", err)
+			return nil, fmt.Errorf("musoak: clock pong: %w", err)
 		}
 		if message.Type != "pong" || message.ClientSentAt != sent {
 			continue // an event arrived while we were measuring

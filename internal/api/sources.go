@@ -1,15 +1,16 @@
 package api
 
 import (
+	"context"
 	"net/http"
-	"sort"
 
 	"github.com/google/uuid"
+
+	"codeberg.org/kyleraykbs/musoak/internal/ranking"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
-// userUploadProvider is the provider of a user-sourced variant: an upload
 // rather than a rendition found on a service.
-const userUploadProvider = "user"
 
 // sourceUploader is who uploaded a user source.
 type sourceUploader struct {
@@ -21,8 +22,13 @@ type sourceUploader struct {
 // sourceResponse is one entry of the playbar source picker: a variant of the
 // track with its vote tally and whether it plays by default.
 type sourceResponse struct {
-	VariantID    string          `json:"variantId"`
-	Provider     string          `json:"provider"`
+	VariantID string `json:"variantId"`
+	Provider  string `json:"provider"`
+	// Slot names the reserved source order position this variant fills for the
+	// caller: "self" for their own upload, "uploaded" for somebody else's, and
+	// "" for a provider's own rendition. Clients rank a variant by its slot
+	// when it has one, so the two reserved positions actually decide playback.
+	Slot         string          `json:"slot"`
 	Title        string          `json:"title"`
 	Artists      []string        `json:"artists"`
 	Album        string          `json:"album"`
@@ -45,11 +51,11 @@ type trackSourcesResponse struct {
 }
 
 // handleTrackSources lists every source of a track for the playbar picker.
-// Official sources come first, then user uploads; inside a group the net
-// votes decide, then the caller's provider ranking, then the variant id so
-// the order never wobbles. Exactly one source is marked default: the
-// caller's saved preference when it is among the sources, otherwise the
-// first one.
+// The caller's effective order decides: the reserved self and uploaded slots
+// come first, each standing for the variant it resolves to, then the providers
+// in their places, with ties broken by net votes and the variant id so the
+// order never wobbles. Exactly one source is marked default: the caller's
+// saved preference when it is among the sources, otherwise the first one.
 func (s *Server) handleTrackSources(w http.ResponseWriter, r *http.Request) {
 	trackID, ok := trackIDFromPath(w, r)
 	if !ok {
@@ -95,44 +101,32 @@ func (s *Server) handleTrackSources(w http.ResponseWriter, r *http.Request) {
 
 	// A guest has no ranking of their own, so the aggregate order decides,
 	// the same fallback rooms use for anonymous members.
-	var order []string
-	if user != nil {
-		order, err = s.ranking.User(r.Context(), user.ID)
-	} else {
-		order, err = s.ranking.Aggregate(r.Context())
-	}
+	order, err := s.effectiveOrder(r.Context(), user)
 	if err != nil {
 		writeStoreError(w, err, "sources unavailable")
 		return
 	}
-	providerRank := make(map[string]int, len(order))
-	for i, provider := range order {
-		if _, seen := providerRank[provider]; !seen {
-			providerRank[provider] = i
-		}
+	caller := uuid.Nil
+	if user != nil {
+		caller = user.ID
 	}
-	rankOf := func(provider string) int {
-		if pos, ok := providerRank[provider]; ok {
-			return pos
-		}
-		// Providers outside the ranking sort last, like ranking.Pick does.
-		return len(order)
-	}
+	ordered := ranking.OrderVariants(order, variants, uploaders, counts, caller)
 
-	sources := make([]sourceResponse, 0, len(variants))
-	for _, variant := range variants {
+	sources := make([]sourceResponse, 0, len(ordered))
+	for _, variant := range ordered {
 		votes := counts[variant.ID]
 		status := s.media.Status(r.Context(), variant.ID)
 		source := sourceResponse{
 			VariantID:    variant.ID.String(),
 			Provider:     variant.Provider,
+			Slot:         slotFor(variant.ID, uploaders, caller),
 			Title:        variant.Title,
 			Artists:      variant.Artists,
 			Album:        variant.Album,
 			DurationMs:   variant.DurationMs,
 			Downloadable: variant.Downloadable,
 			MediaState:   string(status.State),
-			Official:     variant.Provider != userUploadProvider,
+			Official:     variant.Provider != store.UploadProvider,
 			Upvotes:      votes.Up,
 			Downvotes:    votes.Down,
 			MyVote:       myVotes[variant.ID],
@@ -149,20 +143,6 @@ func (s *Server) handleTrackSources(w http.ResponseWriter, r *http.Request) {
 		}
 		sources = append(sources, source)
 	}
-
-	sort.Slice(sources, func(i, j int) bool {
-		a, b := sources[i], sources[j]
-		if a.Official != b.Official {
-			return a.Official
-		}
-		if netA, netB := a.Upvotes-a.Downvotes, b.Upvotes-b.Downvotes; netA != netB {
-			return netA > netB
-		}
-		if rankA, rankB := rankOf(a.Provider), rankOf(b.Provider); rankA != rankB {
-			return rankA < rankB
-		}
-		return a.VariantID < b.VariantID
-	})
 
 	preferredID := ""
 	if preferred != uuid.Nil {
@@ -186,6 +166,32 @@ func (s *Server) handleTrackSources(w http.ResponseWriter, r *http.Request) {
 		PreferredVariantID: preferredID,
 	})
 }
+
+// effectiveOrder is the order that decides a caller's rendition: their own
+// ranking, or the aggregate for a guest, either way carrying the reserved
+// slots at its head.
+func (s *Server) effectiveOrder(ctx context.Context, user *store.User) ([]string, error) {
+	if user != nil {
+		return s.ranking.User(ctx, user.ID)
+	}
+	return s.ranking.Aggregate(ctx)
+}
+
+// slotFor names the reserved order position a variant fills for the caller:
+// "self" when they uploaded it, "uploaded" when somebody else did, and "" for
+// a provider's own rendition. A guest has no self, so every upload they see is
+// somebody else's.
+func slotFor(variantID uuid.UUID, uploaders map[uuid.UUID]store.VariantUploader, caller uuid.UUID) string {
+	uploader, ok := uploaders[variantID]
+	if !ok {
+		return ""
+	}
+	if caller != uuid.Nil && uploader.UserID == caller {
+		return ranking.SlotSelf
+	}
+	return ranking.SlotUploaded
+}
+
 
 type variantVoteRequest struct {
 	Value *int `json:"value"`

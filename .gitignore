@@ -4,3 +4,6 @@ result-*
 dist/
 *.opus
 !testdata/**
+
+# direnv keeps generated state here; it is not source
+.direnv/

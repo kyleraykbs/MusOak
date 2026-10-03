@@ -1,18 +1,18 @@
 # Structure
 
-Go module `codeberg.org/kyleraykbs/prismusic`.
+Go module `codeberg.org/kyleraykbs/musoak`.
 
 ## Binaries
 
-- `cmd/prismusicd` — the server.
-- `cmd/prism` — the CLI. With `client.serverURL` empty it runs the server
-  in-process (`internal/cli` starts `internal/api` on loopback); `prism serve`
+- `cmd/musoakd` — the server.
+- `cmd/musoak` — the CLI. With `client.serverURL` empty it runs the server
+  in-process (`internal/cli` starts `internal/api` on loopback); `musoak serve`
   runs that same server in the foreground on `listen`.
 
 ## Server internals
 
 - `internal/config` — strict JSON config (unknown keys are errors), defaults,
-  `--config` > `$PRISMUSIC_CONFIG` > XDG path.
+  `--config` > `$MUSOAK_CONFIG` > XDG path.
 - `internal/store` — SQLite (modernc, pure Go). Migrations v1 schema, v2 votes,
   v3 media last-use. Narrow repository interfaces per aggregate.
 - `internal/provider` — the plugin boundary: `Provider`, `Caps`, registry with
@@ -40,7 +40,7 @@ Go module `codeberg.org/kyleraykbs/prismusic`.
 - `internal/api` — REST + WebSocket surface, OpenAPI document (embedded and
   served), rate limits, auth middleware. `routeTable` is the single list of
   routes and is checked against the spec by a test.
-- `internal/cli` — the prism command set, mpv IPC driver, gapless queue
+- `internal/cli` — the musoak command set, mpv IPC driver, gapless queue
   playback with prefetch.
 
 ## Public
@@ -51,6 +51,6 @@ Go module `codeberg.org/kyleraykbs/prismusic`.
 ## Support
 
 - `support/` — python helpers embedded into the binary (ytmusicapi search).
-- `nix/` — server option set shared by the modules, the prismusicd service
+- `nix/` — server option set shared by the modules, the musoakd service
   module, and the NixOS/home-manager CLI modules.
 - `agents/` — decisions, structure, terminology, notes.

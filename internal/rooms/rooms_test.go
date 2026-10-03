@@ -13,11 +13,11 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/config"
-	"codeberg.org/kyleraykbs/prismusic/internal/match"
-	"codeberg.org/kyleraykbs/prismusic/internal/provider"
-	"codeberg.org/kyleraykbs/prismusic/internal/ranking"
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/config"
+	"codeberg.org/kyleraykbs/musoak/internal/match"
+	"codeberg.org/kyleraykbs/musoak/internal/provider"
+	"codeberg.org/kyleraykbs/musoak/internal/ranking"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 // manualClock drives the room timeline in tests: nothing sleeps.
@@ -174,6 +174,54 @@ func (f *fixture) trackWithVariants(title string, specs ...variantSpec) (*store.
 	return track, variants
 }
 
+// assigned waits for the room to hand this member a rendition. Preparing runs
+// off the enqueue, so the snapshot is empty for a moment after it.
+func (f *fixture) assigned(roomID, memberID string) string {
+	f.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if current := f.get(roomID).Current; current != nil {
+			if id := current.Variants[memberID]; id != "" {
+				return id
+			}
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	f.t.Fatal("the room never assigned a rendition")
+	return ""
+}
+
+// enqueue adds a track and waits for the room to assign renditions when the
+// track is the one being prepared. Assignment runs off the lock, and a track
+// does not start without it, so a test that reports readiness has to let it
+// finish first.
+func (f *fixture) enqueue(ctx context.Context, roomID, memberID string, trackID uuid.UUID) (*Snapshot, error) {
+	f.t.Helper()
+	snapshot, err := f.m.Enqueue(ctx, roomID, memberID, trackID)
+	if err != nil {
+		return snapshot, err
+	}
+	if current := f.get(roomID).Current; current == nil || current.Item.TrackID != trackID {
+		return snapshot, nil // queued behind something else: nothing is being prepared
+	}
+	f.prepared(roomID)
+	return snapshot, nil
+}
+
+// prepared waits for the renditions of the item the room is preparing. The
+// assignment runs off the lock, and a track does not start without it.
+func (f *fixture) prepared(roomID string) {
+	f.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if current := f.get(roomID).Current; current != nil && current.Prepared {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	f.t.Fatal("the room never prepared the track")
+}
+
 func (f *fixture) current(snapshot *Snapshot) *PlaybackView {
 	f.t.Helper()
 	if snapshot.Current == nil {
@@ -249,15 +297,15 @@ func TestThreeClientsStaySynchronizedAndSkipOnVotes(t *testing.T) {
 		{id: "third", variantID: variants[2].ID, durationMs: 182_000},
 	}
 	for _, client := range clients[1:] {
-		if _, err := f.m.Join(roomID, Member{ID: client.id, Name: client.id}, ""); err != nil {
+		if _, err := f.m.Join(roomID, Member{ID: client.id, Name: client.id}, "", ""); err != nil {
 			t.Fatalf("Join: %v", err)
 		}
 	}
 
-	if _, err := f.m.Enqueue(ctx, roomID, host.ID, track1.ID); err != nil {
+	if _, err := f.enqueue(ctx, roomID, host.ID, track1.ID); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
-	if _, err := f.m.Enqueue(ctx, roomID, host.ID, track2.ID); err != nil {
+	if _, err := f.enqueue(ctx, roomID, host.ID, track2.ID); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 
@@ -287,8 +335,10 @@ func TestThreeClientsStaySynchronizedAndSkipOnVotes(t *testing.T) {
 	if want := f.clock.Now().UnixMilli(); current.StartedAtMs != want {
 		t.Errorf("startedAt = %d, want %d", current.StartedAtMs, want)
 	}
-	if current.TimelineMs != 182_000 {
-		t.Errorf("timeline = %d, want the longest rendition (182000)", current.TimelineMs)
+	// The shortest file in the room ends the song: the 179s rendition, so the
+	// member holding it never sits in silence at the end of their own copy.
+	if current.TimelineMs != 179_000 {
+		t.Errorf("timeline = %d, want the shortest rendition (179000)", current.TimelineMs)
 	}
 	if current.PositionMs != 0 {
 		t.Errorf("position = %d, want 0 at start", current.PositionMs)
@@ -297,25 +347,25 @@ func TestThreeClientsStaySynchronizedAndSkipOnVotes(t *testing.T) {
 		t.Errorf("awaiting = %v, catchingUp = %v; want nobody", current.Awaiting, current.CatchingUp)
 	}
 
-	// The 179s rendition runs out while the room still has 3s to go: that
-	// member pads with silence instead of ending the track early.
+	// The 182s rendition is the one that gets cut, at the room's end.
 	shortEndsAt := current.StartedAtMs + 179_000
 	roomEndsAt := current.StartedAtMs + current.TimelineMs
-	if shortEndsAt >= roomEndsAt {
-		t.Fatalf("expected the shortest rendition to end first: %d vs %d", shortEndsAt, roomEndsAt)
+	if shortEndsAt != roomEndsAt {
+		t.Fatalf("the room's end should be the shortest file: %d vs %d", shortEndsAt, roomEndsAt)
 	}
 
-	f.clock.Advance(179 * time.Second)
+	// Midway, and before the shortest file runs out, so what advances the room
+	// next is the vote and not the end of the track.
+	f.clock.Advance(100 * time.Second)
 	midway := f.get(roomID)
 	if midway.Current.Item.TrackID != track1.ID {
 		t.Fatal("room advanced before the timeline ended")
 	}
-	if midway.Current.PositionMs != 179_000 {
-		t.Errorf("position = %d, want 179000", midway.Current.PositionMs)
+	if midway.Current.PositionMs != 100_000 {
+		t.Errorf("position = %d, want 100000", midway.Current.PositionMs)
 	}
 
 	// A vote-driven skip: every member votes, the mean is below the threshold.
-	f.clock.Advance(time.Second)
 	scores := []int{1, 1, 2}
 	for i, client := range clients {
 		if _, err := f.m.Vote(ctx, roomID, client.id, scores[i]); err != nil {
@@ -347,7 +397,9 @@ func TestThreeClientsStaySynchronizedAndSkipOnVotes(t *testing.T) {
 		t.Errorf("mean = %v, want ~1.333", mean)
 	}
 
-	// The next track runs to its end and the room goes idle.
+	// The next track runs to its end and the room goes idle. Its renditions are
+	// assigned off the lock, and it does not start until they are.
+	f.prepared(roomID)
 	variant2 := variants2[0]
 	for _, client := range clients {
 		if _, err := f.m.Ready(roomID, client.id, track2.ID, variant2.ID, 180_000); err != nil {
@@ -357,6 +409,9 @@ func TestThreeClientsStaySynchronizedAndSkipOnVotes(t *testing.T) {
 	second := f.current(f.get(roomID))
 	if second.Item.TrackID != track2.ID || second.StartedAtMs == 0 {
 		t.Fatalf("second track did not start: %+v", second)
+	}
+	if second.TimelineMs != 180_000 {
+		t.Errorf("timeline = %d, want the only rendition (180000)", second.TimelineMs)
 	}
 	f.clock.Advance(180 * time.Second)
 
@@ -393,6 +448,144 @@ func TestThreeClientsStaySynchronizedAndSkipOnVotes(t *testing.T) {
 	}
 }
 
+// TestRoomLengthIsTheShortestFile is the room's length: the shortest file any
+// member holds. Everybody's song ends when the first of them ends, so nobody
+// sits in silence while the room plays on past the end of their own copy. A
+// longer file is cut at that point, as it always has been.
+func TestRoomLengthIsTheShortestFile(t *testing.T) {
+	f := newFixture(t, nil)
+	ctx := context.Background()
+
+	track, variants := f.trackWithVariants("Comforter",
+		variantSpec{provider: "local", providerTrackID: "a", durationMs: 254_000, downloadable: true},
+		variantSpec{provider: "ytmusic", providerTrackID: "b", durationMs: 431_000, downloadable: true},
+	)
+
+	// The member who queued the song holds the longer copy, so nothing here can
+	// be satisfied by following the queuer.
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "host", Name: "Host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomID := snapshot.ID
+	if _, err := f.m.Join(roomID, Member{ID: "second", Name: "Second"}, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.enqueue(ctx, roomID, "host", track.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.m.Ready(roomID, "host", track.ID, variants[1].ID, 431_000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.m.Ready(roomID, "second", track.ID, variants[0].ID, 254_000); err != nil {
+		t.Fatal(err)
+	}
+
+	current := f.current(f.get(roomID))
+	if current.StartedAtMs == 0 {
+		t.Fatal("the track did not start")
+	}
+	if current.TimelineMs != 254_000 {
+		t.Fatalf("timeline = %d, want the shortest file (254000), not the queuer's 431000", current.TimelineMs)
+	}
+
+	// A member switching to a shorter copy moves the end of the track, and the
+	// room says so, so every client's clock follows.
+	events, cancel := f.m.Subscribe()
+	defer cancel()
+	if _, err := f.m.Ready(roomID, "host", track.ID, variants[0].ID, 100_000); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.current(f.get(roomID)).TimelineMs; got != 100_000 {
+		t.Fatalf("timeline = %d, want the switched file (100000)", got)
+	}
+	deadline := time.After(5 * time.Second)
+	announced := false
+	for !announced {
+		select {
+		case event := <-events:
+			if event.Type != EventReadyState {
+				continue
+			}
+			data, ok := event.Data.(map[string]any)
+			if !ok {
+				continue
+			}
+			if got, ok := data["timelineMs"].(int64); ok && got == 100_000 {
+				announced = true
+			}
+		case <-deadline:
+			t.Fatal("the room never announced the new length")
+		}
+	}
+
+	// The member holding the shortest file leaves: the room has only the longer
+	// copy left, and its end moves out with them.
+	if _, err := f.m.Leave(roomID, "second"); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.current(f.get(roomID)).TimelineMs; got != 100_000 {
+		t.Fatalf("timeline = %d, want the host's switched file (100000)", got)
+	}
+}
+
+func TestRoomLengthBeforeTheQueuerMeasures(t *testing.T) {
+	f := newFixture(t, nil)
+	ctx := context.Background()
+
+	kyle := &store.User{Username: "kyle", PasswordHash: "x"}
+	if err := f.db.CreateUser(ctx, kyle); err != nil {
+		t.Fatal(err)
+	}
+	// Their own copy of the song is the shorter one, and their order says so.
+	if err := f.db.SetRanking(ctx, kyle.ID, []string{"local"}); err != nil {
+		t.Fatal(err)
+	}
+	track, variants := f.trackWithVariants("Comforter",
+		variantSpec{provider: "local", providerTrackID: "a", durationMs: 254_000, downloadable: true},
+		variantSpec{provider: "ytmusic", providerTrackID: "b", durationMs: 431_000, downloadable: true},
+	)
+
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "host", Name: "Kyle", UserID: &kyle.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomID := snapshot.ID
+	if _, err := f.m.Join(roomID, Member{ID: "second", Name: "Second"}, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.enqueue(ctx, roomID, "host", track.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// The other member's file is measured; the queuer's is not yet.
+	if _, err := f.m.Ready(roomID, "second", track.ID, variants[1].ID, 431_000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.m.Ready(roomID, "host", track.ID, variants[0].ID, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	current := f.current(f.get(roomID))
+	if current.StartedAtMs == 0 {
+		t.Fatal("the track did not start")
+	}
+	if current.TimelineMs != 254_000 {
+		t.Fatalf("timeline = %d, want the unmeasured member's rendition (254000), not the longest file", current.TimelineMs)
+	}
+	// A member who has reported is carried by the report, not by the variants
+	// map: that is what the view is telling clients.
+	var plays uuid.UUID
+	for _, report := range current.Ready {
+		if report.MemberID == "host" {
+			plays = report.VariantID
+		}
+	}
+	if plays != variants[0].ID {
+		t.Fatalf("host plays %s, want %s", plays, variants[0].ID)
+	}
+}
+
 func TestReadinessTimeoutStartsWithoutLaggards(t *testing.T) {
 	f := newFixture(t, func(cfg *config.Config) {
 		cfg.ListenTogether.ReadyTimeoutSeconds = 30
@@ -407,10 +600,10 @@ func TestReadinessTimeoutStartsWithoutLaggards(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.m.Join(snapshot.ID, Member{ID: "laggard"}, ""); err != nil {
+	if _, err := f.m.Join(snapshot.ID, Member{ID: "laggard"}, "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.m.Enqueue(ctx, snapshot.ID, "host", track.ID); err != nil {
+	if _, err := f.enqueue(ctx, snapshot.ID, "host", track.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.m.Ready(snapshot.ID, "host", track.ID, variants[0].ID, 200_000); err != nil {
@@ -490,15 +683,15 @@ func TestSkipRule(t *testing.T) {
 			members := []string{"m0"}
 			for i := 1; i < tt.members; i++ {
 				id := "m" + string(rune('0'+i))
-				if _, err := f.m.Join(snapshot.ID, Member{ID: id}, ""); err != nil {
+				if _, err := f.m.Join(snapshot.ID, Member{ID: id}, "", ""); err != nil {
 					t.Fatal(err)
 				}
 				members = append(members, id)
 			}
-			if _, err := f.m.Enqueue(ctx, snapshot.ID, "m0", track.ID); err != nil {
+			if _, err := f.enqueue(ctx, snapshot.ID, "m0", track.ID); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := f.m.Enqueue(ctx, snapshot.ID, "m0", next.ID); err != nil {
+			if _, err := f.enqueue(ctx, snapshot.ID, "m0", next.ID); err != nil {
 				t.Fatal(err)
 			}
 			for _, id := range members {
@@ -533,10 +726,10 @@ func TestHostOnlyControls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.m.Join(snapshot.ID, Member{ID: "guest"}, ""); err != nil {
+	if _, err := f.m.Join(snapshot.ID, Member{ID: "guest"}, "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.m.Enqueue(ctx, snapshot.ID, "guest", track.ID); err != nil {
+	if _, err := f.enqueue(ctx, snapshot.ID, "guest", track.ID); err != nil {
 		t.Fatalf("anyone may enqueue: %v", err)
 	}
 	if _, err := f.m.Ready(snapshot.ID, "host", track.ID, variants[0].ID, 300_000); err != nil {
@@ -600,7 +793,7 @@ func TestJoiningDuringPlaybackAssignsARendition(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.m.Enqueue(ctx, snapshot.ID, "host", track.ID); err != nil {
+	if _, err := f.enqueue(ctx, snapshot.ID, "host", track.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.m.Ready(snapshot.ID, "host", track.ID, variants[0].ID, 300_000); err != nil {
@@ -615,7 +808,7 @@ func TestJoiningDuringPlaybackAssignsARendition(t *testing.T) {
 	events, cancel := f.m.Subscribe()
 	defer cancel()
 
-	if _, err := f.m.Join(snapshot.ID, Member{ID: "late"}, ""); err != nil {
+	if _, err := f.m.Join(snapshot.ID, Member{ID: "late"}, "", ""); err != nil {
 		t.Fatalf("Join: %v", err)
 	}
 
@@ -652,6 +845,125 @@ func TestJoiningDuringPlaybackAssignsARendition(t *testing.T) {
 	}
 }
 
+// TestRoomAssignsTheMembersOwnUpload is the reserved slot rule applied where a
+// room decides a rendition. Both copies are downloadable and the provider's
+// copy is the room's only other option, so the order is what decides: a member
+// whose order puts their own upload first is handed that copy, and one whose
+// order puts it last is handed the provider's.
+func TestRoomAssignsTheMembersOwnUpload(t *testing.T) {
+	f := newFixture(t, nil)
+	ctx := context.Background()
+
+	kyle := &store.User{Username: "kyle", PasswordHash: "x"}
+	if err := f.db.CreateUser(ctx, kyle); err != nil {
+		t.Fatal(err)
+	}
+	track, variants := f.trackWithVariants("Song",
+		variantSpec{provider: "ytmusic", providerTrackID: "o1", durationMs: 180_000, downloadable: true},
+	)
+	provider := variants[0]
+
+	upload := &store.Upload{UserID: kyle.ID, Filename: "mine.opus"}
+	mine := &store.Variant{TrackID: track.ID, Title: "Song", Artists: []string{"Artist"}, DurationMs: 180_000}
+	media := &store.MediaFile{Path: "mine.opus", SHA256: "abc", DurationMs: 180_000, Bytes: 10}
+	if err := f.db.CreateUpload(ctx, upload, mine, media); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := f.db.SetRanking(ctx, kyle.ID, []string{ranking.SlotSelf, "ytmusic"}); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "kyle", UserID: &kyle.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.enqueue(ctx, snapshot.ID, "kyle", track.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.assigned(snapshot.ID, "kyle"); got != mine.ID.String() {
+		t.Fatalf("assigned %s, want the member's own upload %s", got, mine.ID)
+	}
+
+	// The same room and the same track, with the order the other way round.
+	if err := f.db.SetRanking(ctx, kyle.ID, []string{"ytmusic", ranking.SlotSelf}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := f.m.Create("party2", ControlsEveryone, "", Member{ID: "kyle", UserID: &kyle.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.enqueue(ctx, second.ID, "kyle", track.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.assigned(second.ID, "kyle"); got != provider.ID.String() {
+		t.Fatalf("assigned %s, want the provider's copy %s", got, provider.ID)
+	}
+}
+
+// TestSittingOutTakesAMemberOutOfTheRoomsLength: the room plays for as long as
+// the shortest file in it, so a member holding a short or broken copy can step
+// out. Their file stops being what the song is measured by, and the room stops
+// waiting on them, without them leaving.
+func TestSittingOutTakesAMemberOutOfTheRoomsLength(t *testing.T) {
+	f := newFixture(t, nil)
+	ctx := context.Background()
+
+	track, variants := f.trackWithVariants("Comforter",
+		variantSpec{provider: "local", providerTrackID: "a", durationMs: 254_000, downloadable: true},
+		variantSpec{provider: "ytmusic", providerTrackID: "b", durationMs: 431_000, downloadable: true},
+	)
+
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "host", Name: "Host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomID := snapshot.ID
+	if _, err := f.m.Join(roomID, Member{ID: "second", Name: "Second"}, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.enqueue(ctx, roomID, "host", track.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// The short copy's owner steps out, and is not waited for.
+	if _, err := f.m.SetOut(roomID, "second", true); err != nil {
+		t.Fatal(err)
+	}
+	out := f.get(roomID)
+	for _, member := range out.Members {
+		if member.ID == "second" && !member.Out {
+			t.Fatalf("members = %+v, want the second one marked out", out.Members)
+		}
+	}
+	if _, err := f.m.Ready(roomID, "host", track.ID, variants[1].ID, 431_000); err != nil {
+		t.Fatal(err)
+	}
+
+	current := f.current(f.get(roomID))
+	if current.StartedAtMs == 0 {
+		t.Fatal("the room waited for a member who is sitting it out")
+	}
+	if current.TimelineMs != 431_000 {
+		t.Fatalf("timeline = %d, want the long file alone (431000)", current.TimelineMs)
+	}
+	if len(current.Awaiting) != 0 {
+		t.Errorf("awaiting = %v, want nobody", current.Awaiting)
+	}
+
+	// Coming back in puts their file back into the reckoning, and the room's end
+	// moves to it.
+	if _, err := f.m.SetOut(roomID, "second", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.m.Ready(roomID, "second", track.ID, variants[0].ID, 254_000); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.current(f.get(roomID)).TimelineMs; got != 254_000 {
+		t.Fatalf("timeline = %d, want the shortest file again (254000)", got)
+	}
+}
+
 func TestRoomClosesWhenEverybodyLeaves(t *testing.T) {
 	f := newFixture(t, nil)
 
@@ -659,7 +971,7 @@ func TestRoomClosesWhenEverybodyLeaves(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.m.Join(snapshot.ID, Member{ID: "guest"}, ""); err != nil {
+	if _, err := f.m.Join(snapshot.ID, Member{ID: "guest"}, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.m.Leave(snapshot.ID, "host"); err != nil {
@@ -698,7 +1010,7 @@ func TestMasterQueueInterleavesMemberQueues(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 	roomID := snapshot.ID
-	if _, err := f.m.Join(roomID, Member{ID: "b", Name: "B"}, ""); err != nil {
+	if _, err := f.m.Join(roomID, Member{ID: "b", Name: "B"}, "", ""); err != nil {
 		t.Fatalf("Join: %v", err)
 	}
 
@@ -708,7 +1020,7 @@ func TestMasterQueueInterleavesMemberQueues(t *testing.T) {
 	}
 	enqueue := func(member, title string) {
 		f.t.Helper()
-		if _, err := f.m.Enqueue(ctx, roomID, member, tracks[title].ID); err != nil {
+		if _, err := f.enqueue(ctx, roomID, member, tracks[title].ID); err != nil {
 			f.t.Fatalf("Enqueue(%s %s): %v", member, title, err)
 		}
 	}
@@ -871,7 +1183,7 @@ func TestRoomPlaysMasterQueueInOrder(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 	roomID := snapshot.ID
-	if _, err := f.m.Join(roomID, Member{ID: "b"}, ""); err != nil {
+	if _, err := f.m.Join(roomID, Member{ID: "b"}, "", ""); err != nil {
 		t.Fatalf("Join: %v", err)
 	}
 
@@ -882,7 +1194,7 @@ func TestRoomPlaysMasterQueueInOrder(t *testing.T) {
 	for _, enqueue := range []struct{ member, title string }{
 		{"a", "A1"}, {"a", "A2"}, {"b", "B1"}, {"b", "B2"},
 	} {
-		if _, err := f.m.Enqueue(ctx, roomID, enqueue.member, tracks[enqueue.title].ID); err != nil {
+		if _, err := f.enqueue(ctx, roomID, enqueue.member, tracks[enqueue.title].ID); err != nil {
 			t.Fatalf("Enqueue(%s %s): %v", enqueue.member, enqueue.title, err)
 		}
 	}
@@ -923,13 +1235,13 @@ func TestRoomPassword(t *testing.T) {
 		t.Errorf("the snapshot leaks the password: %s", raw)
 	}
 
-	if _, err := f.m.Join(snapshot.ID, Member{ID: "guest"}, "open"); !errors.Is(err, ErrWrongPassword) {
+	if _, err := f.m.Join(snapshot.ID, Member{ID: "guest"}, "open", ""); !errors.Is(err, ErrWrongPassword) {
 		t.Errorf("join with the wrong password: err = %v, want ErrWrongPassword", err)
 	}
-	if _, err := f.m.Join(snapshot.ID, Member{ID: "guest"}, ""); !errors.Is(err, ErrWrongPassword) {
+	if _, err := f.m.Join(snapshot.ID, Member{ID: "guest"}, "", ""); !errors.Is(err, ErrWrongPassword) {
 		t.Errorf("join without a password: err = %v, want ErrWrongPassword", err)
 	}
-	joined, err := f.m.Join(snapshot.ID, Member{ID: "guest"}, "sesame")
+	joined, err := f.m.Join(snapshot.ID, Member{ID: "guest"}, "sesame", "")
 	if err != nil {
 		t.Fatalf("Join: %v", err)
 	}
@@ -944,7 +1256,7 @@ func TestRoomPassword(t *testing.T) {
 	if open.HasPassword {
 		t.Error("a room without a password must not report hasPassword")
 	}
-	if _, err := f.m.Join(open.ID, Member{ID: "guest"}, "anything"); err != nil {
+	if _, err := f.m.Join(open.ID, Member{ID: "guest"}, "anything", ""); err != nil {
 		t.Errorf("joining an open room: %v", err)
 	}
 }
@@ -963,16 +1275,16 @@ func TestMemberEventsCarryMemberCount(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 	roomID := snapshot.ID
-	if _, err := f.m.Join(roomID, Member{ID: "guest"}, ""); err != nil {
+	if _, err := f.m.Join(roomID, Member{ID: "guest"}, "", ""); err != nil {
 		t.Fatalf("Join: %v", err)
 	}
 
 	track := f.track("Song")
 	hostTrack := f.track("Host Song")
-	if _, err := f.m.Enqueue(ctx, roomID, "host", hostTrack.ID); err != nil {
+	if _, err := f.enqueue(ctx, roomID, "host", hostTrack.ID); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
-	if _, err := f.m.Enqueue(ctx, roomID, "guest", track.ID); err != nil {
+	if _, err := f.enqueue(ctx, roomID, "guest", track.ID); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if _, err := f.m.Leave(roomID, "guest"); err != nil {
@@ -1016,5 +1328,92 @@ func TestMemberEventsCarryMemberCount(t *testing.T) {
 	}
 	if left[1] != 1 {
 		t.Errorf("member_left memberCounts = %v, want one 1", left)
+	}
+}
+
+func TestDisconnectLeavesOnlyOnTheLastSocket(t *testing.T) {
+	f := newFixture(t, nil)
+	host := Member{ID: "member-1", Name: "kyle"}
+	room, err := f.m.Create("kitchen", ControlsEveryone, "", host)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	memberOf := func() bool {
+		snapshot, err := f.m.Get(room.ID)
+		if err != nil {
+			// The room closes when its last member leaves, which is also "not a
+			// member" as far as this is asking.
+			return false
+		}
+		for _, member := range snapshot.Members {
+			if member.ID == host.ID {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Two tabs on one account are one listener: closing one window must not take
+	// the member out of the room the other is still listening in.
+	f.m.Connect(host.ID)
+	f.m.Connect(host.ID)
+	f.m.Disconnect(host.ID)
+	if !memberOf() {
+		t.Fatal("a second tab was still open, so the member should still be in the room")
+	}
+
+	f.m.Disconnect(host.ID)
+	// The grace has not passed: a client that dropped its socket to reconnect
+	// is not a member who left.
+	if !memberOf() {
+		t.Fatal("a disconnect is not a leave until the grace has passed")
+	}
+
+	f.m.leaveEveryRoom(host.ID)
+	if memberOf() {
+		t.Fatal("the last socket closing should have taken the member out")
+	}
+}
+
+// A browser that joined as a guest and has since signed in is the same person.
+// The account's membership takes over the guest's queue and the guest's
+// membership goes: without that the room shows them twice, once under the name
+// their browser made up, and whatever they queued belongs to the ghost.
+func TestJoinTakesOverTheGuestMembership(t *testing.T) {
+	f := newFixture(t, nil)
+	ctx := context.Background()
+
+	room, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "host"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := f.m.Join(room.ID, Member{ID: "browser-1", Name: "web"}, "", ""); err != nil {
+		t.Fatalf("guest join: %v", err)
+	}
+	track, _ := f.trackWithVariants("Song", variantSpec{
+		provider: "ytmusic", providerTrackID: "yt-1", durationMs: 180_000, downloadable: true,
+	})
+	if _, err := f.enqueue(ctx, room.ID, "browser-1", track.ID); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	joined, err := f.m.Join(room.ID, Member{ID: "user-9", Name: "Ada"}, "", "browser-1")
+	if err != nil {
+		t.Fatalf("account join: %v", err)
+	}
+
+	if len(joined.Members) != 2 {
+		t.Fatalf("members = %+v, want the host and the account", joined.Members)
+	}
+	for _, member := range joined.Members {
+		if member.ID == "browser-1" {
+			t.Errorf("the guest membership is still there: %+v", member)
+		}
+	}
+	if mine := joined.Queues["user-9"]; len(mine) != 1 {
+		t.Errorf("the account's queue = %+v, want the song the guest queued", mine)
+	}
+	if mine := joined.Queues["browser-1"]; len(mine) != 0 {
+		t.Errorf("the guest still holds a queue: %+v", mine)
 	}
 }

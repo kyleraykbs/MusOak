@@ -1,4 +1,4 @@
-# Shared server-side option set, used by the prismusicd service module and by
+# Shared server-side option set, used by the musoakd service module and by
 # the CLI module (whose standalone mode runs the very same server).
 #
 # Keeping one definition means the daemon and the CLI can never disagree about
@@ -7,18 +7,18 @@
 rec {
   listen = lib.mkOption {
     type = lib.types.str;
-    default = ":8080";
-    example = "127.0.0.1:8080";
+    default = ":4420";
+    example = "127.0.0.1:4420";
     description = "Address the HTTP server listens on.";
   };
 
   storageDir = lib.mkOption {
     type = lib.types.nullOr lib.types.str;
     default = null;
-    example = "/var/lib/prismusicd";
+    example = "/var/lib/musoakd";
     description = ''
       Where the database and the media directory live. Null leaves the choice
-      to prismusic, which uses $XDG_DATA_HOME/prismusic.
+      to musoak, which uses $XDG_DATA_HOME/musoak.
     '';
   };
 
@@ -129,7 +129,7 @@ rec {
     default = { };
     example = {
       client = {
-        serverURL = "http://localhost:8080";
+        serverURL = "http://localhost:4420";
       };
     };
     description = ''

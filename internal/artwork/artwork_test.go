@@ -1,19 +1,24 @@
 package artwork
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 // imageServer serves a tiny PNG and counts the requests.
@@ -237,5 +242,81 @@ func TestArtworkIsOnlySetOnce(t *testing.T) {
 	}
 	if len(sources) != 2 || sources[0].Provider != "spotify" {
 		t.Fatalf("sources = %+v, want spotify first", sources)
+	}
+}
+
+// Storing an image under a different suffix must leave only the new one. The
+// file it replaced is found first when serving - the scan runs from .jpg
+// through to .img - so a gif uploaded over a png was served as the png it had
+// just replaced, which is what "it resets to the old icon" was.
+func TestStoreReplacesAnImageStoredUnderAnotherExtension(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	source := "/api/v1/artwork/user/abc"
+	gifBytes := []byte("GIF89a-not-really-a-gif")
+
+	if err := f.fetcher.Store(source, pngBytes, ".png"); err != nil {
+		t.Fatalf("Store png: %v", err)
+	}
+	if err := f.fetcher.Store(source, gifBytes, ".gif"); err != nil {
+		t.Fatalf("Store gif: %v", err)
+	}
+
+	item, err := f.fetcher.cached(ctx, source)
+	if err != nil {
+		t.Fatalf("cached: %v", err)
+	}
+	if item.ContentType != "image/gif" {
+		t.Errorf("serving found a %s, want the image stored last", item.ContentType)
+	}
+	if data, err := os.ReadFile(item.Path); err != nil || !bytes.Equal(data, gifBytes) {
+		t.Errorf("serving found the wrong bytes: %v", err)
+	}
+
+	// The file it replaced is gone, not merely outranked.
+	entries, err := os.ReadDir(f.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".png") {
+			t.Errorf("the replaced file is still there: %s", entry.Name())
+		}
+	}
+}
+
+// A pair left behind by an older build - before Store removed the file it
+// replaced - must still serve what was stored last, whatever order the suffixes
+// are looked at in. Otherwise a library full of them keeps showing the pictures
+// their owners already replaced.
+func TestCachedServesTheNewestOfAStalePair(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	source := "/api/v1/artwork/user/stale"
+	if err := os.MkdirAll(f.dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	sum := sha256.Sum256([]byte(source))
+	key := hex.EncodeToString(sum[:])
+	pngPath := filepath.Join(f.dir, key+".png")
+	gifPath := filepath.Join(f.dir, key+".gif")
+	if err := os.WriteFile(pngPath, pngBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	older := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(pngPath, older, older); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(gifPath, []byte("GIF89a-newer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	item, err := f.fetcher.cached(ctx, source)
+	if err != nil {
+		t.Fatalf("cached: %v", err)
+	}
+	if item.Path != gifPath {
+		t.Errorf("serving found %s, want the file stored last (%s)", filepath.Base(item.Path), filepath.Base(gifPath))
 	}
 }

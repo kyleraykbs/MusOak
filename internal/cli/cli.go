@@ -1,4 +1,4 @@
-// Package cli implements the prism command line client.
+// Package cli implements the musoak command line client.
 //
 // It is a plain API client: with client.serverURL set it talks to a running
 // daemon, and without it the CLI starts its own server in-process, over
@@ -20,9 +20,9 @@ import (
 	"strings"
 	"time"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/api"
-	"codeberg.org/kyleraykbs/prismusic/internal/config"
-	"codeberg.org/kyleraykbs/prismusic/pkg/client"
+	"codeberg.org/kyleraykbs/musoak/internal/api"
+	"codeberg.org/kyleraykbs/musoak/internal/config"
+	"codeberg.org/kyleraykbs/musoak/pkg/client"
 )
 
 // App is the CLI's runtime.
@@ -64,7 +64,7 @@ func New(cfg *config.Config, logger *slog.Logger, out io.Writer) (*App, error) {
 	}
 	app.embedded = embedded
 	app.client = client.New("http://"+embedded.addr, client.WithToken(state.Token), client.WithMemberID(state.MemberID))
-	logger.Debug("prism: running its own server", "address", embedded.addr)
+	logger.Debug("musoak: running its own server", "address", embedded.addr)
 	return app, nil
 }
 
@@ -122,46 +122,46 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return nil
 	default:
 		a.usage()
-		return fmt.Errorf("prism: unknown command %q", command)
+		return fmt.Errorf("musoak: unknown command %q", command)
 	}
 }
 
 func (a *App) usage() {
-	fmt.Fprint(a.out, `prism — music client for prismusicd
+	fmt.Fprint(a.out, `musoak — music client for musoakd
 
 Usage:
-  prism search <query>                 search every provider, merged per track
-  prism play                           play the local queue, gaplessly
-  prism queue add <track-id|index>     append to the queue
-  prism queue list                     show the queue
-  prism queue rm <index>               remove a queue entry
-  prism queue clear                    empty the queue
-  prism library import <file|dir>      add local files to the library
-  prism fav add|list|rm <track-id|index>
-  prism playlist create|list|show|add|rm|reorder|rename|delete|queue|play
-  prism radio <track-id|index>         station from a song, e.g. --providers ytmusic --play
-  prism album search|show|sync|queue|play <...>     albums, with sync between sources
-  prism artist search|show|sync <...>               artists, with sync between sources
-  prism providers                      list providers
-  prism providers rank <a,b,c>         set your provider preference
-  prism login <username> [--register]  log in (password on stdin or --password)
-  prism logout
-  prism me                             show who you are on this server
-  prism room create [--name N]         open a room (you host it)
-  prism room list
-  prism room join <room-id>            follow a room and play it
-  prism room queue add <track-id|index>
-  prism room vote <1-5> | skip | pause | resume | seek <ms> | now
-  prism serve                          run the server in the foreground
+  musoak search <query>                 search every provider, merged per track
+  musoak play                           play the local queue, gaplessly
+  musoak queue add <track-id|index>     append to the queue
+  musoak queue list                     show the queue
+  musoak queue rm <index>               remove a queue entry
+  musoak queue clear                    empty the queue
+  musoak library import <file|dir>      add local files to the library
+  musoak fav add|list|rm <track-id|index>
+  musoak playlist create|list|show|add|rm|reorder|rename|delete|queue|play
+  musoak radio <track-id|index>         station from a song, e.g. --providers ytmusic --play
+  musoak album search|show|sync|queue|play <...>     albums, with sync between sources
+  musoak artist search|show|sync <...>               artists, with sync between sources
+  musoak providers                      list providers
+  musoak providers rank <a,b,c>         set your provider preference
+  musoak login <username> [--register]  log in (password on stdin or --password)
+  musoak logout
+  musoak me                             show who you are on this server
+  musoak room create [--name N]         open a room (you host it)
+  musoak room list
+  musoak room join <room-id>            follow a room and play it
+  musoak room queue add <track-id|index>
+  musoak room vote <1-5> | skip | pause | resume | seek <ms> | now
+  musoak serve                          run the server in the foreground
 
 The queue, the media cache and the login token live in client.cacheDir.
-With client.serverURL empty, prism runs its own server in-process.
+With client.serverURL empty, musoak runs its own server in-process.
 `)
 }
 
 // --- embedded server -------------------------------------------------------
 
-// embeddedServer is a full prismusicd bound to loopback inside this process.
+// embeddedServer is a full musoakd bound to loopback inside this process.
 type embeddedServer struct {
 	addr   string
 	http   *http.Server
@@ -176,12 +176,12 @@ func startEmbedded(cfg *config.Config, logger *slog.Logger) (*embeddedServer, er
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		_ = server.Close()
-		return nil, fmt.Errorf("prism: bind embedded server: %w", err)
+		return nil, fmt.Errorf("musoak: bind embedded server: %w", err)
 	}
 	httpServer := &http.Server{Handler: server.Handler(), ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		if err := httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("prism: embedded server stopped", "error", err)
+			logger.Error("musoak: embedded server stopped", "error", err)
 		}
 	}()
 	return &embeddedServer{addr: listener.Addr().String(), http: httpServer, server: server}, nil
@@ -210,7 +210,7 @@ type sessionState struct {
 	// RoomID is the room this client last joined.
 	RoomID string `json:"roomId,omitempty"`
 	// MemberID is this client's room identity as a guest. Persisting it keeps
-	// "prism room create" and a later "prism room join" the same member instead
+	// "musoak room create" and a later "musoak room join" the same member instead
 	// of two.
 	MemberID string `json:"memberId,omitempty"`
 	// LastAlbums and LastArtists are the previous collection searches, so an
@@ -237,10 +237,10 @@ func loadState(dir string) (*sessionState, error) {
 		if os.IsNotExist(err) {
 			return state, nil
 		}
-		return nil, fmt.Errorf("prism: read state: %w", err)
+		return nil, fmt.Errorf("musoak: read state: %w", err)
 	}
 	if err := json.Unmarshal(raw, state); err != nil {
-		return nil, fmt.Errorf("prism: parse %s: %w", state.path, err)
+		return nil, fmt.Errorf("musoak: parse %s: %w", state.path, err)
 	}
 	state.path = filepath.Join(dir, "state.json")
 	return state, nil
@@ -253,7 +253,7 @@ func (s *sessionState) save() error {
 	}
 	tmp := s.path + ".part"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return fmt.Errorf("prism: write state: %w", err)
+		return fmt.Errorf("musoak: write state: %w", err)
 	}
 	return os.Rename(tmp, s.path)
 }
@@ -262,11 +262,11 @@ func (s *sessionState) save() error {
 // track.
 func (a *App) resolveTrack(ctx context.Context, argument string) (queueItem, error) {
 	if argument == "" {
-		return queueItem{}, errors.New("prism: a track id or search index is required")
+		return queueItem{}, errors.New("musoak: a track id or search index is required")
 	}
 	if index, err := parseIndex(argument); err == nil {
 		if index < 0 || index >= len(a.state.LastSearch) {
-			return queueItem{}, fmt.Errorf("prism: no search result %d; run \"prism search\" first", index)
+			return queueItem{}, fmt.Errorf("musoak: no search result %d; run \"musoak search\" first", index)
 		}
 		return a.state.LastSearch[index], nil
 	}

@@ -9,8 +9,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/artwork"
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/artwork"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 // artworkPath is the location clients use for an entity's image. Responses

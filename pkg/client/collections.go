@@ -138,7 +138,7 @@ func (c *Client) PlaylistFromAlbum(ctx context.Context, albumID, name string) (*
 		return nil, err
 	}
 	if len(album.Tracks) == 0 {
-		return nil, fmt.Errorf("prismusic: album %q has no tracklist yet; sync it first", album.Title)
+		return nil, fmt.Errorf("musoak: album %q has no tracklist yet; sync it first", album.Title)
 	}
 	if name == "" {
 		name = album.Title

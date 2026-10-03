@@ -44,11 +44,19 @@ const schemaV8 = `
 ALTER TABLE playlists ADD COLUMN artwork_url TEXT NOT NULL DEFAULT '';
 `
 
+// schemaV14 gives a playlist a visibility. Public is the default: a playlist is
+// something to share unless its owner says otherwise.
+const schemaV14 = `
+ALTER TABLE playlists ADD COLUMN public INTEGER NOT NULL DEFAULT 1;
+`
+
 // Playlist is one user's ordered list of tracks.
 type Playlist struct {
 	ID     uuid.UUID
 	UserID uuid.UUID
 	Name   string
+	// Public decides whether anybody else may see it, and its tracks with it.
+	Public bool
 	// ArtworkURL is where the playlist's own cover comes from. An uploaded one
 	// is recorded as "upload:<id>", which the artwork cache serves directly.
 	ArtworkURL string
@@ -76,19 +84,38 @@ func (d *DB) SetPlaylistArtwork(ctx context.Context, id uuid.UUID, url string) e
 	return mapErr(err)
 }
 
+// SetPlaylistVisibility makes a playlist public or private.
+func (d *DB) SetPlaylistVisibility(ctx context.Context, id uuid.UUID, public bool) error {
+	res, err := d.db.ExecContext(ctx,
+		`UPDATE playlists SET public = ?, updated_at = ? WHERE id = ?`,
+		public, time.Now().UnixMilli(), id.String())
+	if err != nil {
+		return mapErr(err)
+	}
+	return rowsAffectedOrNotFound(res)
+}
+
 // PlaylistRepo stores user playlists.
 type PlaylistRepo interface {
 	// SetPlaylistArtwork records the source of a playlist's own cover.
 	SetPlaylistArtwork(ctx context.Context, id uuid.UUID, url string) error
+	// SetPlaylistVisibility makes a playlist public or private.
+	SetPlaylistVisibility(ctx context.Context, id uuid.UUID, public bool) error
 	CreatePlaylist(ctx context.Context, p *Playlist) error
 	// Playlist returns a playlist; ErrNotFound covers both "missing" and
 	// "belongs to somebody else".
 	Playlist(ctx context.Context, id uuid.UUID) (*Playlist, error)
 	PlaylistsForUser(ctx context.Context, userID uuid.UUID) ([]Playlist, error)
+	// PublicPlaylistsForUser lists only what their owner made public: what
+	// another account is allowed to see.
+	PublicPlaylistsForUser(ctx context.Context, userID uuid.UUID) ([]Playlist, error)
 	RenamePlaylist(ctx context.Context, id uuid.UUID, name string) error
 	DeletePlaylist(ctx context.Context, id uuid.UUID) error
 
 	PlaylistItems(ctx context.Context, playlistID uuid.UUID) ([]PlaylistItem, error)
+	// PlaylistTrackIDs lists every track any playlist holds, once each, oldest
+	// entry first: what a background pass over the playlists walks.
+	PlaylistTrackIDs(ctx context.Context) ([]uuid.UUID, error)
 	AppendPlaylistItems(ctx context.Context, playlistID uuid.UUID, trackIDs []uuid.UUID) error
 	RemovePlaylistItem(ctx context.Context, playlistID uuid.UUID, position int) error
 	// ReorderPlaylist rearranges the existing entries; order must be a
@@ -120,9 +147,9 @@ func (d *DB) Playlist(ctx context.Context, id uuid.UUID) (*Playlist, error) {
 		created, updated int64
 	)
 	err := d.db.QueryRowContext(ctx, `
-		SELECT id, user_id, name, artwork_url, created_at, updated_at
+		SELECT id, user_id, name, artwork_url, public, created_at, updated_at
 		  FROM playlists WHERE id = ?`, id.String()).
-		Scan(&idStr, &userID, &playlist.Name, &playlist.ArtworkURL, &created, &updated)
+		Scan(&idStr, &userID, &playlist.Name, &playlist.ArtworkURL, &playlist.Public, &created, &updated)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -139,14 +166,32 @@ func (d *DB) Playlist(ctx context.Context, id uuid.UUID) (*Playlist, error) {
 
 // PlaylistsForUser lists a user's playlists, newest first, with track counts.
 func (d *DB) PlaylistsForUser(ctx context.Context, userID uuid.UUID) ([]Playlist, error) {
-	rows, err := d.db.QueryContext(ctx, `
-		SELECT p.id, p.user_id, p.name, p.artwork_url, p.created_at, p.updated_at,
+	return d.playlistsForUser(ctx, userID, false)
+}
+
+// PublicPlaylistsForUser lists only the playlists their owner made public: what
+// another account is allowed to see of them.
+func (d *DB) PublicPlaylistsForUser(ctx context.Context, userID uuid.UUID) ([]Playlist, error) {
+	return d.playlistsForUser(ctx, userID, true)
+}
+
+// playlistsForUser is the one listing query, optionally narrowed to what its
+// owner shared. The filter is a constant, so nothing about it comes from a
+// caller.
+func (d *DB) playlistsForUser(ctx context.Context, userID uuid.UUID, publicOnly bool) ([]Playlist, error) {
+	query := `
+		SELECT p.id, p.user_id, p.name, p.artwork_url, p.public, p.created_at, p.updated_at,
 		       (SELECT COUNT(*) FROM playlist_items i WHERE i.playlist_id = p.id),
 		       (SELECT COALESCE(SUM(t.duration_ms), 0) FROM playlist_items i
 			JOIN tracks t ON t.id = i.track_id WHERE i.playlist_id = p.id)
 		FROM playlists p
-		WHERE p.user_id = ?
-		ORDER BY p.created_at DESC`, userID.String())
+		WHERE p.user_id = ?`
+	if publicOnly {
+		query += ` AND p.public = 1`
+	}
+	query += ` ORDER BY p.created_at DESC`
+
+	rows, err := d.db.QueryContext(ctx, query, userID.String())
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -159,7 +204,7 @@ func (d *DB) PlaylistsForUser(ctx context.Context, userID uuid.UUID) ([]Playlist
 			idStr, userIDStr string
 			created, updated int64
 		)
-		if err := rows.Scan(&idStr, &userIDStr, &playlist.Name, &playlist.ArtworkURL,
+		if err := rows.Scan(&idStr, &userIDStr, &playlist.Name, &playlist.ArtworkURL, &playlist.Public,
 			&created, &updated, &playlist.TrackCount, &playlist.DurationMs); err != nil {
 			return nil, mapErr(err)
 		}
@@ -225,6 +270,32 @@ func (d *DB) PlaylistItems(ctx context.Context, playlistID uuid.UUID) ([]Playlis
 		items = append(items, item)
 	}
 	return items, mapErr(rows.Err())
+}
+
+// PlaylistTrackIDs lists every track any playlist holds, once each, in the
+// order the entries were made. A background pass over the playlists walks this:
+// what people have collected is what they are likely to play.
+func (d *DB) PlaylistTrackIDs(ctx context.Context) ([]uuid.UUID, error) {
+	rows, err := d.db.QueryContext(ctx, `
+		SELECT track_id FROM playlist_items GROUP BY track_id ORDER BY MIN(rowid)`)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+
+	var ids []uuid.UUID
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return nil, mapErr(err)
+		}
+		id, err := parseUUID(raw)
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, mapErr(rows.Err())
 }
 
 // AppendPlaylistItems adds tracks to the end of a playlist.

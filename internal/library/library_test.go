@@ -9,9 +9,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/match"
-	"codeberg.org/kyleraykbs/prismusic/internal/provider"
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/match"
+	"codeberg.org/kyleraykbs/musoak/internal/provider"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 // fakeProvider is a collection-capable provider with canned answers.
@@ -147,7 +147,7 @@ func TestSearchAlbumsMatchesAcrossProviders(t *testing.T) {
 	}}}
 	f := newFixture(t, ytmusic, spotify)
 
-	albums, problems, err := f.service.SearchAlbums(context.Background(), "never gonna", 10)
+	albums, problems, err := f.service.SearchAlbums(context.Background(), "never gonna", 10, nil)
 	if err != nil {
 		t.Fatalf("SearchAlbums: %v", err)
 	}
@@ -181,7 +181,7 @@ func TestSearchAlbumsKeepsDistinctRecordsApart(t *testing.T) {
 	}}
 	f := newFixture(t, ytmusic)
 
-	albums, _, err := f.service.SearchAlbums(context.Background(), "greatest hits", 10)
+	albums, _, err := f.service.SearchAlbums(context.Background(), "greatest hits", 10, nil)
 	if err != nil {
 		t.Fatalf("SearchAlbums: %v", err)
 	}
@@ -214,7 +214,7 @@ func TestSyncAlbumPullsAndMatchesTracks(t *testing.T) {
 	f := newFixture(t, ytmusic)
 	ctx := context.Background()
 
-	albums, _, err := f.service.SearchAlbums(ctx, "whenever", 5)
+	albums, _, err := f.service.SearchAlbums(ctx, "whenever", 5, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +297,7 @@ func TestSyncAlbumBringsASecondSource(t *testing.T) {
 	f := newFixture(t, ytmusic, spotify)
 	ctx := context.Background()
 
-	albums, _, err := f.service.SearchAlbums(ctx, "whenever", 5)
+	albums, _, err := f.service.SearchAlbums(ctx, "whenever", 5, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,7 +356,7 @@ func TestSyncAlbumReportsProviderFailures(t *testing.T) {
 	f := newFixture(t, broken)
 	ctx := context.Background()
 
-	albums, _, err := f.service.SearchAlbums(ctx, "album", 5)
+	albums, _, err := f.service.SearchAlbums(ctx, "album", 5, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,7 +423,7 @@ func TestSyncArtistPullsAlbumsAndTracks(t *testing.T) {
 	f := newFixture(t, ytmusic)
 	ctx := context.Background()
 
-	artists, _, err := f.service.SearchArtists(ctx, "rick astley", 5)
+	artists, _, err := f.service.SearchArtists(ctx, "rick astley", 5, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -475,7 +475,7 @@ func TestProviderSelectionIsHonoured(t *testing.T) {
 	f := newFixture(t, ytmusic, spotify)
 	ctx := context.Background()
 
-	albums, _, err := f.service.SearchAlbums(ctx, "album", 5)
+	albums, _, err := f.service.SearchAlbums(ctx, "album", 5, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -500,7 +500,7 @@ func TestSearchReportsProviderErrors(t *testing.T) {
 	}}
 	f := newFixture(t, broken, working)
 
-	albums, problems, err := f.service.SearchAlbums(context.Background(), "album", 5)
+	albums, problems, err := f.service.SearchAlbums(context.Background(), "album", 5, nil)
 	if err != nil {
 		t.Fatalf("SearchAlbums: %v", err)
 	}
@@ -527,7 +527,7 @@ func TestSearchPlaylistsRecordsEveryProviderHit(t *testing.T) {
 	}}}
 	f := newFixture(t, ytmusic, spotify)
 
-	playlists, problems, err := f.service.SearchPlaylists(context.Background(), "late night", 10)
+	playlists, problems, err := f.service.SearchPlaylists(context.Background(), "late night", 10, nil)
 	if err != nil {
 		t.Fatalf("SearchPlaylists: %v", err)
 	}
@@ -550,7 +550,7 @@ func TestSearchPlaylistsRecordsEveryProviderHit(t *testing.T) {
 	}
 
 	// Searching again finds the same rows rather than new ones.
-	again, _, err := f.service.SearchPlaylists(context.Background(), "late night", 10)
+	again, _, err := f.service.SearchPlaylists(context.Background(), "late night", 10, nil)
 	if err != nil {
 		t.Fatalf("second SearchPlaylists: %v", err)
 	}
@@ -572,7 +572,7 @@ func TestSearchPlaylistsReportsAProviderThatFailed(t *testing.T) {
 	broken := &fakeProvider{name: "spotify", searchErr: errors.New("token expired")}
 	f := newFixture(t, good, broken)
 
-	playlists, problems, err := f.service.SearchPlaylists(context.Background(), "anything", 10)
+	playlists, problems, err := f.service.SearchPlaylists(context.Background(), "anything", 10, nil)
 	if err != nil {
 		t.Fatalf("SearchPlaylists: %v", err)
 	}
@@ -611,7 +611,7 @@ func TestSyncPlaylistMatchesTracksInOrder(t *testing.T) {
 	f := newFixture(t, ytmusic)
 	ctx := context.Background()
 
-	playlists, _, err := f.service.SearchPlaylists(ctx, "late", 10)
+	playlists, _, err := f.service.SearchPlaylists(ctx, "late", 10, nil)
 	if err != nil {
 		t.Fatalf("SearchPlaylists: %v", err)
 	}
@@ -660,7 +660,7 @@ func TestSyncPlaylistRefusesAProviderThePlaylistIsNotFrom(t *testing.T) {
 	}}}
 	f := newFixture(t, ytmusic)
 
-	playlists, _, err := f.service.SearchPlaylists(context.Background(), "late", 10)
+	playlists, _, err := f.service.SearchPlaylists(context.Background(), "late", 10, nil)
 	if err != nil {
 		t.Fatalf("SearchPlaylists: %v", err)
 	}

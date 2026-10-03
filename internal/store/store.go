@@ -93,10 +93,18 @@ type User struct {
 	PasswordHash string
 	// DisplayName and IconURL are what other people see; Username is how you
 	// sign in. LastPlayedAt is what "online" is derived from.
-	DisplayName  string
-	IconURL      string
+	DisplayName string
+	IconURL     string
+	// IconVersion changes whenever the icon does. It is what makes a new
+	// picture a new URL for everybody, rather than the same one a browser will
+	// happily keep for a week.
+	IconVersion  int
 	LastPlayedAt time.Time
 	CreatedAt    time.Time
+	// SearchPlatforms is the platforms this account wants a search to ask by
+	// default. It is empty when the account never chose, in which case the
+	// client's own default applies.
+	SearchPlatforms []string
 }
 
 // Session is a bearer token. Only the hash of the token is stored.
@@ -120,6 +128,13 @@ type TrackRepo interface {
 	CandidateTracks(ctx context.Context, durationMs, toleranceMs int64, limit int) ([]Track, error)
 	// DeleteTrack removes a canonical track nothing points at any more.
 	DeleteTrack(ctx context.Context, id uuid.UUID) error
+	// SetIcon records a new picture for an account and counts the change, which
+	// is what tells every client to fetch it again.
+	SetIcon(ctx context.Context, id uuid.UUID, iconURL string) error
+	// MergeTracks joins two canonical rows for the same recording: everything
+	// pointing at drop moves to keep, and drop goes away. It is what makes a
+	// library that matched one song twice playable again.
+	MergeTracks(ctx context.Context, keep, drop uuid.UUID) error
 	// AlbumCandidates and ArtistCandidates are the prefilter for collection
 	// matching; see AlbumRepo and ArtistRepo for the rest.
 	AlbumCandidates(ctx context.Context, titleKey, artistKey string, limit int) ([]Album, error)
@@ -129,6 +144,9 @@ type TrackRepo interface {
 	SetTrackArtists(ctx context.Context, id uuid.UUID, names []string) error
 	TrackAlbums(ctx context.Context, id uuid.UUID) ([]Album, error)
 	SetTrackAlbums(ctx context.Context, id uuid.UUID, titles []string) error
+	// TrackArtwork is the cover's path on this server, empty when none is known.
+	// The room manager needs it for the queue rows, which show the artwork.
+	TrackArtwork(ctx context.Context, id uuid.UUID) (string, error)
 	EnsureArtist(ctx context.Context, name string) (uuid.UUID, error)
 	EnsureAlbum(ctx context.Context, title string, artists []string) (uuid.UUID, error)
 }
@@ -140,6 +158,13 @@ type VariantRepo interface {
 	VariantByProviderTrack(ctx context.Context, provider, providerTrackID string) (*Variant, error)
 	VariantsForTrack(ctx context.Context, trackID uuid.UUID) ([]Variant, error)
 	SetVariantTrack(ctx context.Context, variantID, trackID uuid.UUID) error
+}
+
+// SourceRepo reads what the reserved ranking slots resolve against: who
+// uploaded a track's variants, and how they have been voted on.
+type SourceRepo interface {
+	VariantUploaders(ctx context.Context, trackID uuid.UUID) (map[uuid.UUID]VariantUploader, error)
+	VariantVoteCounts(ctx context.Context, trackID uuid.UUID) (map[uuid.UUID]VariantVoteCount, error)
 }
 
 // MediaRepo maps variants to finished files on disk.
@@ -163,6 +188,9 @@ type UserRepo interface {
 	CreateUser(ctx context.Context, u *User) error
 	User(ctx context.Context, id uuid.UUID) (*User, error)
 	UserByUsername(ctx context.Context, username string) (*User, error)
+	// SetSearchPlatforms replaces the platforms a search asks by default; an
+	// empty list clears the preference.
+	SetSearchPlatforms(ctx context.Context, userID uuid.UUID, platforms []string) error
 }
 
 // SessionRepo stores bearer-token sessions.
@@ -312,6 +340,12 @@ var migrations = []migration{
 	{version: 11, name: "source votes", sql: schemaV11},
 	{version: 12, name: "profiles", sql: schemaV12},
 	{version: 13, name: "friends and notifications", sql: schemaV13},
+	{version: 14, name: "playlist visibility", sql: schemaV14},
+	{version: 15, name: "one album tracklist", sql: schemaV15},
+	{version: 16, name: "search platforms", sql: schemaV16},
+	{version: 17, name: "icon version", sql: schemaV17},
+	{version: 18, name: "play history", sql: schemaV18},
+	{version: 19, name: "lyrics", sql: schemaV19},
 }
 
 func (d *DB) migrate(ctx context.Context) error {

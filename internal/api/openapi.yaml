@@ -1,9 +1,9 @@
 openapi: 3.0.3
 info:
-  title: Prismusic API
+  title: MusOak API
   version: "2.0.0"
   description: |
-    Everything the Prismusic server does is reachable here. The CLI and the
+    Everything the MusOak server does is reachable here. The CLI and the
     Discord bot are ordinary clients: they authenticate, search, make media
     ready, join rooms and follow the event stream.
 
@@ -118,6 +118,7 @@ paths:
           in: query
           description: Results per provider (maximum 50).
           schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+        - { $ref: "#/components/parameters/SearchPlatforms" }
       responses:
         "200":
           description: |
@@ -161,6 +162,52 @@ paths:
                   variants:
                     type: array
                     items: { $ref: "#/components/schemas/Variant" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/tracks/{trackId}/lyrics:
+    get:
+      tags: [library]
+      summary: A rendition's lyrics
+      description: |
+        The words as one rendition has them: the copy's own timings when the
+        source has them, otherwise plain text. variantId names the rendition
+        the timings belong to; without it the track's own duration is used.
+        Absent lyrics, an unknown rendition or an unreachable source all answer
+        with null rather than an error.
+      operationId: getTrackLyrics
+      parameters:
+        - { $ref: "#/components/parameters/TrackID" }
+        - name: variantId
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: The rendition's lyrics, or null when there are none.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [lyrics]
+                properties:
+                  lyrics:
+                    nullable: true
+                    type: object
+                    required: [synced, plain, source, durationMs, variantId]
+                    properties:
+                      synced:
+                        type: array
+                        items:
+                          type: object
+                          required: [atMs, text]
+                          properties:
+                            atMs: { type: integer, format: int64 }
+                            text: { type: string }
+                      plain: { type: string }
+                      source: { type: string }
+                      durationMs: { type: integer, format: int64 }
+                      variantId: { type: string, format: uuid }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
 
   /api/v1/tracks/{trackId}/resolve:
@@ -355,10 +402,11 @@ paths:
               schema: { $ref: "#/components/schemas/Me" }
     patch:
       tags: [auth]
-      summary: Change your display name
+      summary: Change your account settings
       description: |
-        A plain text field on the account: the UI saves it or discards it, and
-        no password is involved.
+        The account tab's save/discard fields: the display name and the
+        platforms a search should ask by default. Each key is independent, so
+        a client may save one without touching the other.
       operationId: updateMe
       requestBody:
         required: true
@@ -366,9 +414,17 @@ paths:
           application/json:
             schema:
               type: object
-              required: [displayName]
               properties:
-                displayName: { type: string }
+                displayName:
+                  type: string
+                  description: The name other people see; omit it to leave it unchanged.
+                searchPlatforms:
+                  type: array
+                  description: |
+                    Platforms a search should ask by default. An empty list
+                    clears the preference, so the client's own default applies;
+                    omit the key to leave it unchanged.
+                  items: { type: string }
       responses:
         "200":
           description: The updated account.
@@ -468,6 +524,95 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
+  /api/v1/me/plays:
+    post:
+      tags: [account]
+      summary: Record a listen
+      description: |
+        What was played and how much of it was heard, reported when a track
+        stops. A listen shorter than five seconds is not recorded: a track
+        skipped straight away is not a listen. A caller with no account is
+        accepted and ignored, because the web reports plays either way.
+      operationId: recordPlay
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [trackId]
+              properties:
+                trackId: { type: string, format: uuid }
+                variantId: { type: string, format: uuid }
+                playedMs: { type: integer, format: int64 }
+                source:
+                  type: string
+                  description: Where the listen came from - "web", "cli", "room".
+      responses:
+        "204": { description: "Recorded, or not worth recording." }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/v1/me/history:
+    get:
+      tags: [account]
+      summary: What this account has listened to
+      operationId: getHistory
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, default: 50, maximum: 200 }
+      responses:
+        "200":
+          description: The listens, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [plays]
+                properties:
+                  plays:
+                    type: array
+                    items:
+                      type: object
+                      required: [track, variantId, playedMs, atMs]
+                      properties:
+                        track: { $ref: "#/components/schemas/Track" }
+                        variantId: { type: string, format: uuid }
+                        playedMs: { type: integer, format: int64 }
+                        atMs: { type: integer, format: int64 }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/me/stats/top:
+    get:
+      tags: [account]
+      summary: What this account plays most
+      operationId: getTopTracks
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, default: 50, maximum: 200 }
+      responses:
+        "200":
+          description: The most played, most played first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tracks]
+                properties:
+                  tracks:
+                    type: array
+                    items:
+                      type: object
+                      required: [track, plays, lastPlayedAtMs]
+                      properties:
+                        track: { $ref: "#/components/schemas/Track" }
+                        plays: { type: integer }
+                        lastPlayedAtMs: { type: integer, format: int64 }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
   /api/v1/me/playback:
     get:
       tags: [auth]
@@ -541,6 +686,11 @@ paths:
               required: [name]
               properties:
                 name: { type: string }
+                public:
+                  type: boolean
+                  description: |
+                    Who may see it. Defaults to true: a playlist is public until
+                    its owner says otherwise.
       responses:
         "201":
           description: The new playlist.
@@ -550,6 +700,147 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
+  /api/v1/me/playlists/import:
+    post:
+      tags: [auth]
+      summary: Start importing a playlist from a platform
+      description: |
+        Copies a provider's playlist into one of your own. Every track is matched
+        into the library and then resolved, so what comes out can be played here
+        rather than only described. A Spotify playlist needs no credentials: a
+        public one is read from its embed page, so a link is enough.
+
+        One track is a provider search, so this answers with a job id straight
+        away and the work carries on; poll the job for how far it has got.
+      operationId: importPlaylist
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [provider]
+              properties:
+                provider:
+                  type: string
+                  description: The platform the playlist comes from.
+                  enum: [ytmusic, spotify]
+                id:
+                  type: string
+                  description: The provider's playlist id, when it is known.
+                url:
+                  type: string
+                  description: The link the playlist was copied from.
+                name:
+                  type: string
+                  description: Overrides the playlist's own name.
+      responses:
+        "202":
+          description: The import has started.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlaylistImport" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/v1/me/playlist-imports/{jobId}:
+    get:
+      tags: [auth]
+      summary: How far a playlist import has got
+      description: |
+        `done` of `total` is the count of tracks matched so far, which is the
+        only honest measure: each one is a provider search.
+      operationId: importPlaylistStatus
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: The job as it stands.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlaylistImport" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/me/playlists/{playlistId}/archives:
+    post:
+      tags: [auth]
+      summary: Start downloading a playlist as a zip
+      description: |
+        Reads the playlist and answers with an archive to watch. The songs are
+        counted here, so a client knows how many to expect before a single byte
+        moves, and the download then reports its progress by song.
+
+        An archive is written once, straight into the download: the request for
+        the file streams every song in the playlist as an `.opus` entry, and any
+        song the server has not fetched yet is fetched on the way. That means a
+        playlist nothing has played takes as long as its downloads do, which is
+        what the progress is for.
+      operationId: startPlaylistArchive
+      parameters:
+        - name: playlistId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "202":
+          description: The archive, ready to be downloaded.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlaylistArchive" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/me/playlist-archives/{archiveId}:
+    get:
+      tags: [auth]
+      summary: How much of a playlist zip has been written
+      description: |
+        `done` of `total` songs. A song the server could not prepare is passed
+        over, so an archive can finish with `done` below `total`.
+      operationId: playlistArchiveStatus
+      parameters:
+        - name: archiveId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: The archive as it stands.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlaylistArchive" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/me/playlist-archives/{archiveId}/file:
+    get:
+      tags: [auth]
+      summary: Download a playlist zip
+      description: |
+        The archive itself, as a zip of `.opus` files named after the songs. It
+        streams as it is written, so it has no length up front and cannot be
+        resumed. One archive is downloaded once; a second reader is told to ask
+        for a new one, since writing it is the work.
+      operationId: downloadPlaylistArchive
+      parameters:
+        - name: archiveId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: The archive.
+          content:
+            application/zip:
+              schema: { type: string, format: binary }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: This archive has already been downloaded.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
   /api/v1/me/playlists/{playlistId}:
     get:
       tags: [auth]
@@ -565,7 +856,7 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
     patch:
       tags: [auth]
-      summary: Rename a playlist
+      summary: Rename a playlist, change who may see it, or both
       operationId: renamePlaylist
       parameters: [{ $ref: "#/components/parameters/PlaylistID" }]
       requestBody:
@@ -574,12 +865,18 @@ paths:
           application/json:
             schema:
               type: object
-              required: [name]
+              description: Either field may be given; at least one is needed.
               properties:
                 name: { type: string }
+                public:
+                  type: boolean
+                  description: |
+                    Public playlists are visible on the owner's page to anyone
+                    who may see that page; private ones are only ever their
+                    owner's.
       responses:
         "200":
-          description: The renamed playlist.
+          description: The updated playlist.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Playlist" }
@@ -793,6 +1090,110 @@ paths:
                     type: array
                     items: { $ref: "#/components/schemas/Upload" }
 
+  /api/v1/uploads/association:
+    get:
+      tags: [library]
+      summary: The caller's upload already associated with a song
+      description: |
+        One association per user per song: associating an upload with a song
+        replaces any association the same user already had there, and the
+        upload that loses it goes back to standing on its own. This reports the
+        upload that would be replaced, so a client can say so first. Null when
+        the caller has none on that song.
+      operationId: getUploadAssociation
+      parameters:
+        - name: trackId
+          in: query
+          required: true
+          schema: { type: string }
+          description: The canonical track to look up.
+      responses:
+        "200":
+          description: The upload the caller has there, or null.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [upload]
+                properties:
+                  upload:
+                    nullable: true
+                    allOf: [{ $ref: "#/components/schemas/Upload" }]
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/v1/uploads/duplicates:
+    get:
+      tags: [library]
+      summary: List your uploads that are the same file
+      description: |
+        Groups the caller's own uploads by the content hash of the bytes they
+        hold, keeping only hashes more than one upload shares.
+      operationId: listUploadDuplicates
+      responses:
+        "200":
+          description: The groups of identical uploads.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [groups]
+                properties:
+                  groups:
+                    type: array
+                    items:
+                      type: object
+                      required: [sha256, uploads]
+                      properties:
+                        sha256: { type: string }
+                        uploads:
+                          type: array
+                          items: { $ref: "#/components/schemas/Upload" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/uploads/associate:
+    post:
+      tags: [library]
+      summary: Associate several uploads with one song
+      description: |
+        Points each named upload at the same canonical track, or with an empty
+        associateTrackId back to a track of its own. The selected uploads keep
+        the song; the caller's other uploads already on it are released. The
+        request is refused whole if any id is not the caller's own upload.
+      operationId: associateUploads
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [uploadIds, associateTrackId]
+              properties:
+                uploadIds:
+                  type: array
+                  maxItems: 100
+                  items: { type: string }
+                associateTrackId:
+                  type: string
+                  description: The track to become a source of, or "" to dissociate each.
+      responses:
+        "200":
+          description: The uploads now associated, and any released.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [uploads, released]
+                properties:
+                  uploads:
+                    type: array
+                    items: { $ref: "#/components/schemas/Upload" }
+                  released:
+                    type: array
+                    items: { $ref: "#/components/schemas/Upload" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /api/v1/uploads/{uploadId}:
     patch:
       tags: [library]
@@ -800,6 +1201,10 @@ paths:
       description: |
         Points the upload at another canonical track, or at none. The upload's
         own title, artists and album are left as they are.
+
+        One association per user per song: a second upload associated with the
+        same song takes the association, and the earlier one stands on its own
+        again.
       operationId: patchUpload
       parameters: [{ $ref: "#/components/parameters/UploadID" }]
       requestBody:
@@ -834,6 +1239,30 @@ paths:
         "204": { description: Gone. }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /api/v1/users/{userId}/uploads:
+    get:
+      tags: [library]
+      summary: One person's uploads
+      description: |
+        The songs this person uploaded. Uploaded songs are visible to every
+        user, so this needs no account: a guest and any signed-in user see the
+        same list. An id that names no account is a 404.
+      operationId: listUserUploads
+      parameters: [{ $ref: "#/components/parameters/UserID" }]
+      responses:
+        "200":
+          description: This person's uploads.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [uploads]
+                properties:
+                  uploads:
+                    type: array
+                    items: { $ref: "#/components/schemas/Upload" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /api/v1/tracks/{trackId}/sources:
     get:
       tags: [library]
@@ -861,6 +1290,47 @@ paths:
                   preferredVariantId:
                     type: string
                     description: The saved preference, "" when there is none (always for guests).
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [library]
+      summary: Attach a provider pick to a track
+      description: |
+        Stores a rendition the caller picked from a provider's search as a
+        source of this track. The pick is deliberate, so it is never re-matched
+        against the library: it becomes a variant of exactly this track.
+        Posting the same (provider, providerTrackId) twice returns the variant
+        already stored. An unregistered provider is a 400.
+      operationId: attachTrackSource
+      parameters: [{ $ref: "#/components/parameters/TrackID" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [provider, providerTrackId, title]
+              properties:
+                provider: { type: string, example: ytmusic }
+                providerTrackId: { type: string }
+                title: { type: string }
+                artists: { type: array, items: { type: string } }
+                album: { type: string }
+                durationMs: { type: integer, format: int64 }
+                artworkUrl: { type: string }
+      responses:
+        "200":
+          description: The track's renditions, with the pick among them.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [variants]
+                properties:
+                  variants:
+                    type: array
+                    items: { $ref: "#/components/schemas/Variant" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
 
   /api/v1/variants/{variantId}/vote:
@@ -1352,6 +1822,7 @@ paths:
       parameters:
         - { $ref: "#/components/parameters/SearchQuery" }
         - { $ref: "#/components/parameters/SearchLimit" }
+        - { $ref: "#/components/parameters/SearchPlatforms" }
       responses:
         "200":
           description: Provider playlists, with the providers that failed.
@@ -1370,6 +1841,26 @@ paths:
                     items: { $ref: "#/components/schemas/ProviderProblem" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/v1/playlists/{playlistId}:
+    get:
+      tags: [library]
+      summary: A playlist anyone may see
+      description: |
+        One of your own playlists, or somebody else's that its owner made
+        public. A private playlist belonging to another account answers exactly
+        like one that does not exist, so the route never says whose playlists
+        are which.
+      operationId: getSharedPlaylist
+      parameters: [{ $ref: "#/components/parameters/PlaylistID" }]
+      responses:
+        "200":
+          description: The playlist and its entries in play order.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlaylistDetail" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
 
   /api/v1/playlists/{playlistId}/sync:
     post:
@@ -1412,6 +1903,7 @@ paths:
       parameters:
         - { $ref: "#/components/parameters/SearchQuery" }
         - { $ref: "#/components/parameters/SearchLimit" }
+        - { $ref: "#/components/parameters/SearchPlatforms" }
       responses:
         "200":
           description: Canonical albums with their provider releases.
@@ -1481,6 +1973,7 @@ paths:
       parameters:
         - { $ref: "#/components/parameters/SearchQuery" }
         - { $ref: "#/components/parameters/SearchLimit" }
+        - { $ref: "#/components/parameters/SearchPlatforms" }
       responses:
         "200":
           description: Canonical artists with their provider pages.
@@ -1874,6 +2367,41 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
+  /api/v1/rooms/{roomId}/out:
+    post:
+      tags: [rooms]
+      summary: Sit the room's track out, or come back in
+      description: |
+        The room plays for as long as the shortest file any member holds, so a
+        member whose copy is short or broken can step out of that reckoning
+        without leaving the room: they are not waited for and their file is not
+        what the song is measured by. Their own track keeps playing for them if
+        they have one.
+      operationId: setRoomOut
+      parameters: [{ $ref: "#/components/parameters/RoomID" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [out]
+              properties:
+                out: { type: boolean }
+      responses:
+        "200":
+          description: The room, with the member's new state.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [room]
+                properties:
+                  room: { $ref: "#/components/schemas/Room" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /api/v1/ws:
     get:
       tags: [rooms]
@@ -1919,6 +2447,15 @@ components:
       name: limit
       in: query
       schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+    SearchPlatforms:
+      name: providers
+      in: query
+      description: |
+        Which platforms to ask, comma-separated. Absent or empty asks every
+        enabled one. A name that is not an enabled provider is an error, so a
+        client that filtered everything out has to say so rather than silently
+        getting the lot.
+      schema: { type: string, example: "ytmusic,spotify" }
     AlbumID:
       name: albumId
       in: path
@@ -2045,6 +2582,14 @@ components:
         id: { type: string, format: uuid }
         trackId: { type: string, format: uuid }
         provider: { type: string, example: ytmusic }
+        slot:
+          type: string
+          enum: ["self", "uploaded", ""]
+          description: >-
+            The reserved account-order position this rendition fills for the
+            caller: "self" for their own upload, "uploaded" for somebody
+            else's, and "" for a provider's own rendition. A client ranks a
+            variant by its slot when it has one, and by its provider otherwise.
         providerTrackId: { type: string }
         title: { type: string }
         artists: { type: array, items: { type: string } }
@@ -2148,6 +2693,13 @@ components:
           description: |
             Path on this server for the caller's icon, empty until one is set;
             only when authenticated.
+        searchPlatforms:
+          type: array
+          description: |
+            The platforms this account wants a search to ask by default, only
+            when authenticated. Empty when unset, in which case the client
+            uses its own default.
+          items: { type: string }
         requireLogin: { type: boolean }
         registrationOpen: { type: boolean }
 
@@ -2200,6 +2752,10 @@ components:
           type: string
           format: uuid
           description: This library's id for the playlist, not the provider's.
+        providerPlaylistId:
+          type: string
+          description: The platform's own id for the playlist, which is what
+            importing it by id needs.
         provider: { type: string }
         title: { type: string }
         owner:
@@ -2364,12 +2920,68 @@ components:
         provider: { type: string }
         error: { type: string }
 
+    PlaylistArchive:
+      type: object
+      required: [archiveId, state, done, total, fileName]
+      properties:
+        archiveId: { type: string }
+        state:
+          type: string
+          enum: [ready, running, done, failed]
+          description: |
+            `ready` until a download claims it, `running` while songs are being
+            written into it, then `done` or `failed`.
+        done:
+          type: integer
+          description: How many songs have been written so far.
+        total:
+          type: integer
+          description: How many songs the playlist holds.
+        fileName:
+          type: string
+          description: What the browser should call the zip.
+        error:
+          type: string
+          description: Why it failed, when it did.
+    PlaylistImport:
+      type: object
+      required: [jobId, state]
+      properties:
+        jobId: { type: string }
+        state:
+          type: string
+          enum: [running, done, failed]
+        done:
+          type: integer
+          description: How many tracks have been matched so far.
+        total:
+          type: integer
+          description: How many the source playlist holds.
+        playable:
+          type: integer
+          description: How many of them have a rendition this server can play.
+        playlist:
+          allOf:
+            - $ref: "#/components/schemas/Playlist"
+          description: The new playlist, once the job is done.
+        error:
+          type: string
+          description: Why it failed, when it did.
     Playlist:
       type: object
-      required: [id, name, trackCount]
+      required: [id, name, trackCount, public]
       properties:
         id: { type: string, format: uuid }
         name: { type: string }
+        public:
+          type: boolean
+          description: |
+            Whether people other than the owner may see this playlist, and its
+            tracks with it. New playlists are public.
+        mine:
+          type: boolean
+          description: Whether the caller owns it, which is what decides if a
+            client offers to edit it.
         trackCount: { type: integer }
         durationMs: { type: integer, format: int64 }
         artworkUrl:
@@ -2517,6 +3129,12 @@ components:
           description: |
             Path on this server for the icon, empty until one is set; then it
             is `/api/v1/artwork/user/{userId}`.
+        searchPlatforms:
+          type: array
+          description: |
+            Platforms this account wants a search to ask by default, on its own
+            account view. Empty when unset.
+          items: { type: string }
 
     UserProfile:
       allOf:
@@ -2618,6 +3236,13 @@ components:
       properties:
         variantId: { type: string, format: uuid }
         provider: { type: string, example: ytmusic }
+        slot:
+          type: string
+          enum: ["self", "uploaded", ""]
+          description: >-
+            The reserved account-order position this source fills for the
+            caller: "self" for their own upload, "uploaded" for somebody
+            else's, and "" for a provider's own rendition.
         title: { type: string }
         artists: { type: array, items: { type: string } }
         album: { type: string }

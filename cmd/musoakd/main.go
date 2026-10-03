@@ -1,4 +1,4 @@
-// Command prismusicd runs the Prismusic server.
+// Command musoakd runs the MusOak server.
 package main
 
 import (
@@ -9,12 +9,12 @@ import (
 	"os/signal"
 	"syscall"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/api"
-	"codeberg.org/kyleraykbs/prismusic/internal/config"
+	"codeberg.org/kyleraykbs/musoak/internal/api"
+	"codeberg.org/kyleraykbs/musoak/internal/config"
 )
 
 func main() {
-	configPath := flag.String("config", "", "path to config file (default: $PRISMUSIC_CONFIG, else $XDG_CONFIG_HOME/prismusic/config.json)")
+	configPath := flag.String("config", "", "path to config file (default: $MUSOAK_CONFIG, else $XDG_CONFIG_HOME/musoak/config.json)")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))

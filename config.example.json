@@ -1,20 +1,30 @@
 {
-  "listen": ":8080",
-  "storageDir": "/home/alice/.local/share/prismusic",
+  "listen": ":4420",
+  "storageDir": "/home/alice/.local/share/musoak",
   "requireLogin": false,
   "registrationOpen": true,
   "providers": {
-    "ytmusic": { "enabled": true },
+    "ytmusic": {
+      "enabled": true,
+      "cookiesFromBrowser": "",
+      "cookiesFile": ""
+    },
+    "youtube": {
+      "enabled": true,
+      "cookiesFromBrowser": "",
+      "cookiesFile": ""
+    },
     "spotify": { "enabled": false, "clientId": "", "clientSecret": "" }
   },
   "defaultProviderOrder": ["ytmusic", "spotify"],
   "prefetchCount": 3,
   "match": { "threshold": 0.8 },
   "rateLimit": { "searchPerMinute": 30, "loginPerMinute": 10 },
-  "media": { "quotaMB": 0 },
+  "trustedProxies": [],
+  "media": { "quotaMB": 0, "prefetchPlaylists": true },
   "client": {
     "serverURL": "",
-    "cacheDir": "/home/alice/.cache/prismusic"
+    "cacheDir": "/home/alice/.cache/musoak"
   },
   "listenTogether": {
     "skipThreshold": 2.0,

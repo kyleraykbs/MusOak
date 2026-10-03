@@ -13,7 +13,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 // runFFmpeg and strconvFormat keep the test helpers free of a direct ffmpeg

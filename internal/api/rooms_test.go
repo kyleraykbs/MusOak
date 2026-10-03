@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/rooms"
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/rooms"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 func roomTitles(items []rooms.QueueItem) []string {

@@ -10,8 +10,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/config"
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/config"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 func newTestService(t *testing.T, mutate func(*config.Config)) (*Service, *store.DB) {

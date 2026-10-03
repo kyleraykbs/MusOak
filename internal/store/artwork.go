@@ -79,9 +79,21 @@ func (d *DB) setArtwork(ctx context.Context, table string, id uuid.UUID, url str
 	return nil
 }
 
-// SetTrackArtwork records a track's image if it has none.
+// SetTrackArtwork records a track's image location if it has none. The albums
+// the track is already on adopt it: an album's cover is one of its tracks'
+// covers, and the match path learns a track's cover after it has linked the
+// album, so this is the direction that actually fires.
 func (d *DB) SetTrackArtwork(ctx context.Context, id uuid.UUID, url string) error {
-	return d.setArtwork(ctx, "tracks", id, url)
+	if err := d.setArtwork(ctx, "tracks", id, url); err != nil {
+		return err
+	}
+	_, err := d.db.ExecContext(ctx, `
+		UPDATE albums SET artwork_url = COALESCE((
+			SELECT t.artwork_url FROM tracks t WHERE t.id = ? AND t.artwork_url <> ''
+		), artwork_url)
+		WHERE artwork_url = '' AND id IN (SELECT album_id FROM track_albums WHERE track_id = ?)`,
+		id.String(), id.String())
+	return mapErr(err)
 }
 
 // SetAlbumArtwork records an album's cover if it has none.

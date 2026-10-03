@@ -13,8 +13,8 @@ import (
 	"strings"
 	"testing"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/config"
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/config"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 type testClient struct {
@@ -30,6 +30,8 @@ func newHTTPTestServer(t *testing.T, mutate func(*config.Config)) *testClient {
 	cfg.StorageDir = t.TempDir()
 	cfg.Providers.YTMusic.Enabled = false
 	cfg.Providers.Spotify.Enabled = false
+	// The plain YouTube provider would reach the network; a test wants none of it.
+	cfg.Providers.YouTube.Enabled = false
 	if mutate != nil {
 		mutate(cfg)
 	}
@@ -235,13 +237,39 @@ func TestRankingFlow(t *testing.T) {
 	if len(after.Ranking) != 2 || after.Ranking[0] != "ytmusic" {
 		t.Fatalf("ranking = %+v", after)
 	}
-	if len(after.Effective) != 2 || after.Effective[0] != "ytmusic" {
+	if len(after.Effective) != 4 || after.Effective[0] != "self" || after.Effective[1] != "uploaded" || after.Effective[2] != "ytmusic" {
 		t.Fatalf("effective = %+v", after.Effective)
 	}
 
 	rec = c.do(http.MethodPut, "/api/v1/me/providers/ranking", token, map[string][]string{"ranking": {"deezer"}})
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("unknown provider = %d, want 400", rec.Code)
+	}
+}
+
+// The effective order must name every enabled provider, even when the
+// configured default order predates one - here ytmusic is enabled on the build
+// but the default was written when only spotify was.
+func TestRankingEffectiveCoversEnabledProviders(t *testing.T) {
+	c := newHTTPTestServer(t, func(cfg *config.Config) {
+		cfg.Providers.YTMusic.Enabled = true
+		cfg.DefaultProviderOrder = []string{"spotify"}
+	})
+	token := c.register("kyle", "hunter2hunter2")
+
+	rec := c.do(http.MethodGet, "/api/v1/me/providers/ranking", token, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get ranking = %d: %s", rec.Code, rec.Body.String())
+	}
+	var got rankingResponse
+	c.decode(rec, &got)
+	if len(got.Effective) != 4 || got.Effective[0] != "self" || got.Effective[1] != "uploaded" ||
+		got.Effective[2] != "spotify" || got.Effective[3] != "ytmusic" {
+		t.Fatalf("effective = %v, want [self uploaded spotify ytmusic]", got.Effective)
+	}
+	// The configured default itself keeps its order.
+	if len(got.Default) != 1 || got.Default[0] != "spotify" {
+		t.Fatalf("default = %v, want [spotify]", got.Default)
 	}
 }
 

@@ -5,10 +5,12 @@ import (
 	"encoding/base64"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/provider"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 // seedSourceVariant creates one variant of a track straight in the store.
@@ -90,6 +92,37 @@ func sourceVote(t *testing.T, c *testClient, token string, variantID uuid.UUID, 
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("vote %d = %d: %s", value, rec.Code, rec.Body.String())
 	}
+}
+
+// uploadSource stores a real upload of trackID for the token's user and
+// returns its variant id. It goes through the upload flow because that is what
+// records the uploader the reserved slots resolve against.
+func uploadSourceVariant(t *testing.T, c *testClient, token string, trackID uuid.UUID, title string) uuid.UUID {
+	t.Helper()
+	rec := c.do(http.MethodPost, "/api/v1/uploads", token, map[string]any{
+		"filename":         title + ".opus",
+		"contentType":      "audio/ogg",
+		"data":             base64.StdEncoding.EncodeToString([]byte("not actually audio: " + title)),
+		"title":            title,
+		"artists":          []string{"Uploader"},
+		"album":            "Demo",
+		"durationMs":       1000,
+		"associateTrackId": trackID.String(),
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("upload %q = %d: %s", title, rec.Code, rec.Body.String())
+	}
+	var created struct {
+		Upload struct {
+			VariantID string `json:"variantId"`
+		} `json:"upload"`
+	}
+	c.decode(rec, &created)
+	id, err := uuid.Parse(created.Upload.VariantID)
+	if err != nil {
+		t.Fatalf("upload %q variantId = %q: %v", title, created.Upload.VariantID, err)
+	}
+	return id
 }
 
 func TestTrackSourcesOrderingByVotes(t *testing.T) {
@@ -361,5 +394,238 @@ func TestTrackSourcesFillInUploader(t *testing.T) {
 	}
 	if sourceFor(t, doc, official.ID.String()).Uploader != nil {
 		t.Fatalf("provider source reported an uploader: %+v", doc.Sources)
+	}
+}
+
+// capsStubProvider is a registry entry with a fixed capability set.
+type capsStubProvider struct {
+	name string
+	caps provider.Caps
+}
+
+func (p *capsStubProvider) Name() string                { return p.name }
+func (p *capsStubProvider) Capabilities() provider.Caps { return p.caps }
+func (p *capsStubProvider) Search(context.Context, string, provider.SearchOpts) ([]provider.Track, error) {
+	return nil, nil
+}
+func (p *capsStubProvider) Download(context.Context, string, string) error { return nil }
+
+func TestAttachTrackSource(t *testing.T) {
+	c := newHTTPTestServer(t, nil)
+	c.providers.Register(&capsStubProvider{name: "ytmusic", caps: provider.Caps{Search: true, Download: true}})
+	c.providers.Register(&capsStubProvider{name: "spotify", caps: provider.Caps{Search: true}})
+	token := c.register("kyle", "hunter2hunter2")
+	track := seedTracks(t, c, "Blue Horizon")[0]
+	path := "/api/v1/tracks/" + track.ID.String() + "/sources"
+
+	pick := map[string]any{
+		"provider":        "ytmusic",
+		"providerTrackId": "abc123",
+		"title":           "Blue Horizon",
+		"artists":         []string{"The Waves"},
+		"album":           "Ocean Songs",
+		"durationMs":      213000,
+		"artworkUrl":      "https://example.test/cover.jpg",
+	}
+
+	rec := c.do(http.MethodPost, path, token, pick)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("attach = %d: %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Variants []variantResponse `json:"variants"`
+	}
+	c.decode(rec, &out)
+	if len(out.Variants) != 1 {
+		t.Fatalf("variants = %+v, want the pick", out.Variants)
+	}
+	picked := out.Variants[0]
+	if picked.Provider != "ytmusic" || picked.ProviderTrackID != "abc123" || !picked.Downloadable {
+		t.Fatalf("pick = %+v, want a downloadable ytmusic variant", picked)
+	}
+
+	// It shows up among the track's variants over HTTP...
+	rec = c.do(http.MethodGet, "/api/v1/tracks/"+track.ID.String()+"/variants", token, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("variants = %d: %s", rec.Code, rec.Body.String())
+	}
+	c.decode(rec, &out)
+	if len(out.Variants) != 1 || out.Variants[0].ID != picked.ID {
+		t.Fatalf("listed variants = %+v", out.Variants)
+	}
+
+	// ...and in the store.
+	stored, err := c.store.VariantsForTrack(context.Background(), track.ID)
+	if err != nil || len(stored) != 1 || stored[0].ProviderTrackID != "abc123" {
+		t.Fatalf("stored variants = %+v, %v", stored, err)
+	}
+
+	// The pick fills metadata the track never had.
+	if artists, err := c.store.TrackArtists(context.Background(), track.ID); err != nil || len(artists) != 1 || artists[0].Name != "The Waves" {
+		t.Fatalf("track artists = %+v, %v", artists, err)
+	}
+	if albums, err := c.store.TrackAlbums(context.Background(), track.ID); err != nil || len(albums) != 1 || albums[0].Title != "Ocean Songs" {
+		t.Fatalf("track albums = %+v, %v", albums, err)
+	}
+
+	// Posting the same pick twice is idempotent: the existing variant returns.
+	rec = c.do(http.MethodPost, path, token, pick)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("second attach = %d: %s", rec.Code, rec.Body.String())
+	}
+	c.decode(rec, &out)
+	if len(out.Variants) != 1 || out.Variants[0].ID != picked.ID {
+		t.Fatalf("second attach variants = %+v, want the same one", out.Variants)
+	}
+	if stored, _ = c.store.VariantsForTrack(context.Background(), track.ID); len(stored) != 1 {
+		t.Fatalf("store has %d variants after a repeat, want 1", len(stored))
+	}
+
+	// The provider's real capability is honoured: spotify cannot be downloaded.
+	rec = c.do(http.MethodPost, path, token, map[string]any{
+		"provider": "spotify", "providerTrackId": "sp-1", "title": "Blue Horizon",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("spotify attach = %d: %s", rec.Code, rec.Body.String())
+	}
+	c.decode(rec, &out)
+	for _, v := range out.Variants {
+		if v.Provider == "spotify" && v.Downloadable {
+			t.Errorf("spotify variant reported downloadable: %+v", v)
+		}
+	}
+
+	// An unregistered provider is a 400, an incomplete body too.
+	rec = c.do(http.MethodPost, path, token, map[string]any{
+		"provider": "nope", "providerTrackId": "x", "title": "Blue Horizon",
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("unknown provider = %d, want 400", rec.Code)
+	}
+	rec = c.do(http.MethodPost, path, token, map[string]any{"provider": "ytmusic"})
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("incomplete body = %d, want 400", rec.Code)
+	}
+
+	// A guest has no account, an unknown track does not exist.
+	rec = c.do(http.MethodPost, path, "", pick)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("guest attach = %d, want 401", rec.Code)
+	}
+	rec = c.do(http.MethodPost, "/api/v1/tracks/"+uuid.NewString()+"/sources", token, pick)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("unknown track = %d, want 404", rec.Code)
+	}
+}
+
+// variantsByID reads a track's variants and keys them by variant id.
+func variantsByID(t *testing.T, c *testClient, token string, trackID uuid.UUID) map[string]variantResponse {
+	t.Helper()
+	rec := c.do(http.MethodGet, "/api/v1/tracks/"+trackID.String()+"/variants", token, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("variants = %d: %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Variants []variantResponse `json:"variants"`
+	}
+	c.decode(rec, &out)
+	byID := make(map[string]variantResponse, len(out.Variants))
+	for _, variant := range out.Variants {
+		byID[variant.ID] = variant
+	}
+	return byID
+}
+
+// TestSourceSlotsSelfAndGuest: the self slot fills with the caller's own
+// upload, and a guest has none, so the same upload falls to the uploaded slot.
+func TestSourceSlotsSelfAndGuest(t *testing.T) {
+	c := newHTTPTestServer(t, nil)
+	kyle := c.register("kyle", "hunter2hunter2")
+	track := seedTracks(t, c, "Song")[0]
+	ytmusic := seedSourceVariant(t, c, track.ID, "ytmusic", "o1")
+	mine := uploadSourceVariant(t, c, kyle, track.ID, "Mine")
+
+	doc := fetchSources(t, c, kyle, track.ID)
+	ids := sourceVariantIDs(doc)
+	if len(ids) != 2 || ids[0] != mine.String() || ids[1] != ytmusic.ID.String() {
+		t.Fatalf("sources = %v, want the caller's upload then the provider", ids)
+	}
+	if got := sourceFor(t, doc, mine.String()).Slot; got != "self" {
+		t.Fatalf("self slot = %q, want self", got)
+	}
+	if got := sourceFor(t, doc, ytmusic.ID.String()).Slot; got != "" {
+		t.Fatalf("provider slot = %q, want empty", got)
+	}
+	if !sourceFor(t, doc, mine.String()).Default {
+		t.Fatalf("default = %v, want the caller's own upload", ids)
+	}
+
+	// Variants carry the same slot, which is what a client ranks by.
+	byID := variantsByID(t, c, kyle, track.ID)
+	if byID[mine.String()].Slot != "self" || byID[ytmusic.ID.String()].Slot != "" {
+		t.Fatalf("variant slots = %+v", byID)
+	}
+	if byID[mine.String()].Provider != "user" {
+		t.Fatalf("upload provider = %q, want user", byID[mine.String()].Provider)
+	}
+
+	// A guest never gets self: the same upload is somebody else's, and with no
+	// other upload it fills the household's uploaded slot.
+	guest := fetchSources(t, c, "", track.ID)
+	if ids = sourceVariantIDs(guest); ids[0] != mine.String() {
+		t.Fatalf("guest sources = %v, want the upload first", ids)
+	}
+	if got := sourceFor(t, guest, mine.String()).Slot; got != "uploaded" {
+		t.Fatalf("guest slot = %q, want uploaded", got)
+	}
+	guestVariants := variantsByID(t, c, "", track.ID)
+	if guestVariants[mine.String()].Slot != "uploaded" {
+		t.Fatalf("guest variant slot = %+v", guestVariants)
+	}
+}
+
+// TestSourceSlotUploadedPicksBestOtherUpload: the uploaded slot is the
+// best-liked upload by somebody else, and it is skipped when nobody else has
+// uploaded the track.
+func TestSourceSlotUploadedPicksBestOtherUpload(t *testing.T) {
+	c := newHTTPTestServer(t, nil)
+	kyle := c.register("kyle", "hunter2hunter2")
+	early := c.register("early", "hunter2hunter2")
+	late := c.register("late", "hunter2hunter2")
+	track := seedTracks(t, c, "Song")[0]
+	ytmusic := seedSourceVariant(t, c, track.ID, "ytmusic", "o1")
+	// Two uploaders, because one person has one association per song.
+	a := uploadSourceVariant(t, c, early, track.ID, "A")
+	time.Sleep(2 * time.Millisecond)
+	b := uploadSourceVariant(t, c, late, track.ID, "B")
+
+	// Tied votes: the store's own order (oldest first) fills the slot with the
+	// earlier upload; the rest fall in behind the providers.
+	doc := fetchSources(t, c, kyle, track.ID)
+	ids := sourceVariantIDs(doc)
+	if len(ids) != 3 || ids[0] != a.String() || ids[1] != ytmusic.ID.String() || ids[2] != b.String() {
+		t.Fatalf("sources = %v, want the earliest upload, the provider, then the other", ids)
+	}
+	if sourceFor(t, doc, a.String()).Slot != "uploaded" || sourceFor(t, doc, b.String()).Slot != "uploaded" {
+		t.Fatalf("upload slots = %+v", doc.Sources)
+	}
+
+	// A vote promotes the best-liked upload into the slot.
+	sourceVote(t, c, kyle, b, 1)
+	doc = fetchSources(t, c, kyle, track.ID)
+	if ids = sourceVariantIDs(doc); ids[0] != b.String() {
+		t.Fatalf("sources = %v, want the voted-up upload first", ids)
+	}
+
+	// With no other upload the slot is skipped, exactly like a provider with
+	// no rendition.
+	lonely := seedTracks(t, c, "Lonely")[0]
+	official := seedSourceVariant(t, c, lonely.ID, "ytmusic", "o2")
+	doc = fetchSources(t, c, kyle, lonely.ID)
+	if ids = sourceVariantIDs(doc); len(ids) != 1 || ids[0] != official.ID.String() {
+		t.Fatalf("sources = %v, want only the provider", ids)
+	}
+	if sourceFor(t, doc, official.ID.String()).Slot != "" {
+		t.Fatalf("provider reported a slot: %+v", doc.Sources)
 	}
 }

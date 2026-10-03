@@ -9,7 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 // presenceWindow is how recently an account must have played something to
@@ -27,6 +27,7 @@ type publicUserResponse struct {
 	Username     string          `json:"username"`
 	DisplayName  string          `json:"displayName"`
 	IconURL      string          `json:"iconUrl"`
+	IconVersion  int             `json:"iconVersion"`
 	Online       bool            `json:"online"`
 	LastPlayedAt *time.Time      `json:"lastPlayedAt"`
 	Listening    json.RawMessage `json:"listening"`
@@ -65,6 +66,7 @@ func (s *Server) buildPublicUser(ctx context.Context, viewerID uuid.UUID, u stor
 		Username:     u.Username,
 		DisplayName:  u.DisplayName,
 		IconURL:      u.IconURL,
+		IconVersion:  u.IconVersion,
 		Relationship: string(rel),
 	}
 	if !u.LastPlayedAt.IsZero() {
@@ -273,14 +275,21 @@ func (s *Server) handleUserGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	playlists, err := s.store.PlaylistsForUser(r.Context(), id)
+	// What another account's page shows is what they shared; your own shows all
+	// of them, private ones included.
+	var playlists []store.Playlist
+	if id == viewer.ID {
+		playlists, err = s.store.PlaylistsForUser(r.Context(), id)
+	} else {
+		playlists, err = s.store.PublicPlaylistsForUser(r.Context(), id)
+	}
 	if err != nil {
 		writeStoreError(w, err, "user unavailable")
 		return
 	}
 	public := make([]playlistResponse, 0, len(playlists))
 	for i := range playlists {
-		public = append(public, playlistSummary(&playlists[i]))
+		public = append(public, playlistSummary(&playlists[i], viewer.ID))
 	}
 
 	favoriteIDs, err := s.store.Favorites(r.Context(), id)
@@ -323,6 +332,15 @@ func (s *Server) handleUserGet(w http.ResponseWriter, r *http.Request) {
 		}
 		shared = append(shared, built)
 	}
+	s.withPlays(r.Context(), viewer, trackRefs(favorites))
+	s.withPlays(r.Context(), viewer, trackRefs(recent))
+	sharedRefs := make([]*trackResponse, 0, len(shared))
+	for i := range shared {
+		if shared[i].Track != nil {
+			sharedRefs = append(sharedRefs, shared[i].Track)
+		}
+	}
+	s.withPlays(r.Context(), viewer, sharedRefs)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"user":            response,
@@ -443,6 +461,16 @@ func (s *Server) handleFriendAdd(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err, "the request could not be sent")
 		return
 	}
+	// Tell them, so the bell has something to say: a request nobody notices is
+	// a request nobody answers. Failing to record it must not fail the request
+	// itself, which has already been sent.
+	if _, err := s.store.CreateNotification(r.Context(), &store.Notification{
+		UserID:   target.ID,
+		Kind:     "friend-request",
+		FromUser: &viewer.ID,
+	}); err != nil {
+		s.logger.Warn("friend request notification failed", "to", target.ID, "error", err)
+	}
 	response, err := s.buildPublicUser(r.Context(), viewer.ID, *target, store.RelPendingOut)
 	if err != nil {
 		writeStoreError(w, err, "user unavailable")
@@ -464,6 +492,15 @@ func (s *Server) handleFriendAccept(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.AcceptFriendRequest(r.Context(), viewer.ID, id); err != nil {
 		writeStoreError(w, err, "no friend request from this user")
 		return
+	}
+	// The other side asked; this is the answer. Same rule: the acceptance is
+	// what matters, and a notification that cannot be recorded does not undo it.
+	if _, err := s.store.CreateNotification(r.Context(), &store.Notification{
+		UserID:   id,
+		Kind:     "friend-accepted",
+		FromUser: &viewer.ID,
+	}); err != nil {
+		s.logger.Warn("friend accepted notification failed", "to", id, "error", err)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

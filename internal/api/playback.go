@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"time"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 // maxPlaybackStateBytes bounds what a client may store as its playback state:

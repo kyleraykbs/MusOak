@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"codeberg.org/kyleraykbs/prismusic/pkg/client"
+	"codeberg.org/kyleraykbs/musoak/pkg/client"
 )
 
 // mpvSocketTimeout bounds how long we wait for mpv to create its IPC socket.
@@ -47,10 +47,10 @@ type mpvProcess struct {
 	once   sync.Once
 }
 
-// extraMpvArgs reads PRISM_MPV_ARGS, which headless setups use to pass
+// extraMpvArgs reads MUSOAK_MPV_ARGS, which headless setups use to pass
 // "--ao=null --no-video" and similar.
 func extraMpvArgs() []string {
-	raw := strings.TrimSpace(os.Getenv("PRISM_MPV_ARGS"))
+	raw := strings.TrimSpace(os.Getenv("MUSOAK_MPV_ARGS"))
 	if raw == "" {
 		return nil
 	}
@@ -75,7 +75,7 @@ func startMpv(ctx context.Context, socketPath string, logger *slog.Logger) (*mpv
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("prism: start mpv: %w (is mpv installed?)", err)
+		return nil, fmt.Errorf("musoak: start mpv: %w (is mpv installed?)", err)
 	}
 
 	process := &mpvProcess{
@@ -94,7 +94,7 @@ func startMpv(ctx context.Context, socketPath string, logger *slog.Logger) (*mpv
 	conn, err := net.Dial("unix", socketPath)
 	if err != nil {
 		_ = cmd.Process.Kill()
-		return nil, fmt.Errorf("prism: connect to mpv: %w", err)
+		return nil, fmt.Errorf("musoak: connect to mpv: %w", err)
 	}
 	process.conn = conn
 
@@ -118,7 +118,7 @@ func waitForSocket(ctx context.Context, path string) error {
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
-	return fmt.Errorf("prism: mpv did not create its IPC socket at %s", path)
+	return fmt.Errorf("musoak: mpv did not create its IPC socket at %s", path)
 }
 
 func (m *mpvProcess) readLoop() {
@@ -181,17 +181,17 @@ func (m *mpvProcess) command(ctx context.Context, args ...any) (json.RawMessage,
 		return nil, err
 	}
 	if _, err := m.conn.Write(append(payload, '\n')); err != nil {
-		return nil, fmt.Errorf("prism: mpv write: %w", err)
+		return nil, fmt.Errorf("musoak: mpv write: %w", err)
 	}
 
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-m.closed:
-		return nil, errors.New("prism: mpv exited")
+		return nil, errors.New("musoak: mpv exited")
 	case message := <-waiter:
 		if message.Error != "" && message.Error != "success" {
-			return nil, fmt.Errorf("prism: mpv: %s", message.Error)
+			return nil, fmt.Errorf("musoak: mpv: %s", message.Error)
 		}
 		return message.Data, nil
 	}
@@ -280,7 +280,7 @@ func (m *mpvProcess) waitForEnd(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-m.closed:
-			return errors.New("prism: mpv exited")
+			return errors.New("musoak: mpv exited")
 		case event := <-m.events:
 			if event.Event == "end-file" {
 				return nil
@@ -436,7 +436,7 @@ func (m *mpvProcess) previousEntry(ctx context.Context) error {
 	return err
 }
 
-// --- queue playback (prism play) -------------------------------------------
+// --- queue playback (musoak play) -------------------------------------------
 
 // StartFile replaces the playlist with path and starts playing.
 func (s *MpvSink) StartFile(ctx context.Context, path string, positionMs int64) error {

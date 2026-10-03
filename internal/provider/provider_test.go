@@ -109,6 +109,64 @@ func TestSearchIsParallel(t *testing.T) {
 	}
 }
 
+func TestSearchSomeRunsOnlyNamedProviders(t *testing.T) {
+	reg := newTestRegistry(t, time.Second)
+	a := &fakeProvider{name: "a", caps: Caps{Search: true}, tracks: []Track{{ProviderTrackID: "a1"}}}
+	b := &fakeProvider{name: "b", caps: Caps{Search: true}, tracks: []Track{{ProviderTrackID: "b1"}}}
+	bad := &fakeProvider{name: "bad", caps: Caps{Search: true}, err: errors.New("upstream down")}
+	reg.Register(a)
+	reg.Register(b)
+	reg.Register(bad)
+
+	results := reg.SearchSome(context.Background(), []string{"b"}, "query", SearchOpts{})
+	if len(results) != 1 || results[0].Provider != "b" || len(results[0].Tracks) != 1 {
+		t.Fatalf("results = %+v, want only b's hit", results)
+	}
+	if a.calls != 0 || bad.calls != 0 || b.calls != 1 {
+		t.Errorf("calls: a=%d b=%d bad=%d, want only b searched", a.calls, b.calls, bad.calls)
+	}
+
+	// An empty selection means every provider, exactly like Search, and one
+	// provider failing still leaves the others' results usable.
+	all := reg.SearchSome(context.Background(), nil, "query", SearchOpts{})
+	if len(all) != 3 {
+		t.Fatalf("results = %d, want one per provider", len(all))
+	}
+	if all[0].Err != nil || len(all[0].Tracks) != 1 {
+		t.Errorf("all[0] = %+v, want a's hit", all[0])
+	}
+	if all[2].Provider != "bad" || all[2].Err == nil {
+		t.Errorf("all[2] = %+v, want the failing provider's error", all[2])
+	}
+
+	// A name that is not registered is not searched; callers reject it before
+	// getting here.
+	none := reg.SearchSome(context.Background(), []string{"missing"}, "query", SearchOpts{})
+	if len(none) != 0 {
+		t.Errorf("results = %+v, want none for an unregistered name", none)
+	}
+}
+
+func TestSearchSomeAppliesPerProviderTimeout(t *testing.T) {
+	reg := newTestRegistry(t, 30*time.Millisecond)
+	slow := &fakeProvider{name: "slow", caps: Caps{Search: true}, delay: 2 * time.Second}
+	fast := &fakeProvider{name: "fast", caps: Caps{Search: true}, tracks: []Track{{ProviderTrackID: "x"}}}
+	reg.Register(slow)
+	reg.Register(fast)
+
+	start := time.Now()
+	results := reg.SearchSome(context.Background(), []string{"slow", "fast"}, "query", SearchOpts{})
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("search took %v; the slow provider was not cut off", elapsed)
+	}
+	if !errors.Is(results[0].Err, context.DeadlineExceeded) {
+		t.Errorf("slow provider err = %v, want deadline exceeded", results[0].Err)
+	}
+	if results[1].Err != nil || len(results[1].Tracks) != 1 {
+		t.Errorf("fast provider = %+v, want its results", results[1])
+	}
+}
+
 func TestDownloadRouting(t *testing.T) {
 	reg := newTestRegistry(t, time.Second)
 	dl := &fakeProvider{name: "ytmusic", caps: Caps{Search: true, Download: true}}

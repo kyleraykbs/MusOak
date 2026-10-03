@@ -1,4 +1,4 @@
-// Command prism is the Prismusic client: search, queue, play and listen
+// Command musoak is the MusOak client: search, queue, play and listen
 // together. With client.serverURL empty it runs its own server in-process.
 package main
 
@@ -12,14 +12,14 @@ import (
 	"os/signal"
 	"syscall"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/cli"
-	"codeberg.org/kyleraykbs/prismusic/internal/config"
+	"codeberg.org/kyleraykbs/musoak/internal/cli"
+	"codeberg.org/kyleraykbs/musoak/internal/config"
 )
 
 func main() {
-	configPath := flag.String("config", "", "path to config file (default: $PRISMUSIC_CONFIG, else $XDG_CONFIG_HOME/prismusic/config.json)")
+	configPath := flag.String("config", "", "path to config file (default: $MUSOAK_CONFIG, else $XDG_CONFIG_HOME/musoak/config.json)")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: prism [--config FILE] <command> [arguments]\n\n")
+		fmt.Fprintf(os.Stderr, "usage: musoak [--config FILE] <command> [arguments]\n\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -39,7 +39,7 @@ func main() {
 	}
 	defer func() {
 		if err := app.Close(); err != nil {
-			logger.Error("prism: shutdown", "error", err)
+			logger.Error("musoak: shutdown", "error", err)
 		}
 	}()
 

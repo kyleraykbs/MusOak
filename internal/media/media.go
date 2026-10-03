@@ -23,9 +23,9 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/sync/singleflight"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/ffmpeg"
-	"codeberg.org/kyleraykbs/prismusic/internal/provider"
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/ffmpeg"
+	"codeberg.org/kyleraykbs/musoak/internal/provider"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 // LocalProvider is the provider id for files from the local library.

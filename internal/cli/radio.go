@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"codeberg.org/kyleraykbs/prismusic/pkg/client"
+	"codeberg.org/kyleraykbs/musoak/pkg/client"
 )
 
 // cmdRadio starts a station from a song and optionally plays it.
@@ -23,7 +23,7 @@ func (a *App) cmdRadio(ctx context.Context, args []string) error {
 		switch argument := args[i]; {
 		case argument == "--providers" || argument == "-providers":
 			if i+1 >= len(args) {
-				return errors.New("prism: --providers needs a comma separated list")
+				return errors.New("musoak: --providers needs a comma separated list")
 			}
 			providerList = args[i+1]
 			i++
@@ -31,10 +31,10 @@ func (a *App) cmdRadio(ctx context.Context, args []string) error {
 			providerList = strings.TrimPrefix(argument, "--providers=")
 		case argument == "--length":
 			if i+1 >= len(args) {
-				return errors.New("prism: --length needs a number")
+				return errors.New("musoak: --length needs a number")
 			}
 			if _, err := fmt.Sscanf(args[i+1], "%d", &length); err != nil {
-				return fmt.Errorf("prism: %q is not a length", args[i+1])
+				return fmt.Errorf("musoak: %q is not a length", args[i+1])
 			}
 			i++
 		case argument == "--play":
@@ -46,15 +46,15 @@ func (a *App) cmdRadio(ctx context.Context, args []string) error {
 		case argument == "--no-save":
 			save = false
 		case strings.HasPrefix(argument, "-"):
-			return fmt.Errorf("prism: unknown radio option %q", argument)
+			return fmt.Errorf("musoak: unknown radio option %q", argument)
 		case seed == "":
 			seed = argument
 		default:
-			return fmt.Errorf("prism: unexpected radio argument %q", argument)
+			return fmt.Errorf("musoak: unexpected radio argument %q", argument)
 		}
 	}
 	if seed == "" {
-		return errors.New("prism: usage: prism radio <track-id|index> [--providers a,b] [--length N] [--play|--room] [--no-save]")
+		return errors.New("musoak: usage: musoak radio <track-id|index> [--providers a,b] [--length N] [--play|--room] [--no-save]")
 	}
 
 	item, err := a.resolveTrack(ctx, seed)

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"codeberg.org/kyleraykbs/prismusic/pkg/client"
+	"codeberg.org/kyleraykbs/musoak/pkg/client"
 )
 
 func decodeAll(t *testing.T, input string) []key {

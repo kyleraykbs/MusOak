@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,8 +28,8 @@ func TestLoadExample(t *testing.T) {
 	if err != nil {
 		t.Fatalf("config.example.json must load: %v", err)
 	}
-	if cfg.Listen != ":8080" {
-		t.Errorf("listen = %q, want :8080", cfg.Listen)
+	if cfg.Listen != ":4420" {
+		t.Errorf("listen = %q, want :4420", cfg.Listen)
 	}
 	if cfg.StorageDir == "" {
 		t.Error("storageDir must be filled")
@@ -45,8 +46,24 @@ func TestLoadExample(t *testing.T) {
 	if cfg.RateLimit.SearchPerMinute != 30 || cfg.RateLimit.LoginPerMinute != 10 {
 		t.Errorf("rateLimit = %+v", cfg.RateLimit)
 	}
-	if !cfg.Providers.YTMusic.Enabled || cfg.Providers.Spotify.Enabled {
+	if !cfg.Providers.YTMusic.Enabled || !cfg.Providers.YouTube.Enabled || cfg.Providers.Spotify.Enabled {
 		t.Errorf("unexpected provider enablement: %+v", cfg.Providers)
+	}
+}
+
+func TestLoadEnablesYouTube(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `{
+		"providers": {"youtube": {"enabled": true, "cookiesFromBrowser": "firefox"}},
+		"defaultProviderOrder": ["ytmusic", "youtube", "spotify"]
+	}`))
+	if err != nil {
+		t.Fatalf("youtube is opt-in but must be a first-class provider: %v", err)
+	}
+	if !cfg.Providers.YouTube.Enabled {
+		t.Error("youtube should be enabled")
+	}
+	if cfg.Providers.YouTube.CookiesFromBrowser != "firefox" {
+		t.Errorf("cookiesFromBrowser = %q", cfg.Providers.YouTube.CookiesFromBrowser)
 	}
 }
 
@@ -75,6 +92,30 @@ func TestLoadMissingDefaultPathUsesDefaults(t *testing.T) {
 	}
 	if cfg.Listen != DefaultListen {
 		t.Errorf("listen = %q", cfg.Listen)
+	}
+}
+
+func TestLoadRejectsBadTrustedProxy(t *testing.T) {
+	_, err := Load(writeConfig(t, `{"trustedProxies": ["127.0.0.1/32", "nonsense"]}`))
+	if err == nil || !strings.Contains(err.Error(), "nonsense") {
+		t.Fatalf("want an error naming the bad CIDR, got %v", err)
+	}
+}
+
+func TestLoadParsesTrustedProxies(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `{"trustedProxies": ["127.0.0.1/32", "10.0.0.0/8"]}`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	nets, err := cfg.TrustedProxyNets()
+	if err != nil {
+		t.Fatalf("TrustedProxyNets: %v", err)
+	}
+	if len(nets) != 2 {
+		t.Fatalf("got %d networks, want 2", len(nets))
+	}
+	if !nets[0].Contains(net.ParseIP("127.0.0.1")) || !nets[1].Contains(net.ParseIP("10.1.2.3")) {
+		t.Fatalf("unexpected networks: %v", nets)
 	}
 }
 
@@ -128,6 +169,7 @@ func TestValidateErrors(t *testing.T) {
 		{"negative search limit", func(c *Config) { c.RateLimit.SearchPerMinute = -1 }, "rateLimit.searchPerMinute"},
 		{"negative login limit", func(c *Config) { c.RateLimit.LoginPerMinute = -1 }, "rateLimit.loginPerMinute"},
 		{"negative quota", func(c *Config) { c.Media.QuotaMB = -5 }, "media.quotaMB"},
+		{"bad trusted proxy", func(c *Config) { c.TrustedProxies = []string{"10.0.0.0/33"} }, "10.0.0.0/33"},
 		{"empty order", func(c *Config) { c.DefaultProviderOrder = nil }, "must not be empty"},
 		{"unknown order", func(c *Config) { c.DefaultProviderOrder = []string{"deezer"} }, "unknown provider"},
 		{"duplicate order", func(c *Config) { c.DefaultProviderOrder = []string{"ytmusic", "ytmusic"} }, "duplicate provider"},

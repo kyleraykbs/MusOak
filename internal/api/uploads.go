@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,9 +15,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/artwork"
-	"codeberg.org/kyleraykbs/prismusic/internal/ffmpeg"
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/artwork"
+	"codeberg.org/kyleraykbs/musoak/internal/ffmpeg"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 // uploadCreateRequest is a song upload: the audio, base64, with the metadata
@@ -76,21 +77,38 @@ const (
 	maxUploadBodyBytes = 96 << 20
 )
 
-// decodeUploadJSON reads the upload envelope, which carries the audio and so
-// is far bigger than any other body on the server.
-func decodeUploadJSON(w http.ResponseWriter, r *http.Request, v any) bool {
-	body := http.MaxBytesReader(w, r.Body, maxUploadBodyBytes)
+// maxImageBodyBytes bounds the envelope around an image: the decoded cap the
+// handlers enforce (maxArtworkBytes), base64's third again, and room for the
+// metadata beside it. An image endpoint that read through the small-body
+// decoder instead would refuse a perfectly good photograph.
+const maxImageBodyBytes = (maxArtworkBytes/3)*4 + (1 << 20)
+
+// decodeBoundedJSON reads a JSON body no larger than limit into v, answering
+// 413 with tooLarge when the body runs past it. Everything else is a 400.
+func decodeBoundedJSON(w http.ResponseWriter, r *http.Request, v any, limit int64, tooLarge string) bool {
+	body := http.MaxBytesReader(w, r.Body, limit)
 	err := json.NewDecoder(body).Decode(v)
 	if err == nil {
 		return true
 	}
-	var tooLarge *http.MaxBytesError
-	if errors.As(err, &tooLarge) {
-		writeError(w, http.StatusRequestEntityTooLarge, "the upload is too large")
+	var past *http.MaxBytesError
+	if errors.As(err, &past) {
+		writeError(w, http.StatusRequestEntityTooLarge, tooLarge)
 		return false
 	}
 	writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 	return false
+}
+
+// decodeUploadJSON reads the upload envelope, which carries the audio and so
+// is far bigger than any other body on the server.
+func decodeUploadJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+	return decodeBoundedJSON(w, r, v, maxUploadBodyBytes, "the upload is too large")
+}
+
+// decodeImageJSON reads an image envelope: an icon, or a playlist cover.
+func decodeImageJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+	return decodeBoundedJSON(w, r, v, maxImageBodyBytes, "the image is too large: 8 MB or less")
 }
 
 // handleUploadCreate stores a song somebody uploaded. Every registered user
@@ -146,6 +164,21 @@ func (s *Server) handleUploadCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(data) > maxUploadBytes {
 		writeError(w, http.StatusRequestEntityTooLarge, "the upload is too large")
+		return
+	}
+
+	// The bytes are hashed before anything reaches disk: a second copy of a
+	// file already stored is refused rather than written, because two variants
+	// sharing one media path would let the LRU eviction delete a file another
+	// variant still needs.
+	sum := sha256Hex(data)
+	switch existing, err := s.store.MediaFileBySHA256(r.Context(), sum); {
+	case err == nil:
+		writeError(w, http.StatusConflict,
+			fmt.Sprintf("that file is already uploaded as %q", s.duplicateTitle(r.Context(), existing.VariantID)))
+		return
+	case !errors.Is(err, store.ErrNotFound):
+		writeStoreError(w, err, "the upload could not be checked")
 		return
 	}
 
@@ -217,7 +250,7 @@ func (s *Server) handleUploadCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	file := &store.MediaFile{
 		Path:       path,
-		SHA256:     sha256Hex(data),
+		SHA256:     sum,
 		DurationMs: durationMs,
 		Bytes:      int64(len(data)),
 	}
@@ -226,6 +259,9 @@ func (s *Server) handleUploadCreate(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err, "the upload could not be stored")
 		return
 	}
+	// An upload that joins a song takes the association: the user's other upload
+	// of the same song stands on its own again.
+	s.releaseOtherAssociations(r.Context(), user.ID, target.ID, upload.ID)
 
 	s.storeUploadCover(r.Context(), upload.ID, target.ID, cover, coverExt)
 
@@ -235,6 +271,19 @@ func (s *Server) handleUploadCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"upload": s.uploadResponseFor(r.Context(), created)})
+}
+
+// duplicateTitle names the stored rendition whose bytes matched, so a refused
+// upload can say what it duplicates: the upload's own title when the match is
+// an upload, otherwise the variant's title.
+func (s *Server) duplicateTitle(ctx context.Context, variantID uuid.UUID) string {
+	if upload, err := s.store.UploadByVariant(ctx, variantID); err == nil {
+		return upload.Variant.Title
+	}
+	if variant, err := s.store.Variant(ctx, variantID); err == nil {
+		return variant.Title
+	}
+	return "another song"
 }
 
 // decodeUploadCover reads the optional cover. ok is false and the request is
@@ -392,6 +441,26 @@ func (s *Server) handleUploadListAll(w http.ResponseWriter, r *http.Request) {
 	s.writeUploads(w, r, uploads)
 }
 
+// handleUserUploads lists the uploads of the user named in the path. Uploaded
+// songs are visible to every user, so this needs no account: a guest and any
+// signed-in user see the same list. An id that names no account is a 404.
+func (s *Server) handleUserUploads(w http.ResponseWriter, r *http.Request) {
+	id, ok := userIDFromPath(w, r)
+	if !ok {
+		return
+	}
+	if _, err := s.store.User(r.Context(), id); err != nil {
+		writeStoreError(w, err, "user not found")
+		return
+	}
+	uploads, err := s.store.UploadsForUser(r.Context(), id)
+	if err != nil {
+		writeStoreError(w, err, "uploads unavailable")
+		return
+	}
+	s.writeUploads(w, r, uploads)
+}
+
 // ownedUpload returns the upload when it is the caller's. Somebody else's
 // upload is reported as missing, so the endpoint does not leak who uploaded
 // what.
@@ -440,18 +509,10 @@ func (s *Server) handleUploadPatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	left := upload.Variant.TrackID
+	// No Association (an empty target) gives the upload a fresh track of its
+	// own; otherwise it joins the named one.
 	var target *store.Track
-	if strings.TrimSpace(*req.AssociateTrackID) == "" {
-		// No Association: the upload stands alone again, on a fresh track
-		// credited from its own metadata.
-		created, err := s.ownTrack(r.Context(), upload.Variant.Title, upload.Variant.Artists, upload.Variant.Album, upload.Variant.DurationMs)
-		if err != nil {
-			writeStoreError(w, err, "the association could not be changed")
-			return
-		}
-		target = created
-	} else {
+	if strings.TrimSpace(*req.AssociateTrackID) != "" {
 		found, ok := s.associationTarget(w, r, *req.AssociateTrackID)
 		if !ok {
 			return
@@ -459,11 +520,15 @@ func (s *Server) handleUploadPatch(w http.ResponseWriter, r *http.Request) {
 		target = found
 	}
 
-	if err := s.store.SetUploadTrack(r.Context(), upload.ID, target.ID); err != nil {
+	if err := s.setUploadAssociation(r.Context(), upload, target); err != nil {
 		writeStoreError(w, err, "the association could not be changed")
 		return
 	}
-	s.dropEmptyTrack(r.Context(), left)
+	if target != nil {
+		// One association per user per song: any other upload of theirs on
+		// this track loses it, standing on its own again.
+		s.releaseOtherAssociations(r.Context(), user.ID, target.ID, upload.ID)
+	}
 
 	updated, err := s.store.Upload(r.Context(), upload.ID)
 	if err != nil {
@@ -471,6 +536,97 @@ func (s *Server) handleUploadPatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"upload": s.uploadResponseFor(r.Context(), updated)})
+}
+
+// setUploadAssociation moves one upload onto target and drops the track it left
+// once that track has no rendition of its own. A nil target means No
+// Association: the upload stands on a fresh track credited from its metadata.
+// The one-association-per-song rule is not applied here; the caller does that
+// once it knows every upload taking part.
+func (s *Server) setUploadAssociation(ctx context.Context, upload *store.Upload, target *store.Track) error {
+	left := upload.Variant.TrackID
+	if target == nil {
+		own, err := s.ownTrack(ctx, upload.Variant.Title, upload.Variant.Artists, upload.Variant.Album, upload.Variant.DurationMs)
+		if err != nil {
+			return err
+		}
+		target = own
+	}
+	if err := s.store.SetUploadTrack(ctx, upload.ID, target.ID); err != nil {
+		return err
+	}
+	s.dropEmptyTrack(ctx, left)
+	return nil
+}
+
+// releaseOtherAssociations enforces one association per user per song: the
+// caller's other uploads on the same canonical track lose theirs and stand on
+// their own again. keep names the uploads taking the association and already on
+// the track when this runs; a bulk association passes its whole selection, so
+// the selected uploads keep the song together and only the ones left out are
+// released. Like dropEmptyTrack this is cleanup after the write the caller
+// asked for, so a failure is logged rather than unwound. The uploads that lost
+// their association are returned, already re-read with the track they moved to.
+func (s *Server) releaseOtherAssociations(ctx context.Context, userID, trackID uuid.UUID, keep ...uuid.UUID) []store.Upload {
+	keeping := make(map[uuid.UUID]struct{}, len(keep))
+	for _, id := range keep {
+		keeping[id] = struct{}{}
+	}
+	uploads, err := s.store.UploadsForUser(ctx, userID)
+	if err != nil {
+		s.logger.Warn("upload: could not read uploads to release", "user", userID, "error", err)
+		return nil
+	}
+	var released []store.Upload
+	for _, other := range uploads {
+		if _, ok := keeping[other.ID]; ok || other.Variant.TrackID != trackID {
+			continue
+		}
+		own, err := s.ownTrack(ctx, other.Variant.Title, other.Variant.Artists, other.Variant.Album, other.Variant.DurationMs)
+		if err != nil {
+			s.logger.Warn("upload: could not stand a replaced upload on its own track", "upload", other.ID, "error", err)
+			continue
+		}
+		if err := s.store.SetUploadTrack(ctx, other.ID, own.ID); err != nil {
+			s.logger.Warn("upload: could not release a replaced association", "upload", other.ID, "error", err)
+			continue
+		}
+		updated, err := s.store.Upload(ctx, other.ID)
+		if err != nil {
+			s.logger.Warn("upload: could not re-read a released upload", "upload", other.ID, "error", err)
+			continue
+		}
+		released = append(released, *updated)
+	}
+	return released
+}
+
+// handleUploadAssociation reports the upload the caller already has associated
+// with a song. That is what a new association replaces, so the dialog can say so
+// before it happens. Null when the caller has none there.
+func (s *Server) handleUploadAssociation(w http.ResponseWriter, r *http.Request) {
+	user, ok := s.requireUser(w, r)
+	if !ok {
+		return
+	}
+	trackID, err := uuid.Parse(strings.TrimSpace(r.URL.Query().Get("trackId")))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid trackId")
+		return
+	}
+	uploads, err := s.store.UploadsForUser(r.Context(), user.ID)
+	if err != nil {
+		writeStoreError(w, err, "the association could not be read")
+		return
+	}
+	for i := range uploads {
+		if uploads[i].Variant.TrackID != trackID {
+			continue
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"upload": s.uploadResponseFor(r.Context(), &uploads[i])})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"upload": nil})
 }
 
 // handleUploadDelete removes an upload: its rows, its bytes, and the canonical

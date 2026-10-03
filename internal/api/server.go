@@ -14,19 +14,22 @@ import (
 	"strings"
 	"time"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/artwork"
-	"codeberg.org/kyleraykbs/prismusic/internal/auth"
-	"codeberg.org/kyleraykbs/prismusic/internal/config"
-	"codeberg.org/kyleraykbs/prismusic/internal/library"
-	"codeberg.org/kyleraykbs/prismusic/internal/match"
-	"codeberg.org/kyleraykbs/prismusic/internal/media"
-	"codeberg.org/kyleraykbs/prismusic/internal/provider"
-	"codeberg.org/kyleraykbs/prismusic/internal/provider/spotify"
-	"codeberg.org/kyleraykbs/prismusic/internal/provider/ytmusic"
-	"codeberg.org/kyleraykbs/prismusic/internal/radio"
-	"codeberg.org/kyleraykbs/prismusic/internal/ranking"
-	"codeberg.org/kyleraykbs/prismusic/internal/rooms"
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/artwork"
+	"codeberg.org/kyleraykbs/musoak/internal/auth"
+	"codeberg.org/kyleraykbs/musoak/internal/config"
+	"codeberg.org/kyleraykbs/musoak/internal/library"
+	"codeberg.org/kyleraykbs/musoak/internal/lyrics"
+	"codeberg.org/kyleraykbs/musoak/internal/match"
+	"codeberg.org/kyleraykbs/musoak/internal/media"
+	"codeberg.org/kyleraykbs/musoak/internal/prefetch"
+	"codeberg.org/kyleraykbs/musoak/internal/provider"
+	"codeberg.org/kyleraykbs/musoak/internal/provider/spotify"
+	"codeberg.org/kyleraykbs/musoak/internal/provider/youtube"
+	"codeberg.org/kyleraykbs/musoak/internal/provider/ytmusic"
+	"codeberg.org/kyleraykbs/musoak/internal/radio"
+	"codeberg.org/kyleraykbs/musoak/internal/ranking"
+	"codeberg.org/kyleraykbs/musoak/internal/rooms"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 // ShutdownTimeout bounds graceful shutdown after the context is cancelled.
@@ -51,15 +54,29 @@ type Server struct {
 	radio     *radio.Service
 	library   *library.Service
 	artwork   *artwork.Fetcher
+	lyrics    *lyrics.Service
 
 	searchLimiter *limiter
 	loginLimiter  *limiter
+
+	// imports and archives are the long jobs a client watches: playlists being
+	// imported, and playlists being written out as zips.
+	imports  *jobRegistry[playlistImport]
+	archives *jobRegistry[playlistArchive]
+
+	// prefetcher keeps the playlists downloaded; nil when it is turned off.
+	prefetcher *prefetch.Prefetcher
 }
 
 // New builds the server: it opens the store and instantiates the enabled
 // providers and the media pipeline.
 func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
-	db, err := store.Open(filepath.Join(cfg.StorageDir, "prismusic.db"))
+	trustedProxies, err := cfg.TrustedProxyNets()
+	if err != nil {
+		return nil, err
+	}
+
+	db, err := store.Open(filepath.Join(cfg.StorageDir, "musoak.db"))
 	if err != nil {
 		return nil, err
 	}
@@ -80,13 +97,24 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 	s.radio = radio.New(db, s.providers, s.matcher, logger)
 	s.library = library.New(db, s.providers, s.matcher, logger)
 	s.artwork = artwork.New(filepath.Join(cfg.StorageDir, "artwork"), db, logger)
+	s.lyrics = lyrics.New(db, lyrics.NewLRCLIB(), logger)
 
 	// One search burst may be as wide as a handful of keystrokes; login bursts
 	// stay tight because each attempt costs an argon2id hash.
-	s.searchLimiter = newLimiter(cfg.RateLimit.SearchPerMinute, 10)
-	s.loginLimiter = newLimiter(cfg.RateLimit.LoginPerMinute, 3)
+	s.searchLimiter = newLimiter(cfg.RateLimit.SearchPerMinute, 10, trustedProxies...)
+	s.loginLimiter = newLimiter(cfg.RateLimit.LoginPerMinute, 3, trustedProxies...)
+
+	// Jobs are remembered for a while after they end, so a client that polls
+	// every second still sees how one turned out.
+	s.imports = newJobRegistry(importTTL, func(job *playlistImport) time.Time { return job.ended })
+	s.archives = newJobRegistry(archiveTTL, func(archive *playlistArchive) time.Time { return archive.ended })
+
+	s.startPrefetch()
 
 	s.registerProviders()
+	// The ranking order must cover every enabled provider, even one the
+	// configured default order predates.
+	s.ranking.SetEnabledProviders(s.providers.Names())
 	s.logProviderDeps()
 	s.routes()
 	return s, nil
@@ -106,7 +134,16 @@ func (s *Server) Close() error {
 // registerProviders instantiates every provider the configuration enables.
 func (s *Server) registerProviders() {
 	if s.cfg.Providers.YTMusic.Enabled {
-		s.providers.Register(ytmusic.New(s.logger))
+		s.providers.Register(ytmusic.New(s.logger, ytmusic.Options{
+			CookiesFromBrowser: s.cfg.Providers.YTMusic.CookiesFromBrowser,
+			CookiesFile:        s.cfg.Providers.YTMusic.CookiesFile,
+		}))
+	}
+	if s.cfg.Providers.YouTube.Enabled {
+		s.providers.Register(youtube.New(s.logger, youtube.Options{
+			CookiesFromBrowser: s.cfg.Providers.YouTube.CookiesFromBrowser,
+			CookiesFile:        s.cfg.Providers.YouTube.CookiesFile,
+		}))
 	}
 	if s.cfg.Providers.Spotify.Enabled {
 		if s.cfg.Providers.Spotify.ClientID == "" || s.cfg.Providers.Spotify.ClientSecret == "" {
@@ -166,6 +203,11 @@ func (s *Server) Run(ctx context.Context) error {
 	listener, err := net.Listen("tcp", s.cfg.Listen)
 	if err != nil {
 		return err
+	}
+	// The playlists are kept downloaded for as long as the server runs. It is
+	// started here rather than in New so that a test's server stays quiet.
+	if s.prefetcher != nil {
+		go s.prefetcher.Run(ctx)
 	}
 	return s.Serve(ctx, listener)
 }

@@ -18,10 +18,10 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/config"
-	"codeberg.org/kyleraykbs/prismusic/internal/match"
-	"codeberg.org/kyleraykbs/prismusic/internal/ranking"
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/config"
+	"codeberg.org/kyleraykbs/musoak/internal/match"
+	"codeberg.org/kyleraykbs/musoak/internal/ranking"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 // Errors returned by room commands.
@@ -59,6 +59,16 @@ type Member struct {
 	UserID     *uuid.UUID `json:"userId,omitempty"`
 	Name       string     `json:"name"`
 	JoinedAtMs int64      `json:"joinedAtMs"`
+	// IconURL is the member's picture, empty for a guest. The Listening panel
+	// shows it, so it travels with the member rather than needing a lookup.
+	IconURL string `json:"iconUrl,omitempty"`
+	// Out is set while this member is sitting the room's track out: they are
+	// not waited for and their file is not what the room's length is measured
+	// by. The manager sets it from its own record; a client never claims it.
+	Out bool `json:"out,omitempty"`
+	// IconVersion changes when that picture does, so the panel fetches the new
+	// one instead of the copy its browser has been holding.
+	IconVersion int `json:"iconVersion,omitempty"`
 }
 
 // QueueItem is one entry of a room's queue.
@@ -68,6 +78,12 @@ type QueueItem struct {
 	Title     string    `json:"title"`
 	AddedBy   string    `json:"addedBy"`
 	AddedAtMs int64     `json:"addedAtMs"`
+	// ArtworkURL is a path on this server, empty when nothing is known yet. The
+	// queue list shows it, and without it every row is a blank square.
+	ArtworkURL string `json:"artworkUrl,omitempty"`
+	// ArtistIDs lets a client open an artist's page from a queue row's menu:
+	// the names alone cannot name a page.
+	ArtistIDs []string `json:"artistIds,omitempty"`
 }
 
 // ReadyReport is a member's answer to "this is what I will play".
@@ -90,8 +106,18 @@ type playback struct {
 
 	// startedAtMs is zero until the track actually starts.
 	startedAtMs int64
-	// timelineMs is the room-wide length: the longest rendition in the room.
+	// timelineMs is the room-wide length: the file the member who queued the
+	// song is playing.
 	timelineMs int64
+	// durations is what each assigned rendition says it is long, known from the
+	// store before anyone has measured the file they actually play.
+	durations map[uuid.UUID]int64
+	// prepared is set once the renditions have been assigned, and timedOut once
+	// the room has waited long enough for the laggards. A track starts when both
+	// have happened and everyone else is ready: assignment needs the providers
+	// and can outlast the wait.
+	prepared bool
+	timedOut bool
 	// fallbackMs is the canonical track duration, used when nobody reports.
 	fallbackMs int64
 
@@ -142,6 +168,11 @@ type room struct {
 	queues  map[string][]QueueItem
 	master  []QueueItem
 	current *playback
+	// out is who is sitting the room out. Their file is not what the room's
+	// song is measured by and the room does not wait for them: with the
+	// shortest copy in the room ending the song, a member holding a short or
+	// broken one needs a way to say so rather than cut everybody else off.
+	out map[string]bool
 }
 
 // Snapshot is a room as clients see it.
@@ -172,6 +203,10 @@ type PlaybackView struct {
 	Paused      bool              `json:"paused"`
 	Variants    map[string]string `json:"variants"`
 	Ready       []ReadyReport     `json:"ready"`
+	// Prepared is set once the renditions have been assigned. A track starts
+	// only after that, so a client can tell "waiting on the room" from "waiting
+	// on me".
+	Prepared bool `json:"prepared"`
 	Awaiting    []string          `json:"awaiting"`
 	CatchingUp  []string          `json:"catchingUp"`
 	Votes       map[string]int    `json:"votes"`
@@ -190,6 +225,7 @@ type SkipRules struct {
 type Store interface {
 	store.TrackRepo
 	store.VoteRepo
+	store.SourceRepo
 }
 
 // Manager owns every room.
@@ -197,6 +233,14 @@ type Manager struct {
 	mu        sync.Mutex
 	rooms     map[string]*room
 	roomOrder []string
+	// connections counts the live event sockets per member identity. Two tabs on
+	// one account are one listener: closing one window must not take them out of
+	// the rooms they are still listening in.
+	connections map[string]int
+	// leaving holds the pending leave for a member whose last socket closed. A
+	// client that reconnects drops its socket and opens another, and that gap
+	// must not read as leaving the room; a tab that closed for good must.
+	leaving map[string]*time.Timer
 
 	cfg     *config.Config
 	logger  *slog.Logger
@@ -213,14 +257,77 @@ func NewManager(cfg *config.Config, st Store, matcher *match.Matcher, rank *rank
 		logger = slog.Default()
 	}
 	return &Manager{
-		rooms:   make(map[string]*room),
-		cfg:     cfg,
-		logger:  logger,
-		bus:     NewBus(),
-		clock:   realClock{},
-		store:   st,
-		matcher: matcher,
-		ranking: rank,
+		rooms:       make(map[string]*room),
+		connections: make(map[string]int),
+		leaving:     make(map[string]*time.Timer),
+		cfg:         cfg,
+		logger:      logger,
+		bus:         NewBus(),
+		clock:       realClock{},
+		store:       st,
+		matcher:     matcher,
+		ranking:     rank,
+	}
+}
+
+// socketGrace is how long a member's rooms are kept after their last event
+// socket closes. Long enough that a client reconnecting through a dropped
+// socket is not taken out of the room it is still listening to.
+const socketGrace = 10 * time.Second
+
+// Connect records that a member has an event socket open, and cancels a leave
+// that was waiting on the old one.
+func (m *Manager) Connect(memberID string) {
+	if memberID == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if timer, ok := m.leaving[memberID]; ok {
+		timer.Stop()
+		delete(m.leaving, memberID)
+	}
+	m.connections[memberID]++
+}
+
+// Disconnect drops one of a member's event sockets, and takes them out of every
+// room they were in once it was the last one and the grace has passed.
+//
+// A tab that closes is a listener that has gone: without this, a member who shut
+// the window sits in the room for ever, waiting to be skipped past and holding
+// the timeline open. A second tab on the same account keeps them there, and so
+// does a client that is only reconnecting - only the last socket, staying
+// closed, is a leave.
+func (m *Manager) Disconnect(memberID string) {
+	if memberID == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.connections[memberID] > 1 {
+		m.connections[memberID]--
+		return
+	}
+	delete(m.connections, memberID)
+	if timer, ok := m.leaving[memberID]; ok {
+		timer.Stop()
+	}
+	m.leaving[memberID] = time.AfterFunc(socketGrace, func() { m.leaveEveryRoom(memberID) })
+}
+
+// leaveEveryRoom takes a member out of every room they are in, once the grace
+// has passed with no socket of theirs coming back.
+func (m *Manager) leaveEveryRoom(memberID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.leaving, memberID)
+	if m.connections[memberID] > 0 {
+		return
+	}
+	for _, room := range m.rooms {
+		if _, ok := room.members[memberID]; ok {
+			m.leaveLocked(room, memberID)
+		}
 	}
 }
 
@@ -283,6 +390,7 @@ func (m *Manager) Create(name string, controls Controls, password string, host M
 		members:     map[string]*Member{host.ID: &host},
 		order:       []string{host.ID},
 		queues:      map[string][]QueueItem{host.ID: {}},
+		out:         map[string]bool{},
 	}
 	m.rooms[id] = room
 	m.roomOrder = append(m.roomOrder, id)
@@ -318,11 +426,29 @@ func (m *Manager) Get(roomID string) (*Snapshot, error) {
 	return m.snapshotLocked(room), nil
 }
 
+// withoutMember is the order with one member's id taken out, keeping the rest
+// as it was.
+func withoutMember(order []string, memberID string) []string {
+	out := make([]string, 0, len(order))
+	for _, id := range order {
+		if id != memberID {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 // Join adds a member (or refreshes an existing one) and returns the room. A
 // member arriving while a track is preparing or playing is given a rendition of
 // that track, so joining mid-track still means playing along. The password must
 // match when the room has one.
-func (m *Manager) Join(roomID string, member Member, password string) (*Snapshot, error) {
+//
+// `supersedes` names a member this one replaces: a browser that joined as a
+// guest and has since signed in, whose account is a different member id. What
+// that member had queued comes across - it was the same person - and the
+// membership it was goes, so the room does not show somebody twice, once under
+// the name their browser made up.
+func (m *Manager) Join(roomID string, member Member, password, supersedes string) (*Snapshot, error) {
 	m.mu.Lock()
 
 	room, err := m.roomLocked(roomID)
@@ -339,6 +465,20 @@ func (m *Manager) Join(roomID string, member Member, password string) (*Snapshot
 		room.order = append(room.order, member.ID)
 		room.queues[member.ID] = []QueueItem{}
 		recomputeMasterLocked(room) // the round-robin gains a (still empty) slot
+	}
+	if supersedes != "" && supersedes != member.ID {
+		if _, wasThere := room.members[supersedes]; wasThere {
+			if len(room.queues[member.ID]) == 0 {
+				room.queues[member.ID] = append([]QueueItem(nil), room.queues[supersedes]...)
+			}
+			delete(room.members, supersedes)
+			delete(room.queues, supersedes)
+			room.order = withoutMember(room.order, supersedes)
+			recomputeMasterLocked(room)
+			m.publishLocked(room, EventMemberLeft, map[string]any{
+				"memberId": supersedes, "memberCount": len(room.members),
+			})
+		}
 	}
 	member.JoinedAtMs = m.nowMsLocked()
 	room.members[member.ID] = &member
@@ -376,7 +516,11 @@ func (m *Manager) Leave(roomID, memberID string) (*Snapshot, error) {
 	if _, ok := room.members[memberID]; !ok {
 		return nil, ErrMemberNotFound
 	}
+	return m.leaveLocked(room, memberID), nil
+}
 
+// leaveLocked is Leave's body, for callers that already hold the lock.
+func (m *Manager) leaveLocked(room *room, memberID string) *Snapshot {
 	delete(room.members, memberID)
 	room.order = removeString(room.order, memberID)
 	// A member who leaves takes their queue with them.
@@ -388,6 +532,9 @@ func (m *Manager) Leave(roomID, memberID string) (*Snapshot, error) {
 		delete(room.current.votes, memberID)
 		delete(room.current.variants, memberID)
 	}
+	// The member who held the shortest file may be the one who left, which
+	// moves the end of the track they were holding down.
+	m.retimeLocked(room, room.current)
 	m.publishLocked(room, EventMemberLeft, map[string]any{"memberId": memberID, "memberCount": len(room.members)})
 	m.publishLocked(room, EventQueueUpdated, queueDataLocked(room))
 
@@ -395,7 +542,7 @@ func (m *Manager) Leave(roomID, memberID string) (*Snapshot, error) {
 		// The last member leaving closes the room; that is still a successful
 		// leave, so callers are not told the room was missing.
 		m.closeRoomLocked(room)
-		return nil, nil
+		return nil
 	}
 	if room.host == memberID {
 		room.host = room.order[0]
@@ -403,7 +550,7 @@ func (m *Manager) Leave(roomID, memberID string) (*Snapshot, error) {
 		m.publishLocked(room, EventMemberJoined, map[string]any{"host": room.host, "memberCount": len(room.members)})
 	}
 	m.maybeStartLocked(room)
-	return m.snapshotLocked(room), nil
+	return m.snapshotLocked(room)
 }
 
 // Enqueue appends a track to the member's own queue, starting it right away
@@ -423,13 +570,32 @@ func (m *Manager) Enqueue(ctx context.Context, roomID, memberID string, trackID 
 	if err != nil {
 		return nil, err
 	}
+	// The header may predate the cover, so fall back to a lookup: the queue rows
+	// show the artwork, and a blank one is the whole row's look.
+	artwork := track.ArtworkURL
+	if artwork == "" {
+		if url, err := m.store.TrackArtwork(ctx, trackID); err == nil {
+			artwork = url
+		}
+	}
+
+	// The row's menu opens the artist's page, so the ids travel with the item.
+	var artistIDs []string
+	if artists, err := m.store.TrackArtists(ctx, trackID); err == nil {
+		artistIDs = make([]string, 0, len(artists))
+		for _, artist := range artists {
+			artistIDs = append(artistIDs, artist.ID.String())
+		}
+	}
 
 	room.queues[memberID] = append(room.queues[memberID], QueueItem{
-		ID:        uuid.NewString(),
-		TrackID:   track.ID,
-		Title:     track.Title,
-		AddedBy:   memberID,
-		AddedAtMs: m.nowMsLocked(),
+		ID:         uuid.NewString(),
+		TrackID:    track.ID,
+		Title:      track.Title,
+		AddedBy:    memberID,
+		AddedAtMs:  m.nowMsLocked(),
+		ArtworkURL: artwork,
+		ArtistIDs:  artistIDs,
 	})
 	recomputeMasterLocked(room)
 	m.publishLocked(room, EventQueueUpdated, queueDataLocked(room))
@@ -757,13 +923,81 @@ func (m *Manager) Ready(roomID, memberID string, trackID, variantID uuid.UUID, d
 		playback.variants[memberID] = variantID
 	}
 
-	m.publishLocked(room, EventReadyState, map[string]any{
+	// A member may change which file they play, and a member may arrive: either
+	// can change the shortest file in the room, and so the end of the track.
+	state := map[string]any{
 		"ready":   len(playback.ready),
 		"members": len(room.members),
 		"item":    playback.item,
-	})
+		"out":     outMembers(room),
+	}
+	if playback.startedAtMs != 0 {
+		m.retimeLocked(room, playback)
+		state["timelineMs"] = playback.timelineMs
+	}
+
+	m.publishLocked(room, EventReadyState, state)
 	m.maybeStartLocked(room)
 	return m.snapshotLocked(room), nil
+}
+
+// SetOut records that a member is sitting the room's track out, or is back in.
+//
+// The room plays for as long as the shortest file in it, so one member holding
+// a short or broken copy would otherwise end the song for everybody. Sitting it
+// out takes their file out of that reckoning and stops the room waiting on
+// them, without leaving the room.
+func (m *Manager) SetOut(roomID, memberID string, out bool) (*Snapshot, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	room, err := m.roomLocked(roomID)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := room.members[memberID]; !ok {
+		return nil, ErrMemberNotFound
+	}
+	if out {
+		room.out[memberID] = true
+	} else {
+		delete(room.out, memberID)
+	}
+
+	state := map[string]any{
+		"members": len(room.members),
+		"out":     outMembers(room),
+	}
+	playback := room.current
+	if playback != nil {
+		if out {
+			// Their rendition is no longer the room's business, and the end of
+			// the track may move without it.
+			delete(playback.ready, memberID)
+			delete(playback.variants, memberID)
+			m.retimeLocked(room, playback)
+		} else {
+			// Back in: they need a rendition again, and the room counts them.
+			go m.prepare(room.id, playback.item.ID)
+		}
+		state["ready"] = len(playback.ready)
+		state["item"] = playback.item
+	}
+
+	m.publishLocked(room, EventReadyState, state)
+	m.maybeStartLocked(room)
+	return m.snapshotLocked(room), nil
+}
+
+// outMembers lists who is sitting this room's track out.
+func outMembers(room *room) []string {
+	out := make([]string, 0, len(room.out))
+	for _, memberID := range room.order {
+		if room.out[memberID] {
+			out = append(out, memberID)
+		}
+	}
+	return out
 }
 
 // --- internals -------------------------------------------------------------
@@ -918,7 +1152,8 @@ func (m *Manager) beginNextLocked(room *room) {
 		}
 		m.logger.Info("room: readiness timeout, starting without everyone",
 			"room", room.id, "item", playback.item.ID)
-		m.startLocked(current, playback)
+		playback.timedOut = true
+		m.maybeStartLocked(current)
 	})
 }
 
@@ -938,7 +1173,9 @@ func (m *Manager) prepare(roomID, itemID string) {
 	members := make([]Member, 0, len(room.order))
 	for _, memberID := range room.order {
 		if member, ok := room.members[memberID]; ok {
-			members = append(members, *member)
+			member := *member
+			member.Out = room.out[memberID]
+			members = append(members, member)
 		}
 	}
 	m.mu.Unlock()
@@ -949,7 +1186,16 @@ func (m *Manager) prepare(roomID, itemID string) {
 	}
 
 	assignments := make(map[string]uuid.UUID, len(members))
+	durations := make(map[uuid.UUID]int64, len(variants))
+	for _, variant := range variants {
+		if variant.DurationMs > 0 {
+			durations[variant.ID] = variant.DurationMs
+		}
+	}
 	for _, member := range members {
+		if room.out[member.ID] {
+			continue // no rendition to fetch: they are not playing this one
+		}
 		if variant, ok := m.pickVariant(ctx, member, variants); ok {
 			assignments[member.ID] = variant.ID
 		}
@@ -962,6 +1208,10 @@ func (m *Manager) prepare(roomID, itemID string) {
 		return
 	}
 	room.current.variants = assignments
+	room.current.durations = durations
+	room.current.prepared = true
+	// Someone who arrived mid-track has a file the room has not reckoned with.
+	m.retimeLocked(room, room.current)
 	m.publishLocked(room, EventTrackPrepared, map[string]any{
 		"item":     room.current.item,
 		"variants": assignments,
@@ -973,7 +1223,9 @@ func (m *Manager) prepare(roomID, itemID string) {
 // ranking decides, exactly as it does for the CLI.
 func (m *Manager) pickVariant(ctx context.Context, member Member, variants []store.Variant) (store.Variant, bool) {
 	order := m.cfg.DefaultProviderOrder
+	caller := uuid.Nil
 	if member.UserID != nil {
+		caller = *member.UserID
 		if own, err := m.ranking.User(ctx, *member.UserID); err == nil {
 			order = own
 		} else {
@@ -982,18 +1234,99 @@ func (m *Manager) pickVariant(ctx context.Context, member Member, variants []sto
 	} else if aggregate, err := m.ranking.Aggregate(ctx); err == nil {
 		order = aggregate
 	}
+	// The reserved slots name a rendition rather than a provider, so they are
+	// resolved against this track's uploads before the order can decide. The
+	// room assigns the same rendition the member's own client would pick.
+	if len(variants) == 0 {
+		return store.Variant{}, false
+	}
+	trackID := variants[0].TrackID
+	uploaders, err := m.store.VariantUploaders(ctx, trackID)
+	if err != nil {
+		m.logger.Warn("room: uploaders lookup failed", "track", trackID, "error", err)
+	}
+	counts, err := m.store.VariantVoteCounts(ctx, trackID)
+	if err != nil {
+		m.logger.Warn("room: vote count lookup failed", "track", trackID, "error", err)
+	}
+	for _, variant := range ranking.OrderVariants(order, variants, uploaders, counts, caller) {
+		if variant.Downloadable {
+			return variant, true
+		}
+	}
 	return ranking.Pick(order, variants)
+}
+
+// timelineFor is how long the room plays the current track: the shortest file
+// any member holds. Everybody's song ends when the first of them ends. A member
+// sitting in silence while the room plays on is what this avoids, and a longer
+// file is cut at that point, exactly as it always has been.
+//
+// A member who has not measured their file yet still counts: the rendition the
+// room handed them says how long their copy is, and that is a better answer
+// than leaving them out of the reckoning. Their measured report replaces it the
+// moment it arrives.
+func timelineFor(room *room, playback *playback) int64 {
+	shortest := int64(0)
+	keep := func(durationMs int64) {
+		if durationMs > 0 && (shortest == 0 || durationMs < shortest) {
+			shortest = durationMs
+		}
+	}
+	for memberID := range room.members {
+		if room.out[memberID] {
+			continue
+		}
+		if report, ok := playback.ready[memberID]; ok && report.DurationMs > 0 {
+			keep(report.DurationMs)
+			continue
+		}
+		keep(playback.durations[playback.variants[memberID]])
+	}
+	if shortest > 0 {
+		return shortest
+	}
+	if playback.fallbackMs > 0 {
+		return playback.fallbackMs
+	}
+	return defaultTimelineMs
+}
+
+// retimeLocked moves the end of the current track if the shortest file in the
+// room has changed, and tells everyone. The timer that advances the room moves
+// with it: an end that is only written down is an end nobody acts on.
+func (m *Manager) retimeLocked(room *room, playback *playback) {
+	if playback == nil || playback.startedAtMs == 0 {
+		return
+	}
+	timeline := timelineFor(room, playback)
+	if timeline == playback.timelineMs {
+		return
+	}
+	playback.timelineMs = timeline
+	m.scheduleAdvanceLocked(room, playback)
+	m.publishLocked(room, EventReadyState, map[string]any{
+		"ready":      len(playback.ready),
+		"members":    len(room.members),
+		"item":       playback.item,
+		"timelineMs": timeline,
+	})
 }
 
 // maybeStartLocked starts the current track when every member is ready.
 func (m *Manager) maybeStartLocked(room *room) {
 	playback := room.current
-	if playback == nil || playback.startedAtMs != 0 {
+	if playback == nil || playback.startedAtMs != 0 || !playback.prepared {
 		return
 	}
-	for memberID := range room.members {
-		if _, ready := playback.ready[memberID]; !ready {
-			return
+	if !playback.timedOut {
+		for memberID := range room.members {
+			if room.out[memberID] {
+				continue
+			}
+			if _, ready := playback.ready[memberID]; !ready {
+				return
+			}
 		}
 	}
 	m.startLocked(room, playback)
@@ -1006,15 +1339,7 @@ func (m *Manager) startLocked(room *room, playback *playback) {
 		return
 	}
 
-	timeline := playback.fallbackMs
-	for _, report := range playback.ready {
-		if report.DurationMs > timeline {
-			timeline = report.DurationMs
-		}
-	}
-	if timeline <= 0 {
-		timeline = defaultTimelineMs
-	}
+	timeline := timelineFor(room, playback)
 	playback.timelineMs = timeline
 	playback.startedAtMs = m.nowMsLocked()
 	playback.paused = false
@@ -1165,7 +1490,9 @@ func (m *Manager) snapshotLocked(room *room) *Snapshot {
 	}
 	for _, memberID := range room.order {
 		if member, ok := room.members[memberID]; ok {
-			snapshot.Members = append(snapshot.Members, *member)
+			member := *member
+			member.Out = room.out[memberID]
+			snapshot.Members = append(snapshot.Members, member)
 		}
 	}
 
@@ -1182,6 +1509,7 @@ func (m *Manager) snapshotLocked(room *room) *Snapshot {
 		Paused:      playback.paused,
 		Variants:    make(map[string]string, len(playback.variants)),
 		Ready:       make([]ReadyReport, 0, len(playback.ready)),
+		Prepared:    playback.prepared,
 		Awaiting:    []string{},
 		CatchingUp:  []string{},
 		Votes:       make(map[string]int, len(playback.votes)),

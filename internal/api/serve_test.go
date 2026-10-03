@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/config"
+	"codeberg.org/kyleraykbs/musoak/internal/config"
 )
 
 // TestServeAppliesMiddleware guards a real bug: the daemon used to serve the
@@ -23,6 +23,8 @@ func TestServeAppliesMiddleware(t *testing.T) {
 	cfg.StorageDir = t.TempDir()
 	cfg.Providers.YTMusic.Enabled = false
 	cfg.Providers.Spotify.Enabled = false
+	// The plain YouTube provider would reach the network; a test wants none of it.
+	cfg.Providers.YouTube.Enabled = false
 	cfg.RequireLogin = true
 
 	server, err := New(cfg, slog.New(slog.DiscardHandler))

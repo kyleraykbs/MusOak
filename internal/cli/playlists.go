@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"codeberg.org/kyleraykbs/prismusic/pkg/client"
+	"codeberg.org/kyleraykbs/musoak/pkg/client"
 )
 
 // --- playlists --------------------------------------------------------------
@@ -16,7 +16,7 @@ import (
 func (a *App) resolvePlaylist(ctx context.Context, argument string) (*client.Playlist, error) {
 	argument = strings.TrimSpace(argument)
 	if argument == "" {
-		return nil, errors.New("prism: a playlist id or name is required")
+		return nil, errors.New("musoak: a playlist id or name is required")
 	}
 	if looksLikeID(argument) {
 		detail, err := a.client.Playlist(ctx, argument)
@@ -53,7 +53,7 @@ func (a *App) cmdPlaylist(ctx context.Context, args []string) error {
 
 	case "create":
 		if len(args) < 2 {
-			return errors.New("prism: usage: prism playlist create <name>")
+			return errors.New("musoak: usage: musoak playlist create <name>")
 		}
 		name := strings.Join(args[1:], " ")
 		playlist, err := a.client.CreatePlaylist(ctx, name)
@@ -65,54 +65,54 @@ func (a *App) cmdPlaylist(ctx context.Context, args []string) error {
 
 	case "show":
 		if len(args) < 2 {
-			return errors.New("prism: usage: prism playlist show <id|name>")
+			return errors.New("musoak: usage: musoak playlist show <id|name>")
 		}
 		return a.playlistShow(ctx, args[1])
 
 	case "add":
 		if len(args) < 3 {
-			return errors.New("prism: usage: prism playlist add <id|name> <track-id|index>...")
+			return errors.New("musoak: usage: musoak playlist add <id|name> <track-id|index>...")
 		}
 		return a.playlistAdd(ctx, args[1], args[2:])
 
 	case "rm", "remove":
 		if len(args) < 3 {
-			return errors.New("prism: usage: prism playlist rm <id|name> <position>")
+			return errors.New("musoak: usage: musoak playlist rm <id|name> <position>")
 		}
 		return a.playlistRemove(ctx, args[1], args[2])
 
 	case "reorder":
 		if len(args) < 3 {
-			return errors.New("prism: usage: prism playlist reorder <id|name> <position,position,...>")
+			return errors.New("musoak: usage: musoak playlist reorder <id|name> <position,position,...>")
 		}
 		return a.playlistReorder(ctx, args[1], args[2])
 
 	case "rename":
 		if len(args) < 3 {
-			return errors.New("prism: usage: prism playlist rename <id|name> <new name>")
+			return errors.New("musoak: usage: musoak playlist rename <id|name> <new name>")
 		}
 		return a.playlistRename(ctx, args[1], strings.Join(args[2:], " "))
 
 	case "delete", "rm-playlist":
 		if len(args) < 2 {
-			return errors.New("prism: usage: prism playlist delete <id|name>")
+			return errors.New("musoak: usage: musoak playlist delete <id|name>")
 		}
 		return a.playlistDelete(ctx, args[1])
 
 	case "queue":
 		if len(args) < 2 {
-			return errors.New("prism: usage: prism playlist queue <id|name>")
+			return errors.New("musoak: usage: musoak playlist queue <id|name>")
 		}
 		return a.playlistQueue(ctx, args[1])
 
 	case "play":
 		if len(args) < 2 {
-			return errors.New("prism: usage: prism playlist play <id|name>")
+			return errors.New("musoak: usage: musoak playlist play <id|name>")
 		}
 		return a.playlistPlay(ctx, args[1])
 
 	default:
-		return fmt.Errorf("prism: unknown playlist command %q", args[0])
+		return fmt.Errorf("musoak: unknown playlist command %q", args[0])
 	}
 }
 
@@ -122,7 +122,7 @@ func (a *App) playlistList(ctx context.Context) error {
 		return err
 	}
 	if len(playlists) == 0 {
-		a.printf("no playlists; create one with \"prism playlist create <name>\"\n")
+		a.printf("no playlists; create one with \"musoak playlist create <name>\"\n")
 		return nil
 	}
 	for _, playlist := range playlists {
@@ -182,7 +182,7 @@ func (a *App) playlistRemove(ctx context.Context, argument, rawPosition string) 
 	}
 	position, err := strconv.Atoi(rawPosition)
 	if err != nil {
-		return fmt.Errorf("prism: %q is not a position", rawPosition)
+		return fmt.Errorf("musoak: %q is not a position", rawPosition)
 	}
 	detail, err := a.client.RemovePlaylistItem(ctx, playlist.ID, position)
 	if err != nil {
@@ -201,7 +201,7 @@ func (a *App) playlistReorder(ctx context.Context, argument, rawOrder string) er
 	for _, field := range strings.Split(rawOrder, ",") {
 		position, err := strconv.Atoi(strings.TrimSpace(field))
 		if err != nil {
-			return fmt.Errorf("prism: %q is not a position list", rawOrder)
+			return fmt.Errorf("musoak: %q is not a position list", rawOrder)
 		}
 		order = append(order, position)
 	}
@@ -269,7 +269,7 @@ func (a *App) playlistPlay(ctx context.Context, argument string) error {
 		return err
 	}
 	if len(detail.Items) == 0 {
-		return fmt.Errorf("prism: %q is empty", detail.Name)
+		return fmt.Errorf("musoak: %q is empty", detail.Name)
 	}
 
 	a.state.Queue = a.state.Queue[:0]
@@ -307,7 +307,7 @@ func (a *App) roomQueuePlaylist(ctx context.Context, argument string) error {
 		return err
 	}
 	if len(ids) == 0 {
-		return fmt.Errorf("prism: %q is empty", name)
+		return fmt.Errorf("musoak: %q is empty", name)
 	}
 	room, err := a.joinedRoom(ctx, true)
 	if err != nil {

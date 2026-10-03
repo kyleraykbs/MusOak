@@ -8,7 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/provider"
+	"codeberg.org/kyleraykbs/musoak/internal/provider"
 )
 
 const (
@@ -52,7 +52,13 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		limit = maxSearchLimit
 	}
 
-	results := s.providers.Search(r.Context(), query, provider.SearchOpts{Limit: limit})
+	providers, err := s.providerNames(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	results := s.providers.SearchSome(r.Context(), providers, query, provider.SearchOpts{Limit: limit})
 
 	groups, err := s.matcher.Group(r.Context(), results)
 	if err != nil {
@@ -88,6 +94,11 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 	}
+	refs := make([]*trackResponse, 0, len(response.Groups))
+	for i := range response.Groups {
+		refs = append(refs, &response.Groups[i].Track)
+	}
+	s.withPlays(r.Context(), s.currentUser(r), refs)
 	writeJSON(w, http.StatusOK, response)
 }
 

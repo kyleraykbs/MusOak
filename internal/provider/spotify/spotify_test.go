@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/provider"
+	"codeberg.org/kyleraykbs/musoak/internal/provider"
 )
 
 // fakeSpotify serves the token and search endpoints and counts the calls.
@@ -302,5 +302,75 @@ func TestSearchPicksTheLargestCover(t *testing.T) {
 	}
 	if len(tracks) != 1 || tracks[0].ArtworkURL != "https://i.scdn.co/large.jpg" {
 		t.Fatalf("tracks = %+v", tracks)
+	}
+}
+
+// The embed page is the only way in without credentials, and its shape is
+// Spotify's to change: these pin what is read out of it, and that a page
+// without a playlist is reported rather than half-read.
+func TestPublicPlaylistReadsTheEmbedPage(t *testing.T) {
+	const page = `<!DOCTYPE html><html><head></head><body>
+<script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"state":{"data":{"entity":{"type":"playlist","name":"Road Trip","title":"Road Trip","subtitle":"kyleraykbs","trackList":[{"uri":"spotify:track:abc123","title":"First Song","subtitle":"Artist One, Artist Two","duration":213000},{"uri":"spotify:track:def456","title":"Second Song","subtitle":"Someone Else","duration":190500},{"uri":"","title":"No id","subtitle":"Nobody","duration":1000}]}}}}}}</script>
+</body></html>`
+
+	entity, ok := embedEntity([]byte(page))
+	if !ok {
+		t.Fatal("no playlist found in the embed page")
+	}
+	detail := detailFromEntity("PL1", entity)
+
+	if detail.Title != "Road Trip" || detail.Owner != "kyleraykbs" {
+		t.Fatalf("playlist = %+v", detail.Playlist)
+	}
+	if len(detail.Tracks) != 2 || detail.TrackCount != 2 {
+		t.Fatalf("tracks = %d (%+v)", len(detail.Tracks), detail.Tracks)
+	}
+	first := detail.Tracks[0]
+	if first.ProviderTrackID != "abc123" || first.Title != "First Song" {
+		t.Fatalf("first track = %+v", first)
+	}
+	if len(first.Artists) != 2 || first.Artists[1] != "Artist Two" {
+		t.Fatalf("first track artists = %+v", first.Artists)
+	}
+	if first.DurationMs != 213000 {
+		t.Fatalf("first track duration = %d", first.DurationMs)
+	}
+}
+
+func TestEmbedEntityFindsThePlaylistWhereverItSits(t *testing.T) {
+	// Spotify has moved this object before; the search is by shape, not path.
+	const page = `<script id="__NEXT_DATA__" type="application/json">{"a":{"b":[{"c":{"title":"Deep","trackList":[{"uri":"spotify:track:x","title":"One","subtitle":"An Artist"}]}}]}}</script>`
+
+	entity, ok := embedEntity([]byte(page))
+	if !ok {
+		t.Fatal("no playlist found when it is nested")
+	}
+	if detail := detailFromEntity("id", entity); len(detail.Tracks) != 1 {
+		t.Fatalf("tracks = %+v", detail.Tracks)
+	}
+}
+
+func TestEmbedEntityReportsAPageWithoutAPlaylist(t *testing.T) {
+	cases := map[string]string{
+		"no script":   `<html><body>nothing here</body></html>`,
+		"broken json": `<script id="__NEXT_DATA__" type="application/json">{oops</script>`,
+		"no playlist": `<script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"state":{"data":{"entity":{"type":"album","name":"Not a playlist"}}}}}}</script>`,
+	}
+	for name, page := range cases {
+		if _, ok := embedEntity([]byte(page)); ok {
+			t.Fatalf("%s: reported a playlist", name)
+		}
+	}
+}
+
+func TestConfiguredNeedsBothHalvesOfTheCredentials(t *testing.T) {
+	if (&Provider{clientID: "id"}).configured() {
+		t.Fatal("an id without a secret is not configured")
+	}
+	if (&Provider{}).configured() {
+		t.Fatal("nothing is not configured")
+	}
+	if !(&Provider{clientID: "id", clientSecret: "secret"}).configured() {
+		t.Fatal("both halves are configured")
 	}
 }

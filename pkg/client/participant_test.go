@@ -3,6 +3,7 @@ package client_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http/httptest"
 	"os/exec"
@@ -12,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/api"
-	"codeberg.org/kyleraykbs/prismusic/internal/config"
-	"codeberg.org/kyleraykbs/prismusic/pkg/client"
+	"codeberg.org/kyleraykbs/musoak/internal/api"
+	"codeberg.org/kyleraykbs/musoak/internal/config"
+	"codeberg.org/kyleraykbs/musoak/pkg/client"
 )
 
 // newServer boots a real server (in-memory transport, on-disk store in a temp
@@ -25,6 +26,8 @@ func newServer(t *testing.T, mutate func(*config.Config)) *client.Client {
 	cfg.StorageDir = t.TempDir()
 	cfg.Providers.YTMusic.Enabled = false
 	cfg.Providers.Spotify.Enabled = false
+	// The plain YouTube provider would reach the network; a test wants none of it.
+	cfg.Providers.YouTube.Enabled = false
 	if mutate != nil {
 		mutate(cfg)
 	}
@@ -234,7 +237,9 @@ func TestParticipantsFollowTheRoom(t *testing.T) {
 		slots = append(slots, c.sink.recorded()[0])
 	}
 
+	var shortest int64 = 1 << 40
 	var longest int64
+	timeline := slots[0].TimelineMs
 	for i, slot := range slots {
 		if slot.TrackID != trackID {
 			t.Fatalf("client %d played %s, want %s", i, slot.TrackID, trackID)
@@ -246,24 +251,25 @@ func TestParticipantsFollowTheRoom(t *testing.T) {
 		if slot.PositionMs > 200 {
 			t.Errorf("client %d began %d ms in; the room had just started", i, slot.PositionMs)
 		}
-		if slot.TimelineMs > longest {
-			longest = slot.TimelineMs
-		}
-	}
-
-	// The room's timeline is the longest rendition; the shorter files pad with
-	// silence rather than ending the room's slot early.
-	var shortest int64 = 1 << 40
-	for _, slot := range slots {
 		if slot.DurationMs < shortest {
 			shortest = slot.DurationMs
 		}
-		if slot.TimelineMs != longest {
-			t.Errorf("client knew a timeline of %d, want the longest rendition %d", slot.TimelineMs, longest)
+		if slot.DurationMs > longest {
+			longest = slot.DurationMs
+		}
+		if slot.TimelineMs != timeline {
+			t.Errorf("client knew a timeline of %d, want every client to agree on %d", slot.TimelineMs, timeline)
 		}
 	}
+
+	// The room's timeline is the shortest rendition in it: everybody's song ends
+	// when the first of them ends, and a longer file is cut there. No member is
+	// left padding out the end of somebody else's copy.
+	if timeline != shortest {
+		t.Errorf("timeline = %d, want the shortest rendition %d", timeline, shortest)
+	}
 	if shortest >= longest {
-		t.Fatalf("expected one rendition shorter than the timeline: %d vs %d", shortest, longest)
+		t.Fatalf("expected renditions of different lengths: %d vs %d", shortest, longest)
 	}
 
 	for _, c := range clients {
@@ -379,6 +385,80 @@ func TestParticipantReportsLocalRendition(t *testing.T) {
 	<-done
 }
 
+// TestParticipantWarmsTheRoomsNextSongs checks that a member keeps the room's
+// upcoming songs on disk rather than only the one it is playing. The server
+// prepares a track at a time, and a room moves faster than a download: without
+// this, a skip waits for one.
+func TestParticipantWarmsTheRoomsNextSongs(t *testing.T) {
+	apiClient := newServer(t, func(cfg *config.Config) {
+		cfg.ListenTogether.ReadyTimeoutSeconds = 5
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Five local songs: one to play, the three after it, and one beyond the
+	// window for the queue to be longer than what is fetched.
+	files := t.TempDir()
+	tracks := make([]string, 0, 5)
+	for i := range 5 {
+		path := tone(t, files, fmt.Sprintf("Ahead %d.opus", i), 0.4)
+		result, err := apiClient.ImportPath(ctx, path)
+		if err != nil {
+			t.Fatalf("ImportPath: %v", err)
+		}
+		tracks = append(tracks, result.Imported[0].Track.ID)
+	}
+
+	cache, err := client.OpenCache(filepath.Join(t.TempDir(), "cache"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	peer := client.New(apiClient.BaseURL())
+	room, err := peer.CreateRoom(ctx, "ahead", "everyone")
+	if err != nil {
+		t.Fatalf("CreateRoom: %v", err)
+	}
+	self := client.New(apiClient.BaseURL())
+	joined, err := self.JoinRoom(ctx, room.RoomID)
+	if err != nil {
+		t.Fatalf("JoinRoom: %v", err)
+	}
+
+	participant := client.NewParticipant(joined, cache, &fakeSink{}, slog.New(slog.DiscardHandler))
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	done := make(chan error, 1)
+	go func() { done <- participant.Run(runCtx) }()
+	time.Sleep(300 * time.Millisecond)
+
+	for _, trackID := range tracks {
+		if _, err := room.Queue(ctx, trackID); err != nil {
+			t.Fatalf("Queue: %v", err)
+		}
+	}
+
+	// The room prepares the first song; the three that follow it should be on
+	// disk before anybody asks for them.
+	waitFor(t, 20*time.Second, "the room's next three songs to be ready", func() bool {
+		for _, trackID := range tracks[1:4] {
+			if _, ok := cache.LookupTrack(trackID); !ok {
+				return false
+			}
+		}
+		return true
+	})
+
+	// And no further: the room is still on its first song, so the one after
+	// the window is not this member's to fetch yet.
+	if _, ok := cache.LookupTrack(tracks[4]); ok {
+		t.Error("fetched a song beyond the room's next three")
+	}
+
+	stop()
+	<-done
+}
+
 // TestClockOffsetIsStable checks the NTP-style clock estimate.
 func TestClockOffsetIsStable(t *testing.T) {
 	apiClient := newServer(t, nil)
@@ -455,7 +535,9 @@ func TestAuthFlowOverSDK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SetRanking: %v", err)
 	}
-	if len(ranking.Effective) == 0 || ranking.Effective[0] != "local" {
+	// The caller's own order is kept, behind the two reserved slots.
+	if len(ranking.Effective) < 3 || ranking.Effective[0] != "self" ||
+		ranking.Effective[1] != "uploaded" || ranking.Effective[2] != "local" {
 		t.Fatalf("ranking = %+v", ranking)
 	}
 

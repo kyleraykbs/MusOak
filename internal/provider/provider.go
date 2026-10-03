@@ -41,6 +41,9 @@ type Track struct {
 	ISRC            string
 	// ArtworkURL is the best image the provider offers for this recording.
 	ArtworkURL string
+	// Video marks a music video rather than the recording: its audio carries the
+	// video's intro and skits, so it is a last resort where a song will do.
+	Video bool
 }
 
 // SearchOpts tunes a search.
@@ -239,7 +242,19 @@ func (r *Registry) All() []Provider {
 // result per provider, in registration order. One provider failing (or timing
 // out) never fails the whole search; providers that cannot search are skipped.
 func (r *Registry) Search(ctx context.Context, q string, opts SearchOpts) []Result {
-	providers := r.All()
+	return r.search(ctx, r.All(), q, opts)
+}
+
+// SearchSome fans out to only the providers named, preserving registration
+// order. An empty names list means every provider, exactly like Search. The
+// fan-out and error handling are identical to Search's: each provider gets its
+// own timeout and one provider's failure is reported in its Result without
+// failing the rest.
+func (r *Registry) SearchSome(ctx context.Context, names []string, q string, opts SearchOpts) []Result {
+	return r.search(ctx, r.selectProviders(names), q, opts)
+}
+
+func (r *Registry) search(ctx context.Context, providers []Provider, q string, opts SearchOpts) []Result {
 	results := make([]Result, len(providers))
 	var wg sync.WaitGroup
 	for i, p := range providers {
@@ -261,6 +276,26 @@ func (r *Registry) Search(ctx context.Context, q string, opts SearchOpts) []Resu
 	}
 	wg.Wait()
 	return results
+}
+
+// selectProviders keeps the registered providers named, in registration order.
+// An empty names list keeps every provider.
+func (r *Registry) selectProviders(names []string) []Provider {
+	providers := r.All()
+	if len(names) == 0 {
+		return providers
+	}
+	want := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		want[name] = struct{}{}
+	}
+	kept := make([]Provider, 0, len(providers))
+	for _, p := range providers {
+		if _, ok := want[p.Name()]; ok {
+			kept = append(kept, p)
+		}
+	}
+	return kept
 }
 
 // errNotSearchable marks providers that are registered but cannot search.
@@ -311,7 +346,16 @@ func (r *Registry) MissingDeps() map[string][]string {
 
 // SearchAlbums fans out to the providers that can browse albums.
 func (r *Registry) SearchAlbums(ctx context.Context, q string, opts SearchOpts) []AlbumResult {
-	providers := r.All()
+	return r.searchAlbums(ctx, r.All(), q, opts)
+}
+
+// SearchSomeAlbums is SearchAlbums restricted to the providers named; an empty
+// names list means every provider, exactly like SearchAlbums.
+func (r *Registry) SearchSomeAlbums(ctx context.Context, names []string, q string, opts SearchOpts) []AlbumResult {
+	return r.searchAlbums(ctx, r.selectProviders(names), q, opts)
+}
+
+func (r *Registry) searchAlbums(ctx context.Context, providers []Provider, q string, opts SearchOpts) []AlbumResult {
 	results := make([]AlbumResult, len(providers))
 	var wg sync.WaitGroup
 
@@ -339,7 +383,16 @@ func (r *Registry) SearchAlbums(ctx context.Context, q string, opts SearchOpts) 
 
 // SearchPlaylists fans out to the providers that can browse playlists.
 func (r *Registry) SearchPlaylists(ctx context.Context, q string, opts SearchOpts) []PlaylistResult {
-	providers := r.All()
+	return r.searchPlaylists(ctx, r.All(), q, opts)
+}
+
+// SearchSomePlaylists is SearchPlaylists restricted to the providers named; an
+// empty names list means every provider, exactly like SearchPlaylists.
+func (r *Registry) SearchSomePlaylists(ctx context.Context, names []string, q string, opts SearchOpts) []PlaylistResult {
+	return r.searchPlaylists(ctx, r.selectProviders(names), q, opts)
+}
+
+func (r *Registry) searchPlaylists(ctx context.Context, providers []Provider, q string, opts SearchOpts) []PlaylistResult {
 	results := make([]PlaylistResult, len(providers))
 	var wg sync.WaitGroup
 
@@ -380,7 +433,16 @@ func (r *Registry) Playlist(ctx context.Context, name, providerPlaylistID string
 
 // SearchArtists fans out to the providers that can browse artists.
 func (r *Registry) SearchArtists(ctx context.Context, q string, opts SearchOpts) []ArtistResult {
-	providers := r.All()
+	return r.searchArtists(ctx, r.All(), q, opts)
+}
+
+// SearchSomeArtists is SearchArtists restricted to the providers named; an
+// empty names list means every provider, exactly like SearchArtists.
+func (r *Registry) SearchSomeArtists(ctx context.Context, names []string, q string, opts SearchOpts) []ArtistResult {
+	return r.searchArtists(ctx, r.selectProviders(names), q, opts)
+}
+
+func (r *Registry) searchArtists(ctx context.Context, providers []Provider, q string, opts SearchOpts) []ArtistResult {
 	results := make([]ArtistResult, len(providers))
 	var wg sync.WaitGroup
 

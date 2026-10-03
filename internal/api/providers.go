@@ -1,8 +1,10 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 )
 
 type providerResponse struct {
@@ -35,4 +37,30 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request) {
 		out = append(out, entry)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"providers": out})
+}
+
+// providerNames reads the optional "providers" query parameter: a
+// comma-separated list of enabled provider names, e.g. ?providers=ytmusic,spotify.
+// Absent or empty means every enabled provider. A name that is not an enabled
+// provider is an error naming it, which callers turn into a 400.
+func (s *Server) providerNames(r *http.Request) ([]string, error) {
+	raw := strings.TrimSpace(r.URL.Query().Get("providers"))
+	if raw == "" {
+		return nil, nil
+	}
+	names := make([]string, 0, strings.Count(raw, ",")+1)
+	for _, part := range strings.Split(raw, ",") {
+		name := strings.TrimSpace(part)
+		if name == "" {
+			continue
+		}
+		if !s.providerKnown(name) {
+			return nil, fmt.Errorf("unknown provider %s", name)
+		}
+		names = append(names, name)
+	}
+	if len(names) == 0 {
+		return nil, nil
+	}
+	return names, nil
 }

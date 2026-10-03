@@ -7,9 +7,9 @@ import (
 	"regexp"
 	"strings"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/artwork"
-	"codeberg.org/kyleraykbs/prismusic/internal/auth"
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/artwork"
+	"codeberg.org/kyleraykbs/musoak/internal/auth"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 // accountUserResponse is the account view of a user: the identity plus the
@@ -18,7 +18,13 @@ type accountUserResponse struct {
 	ID          string `json:"id"`
 	Username    string `json:"username"`
 	DisplayName string `json:"displayName"`
-	IconURL     string `json:"iconUrl"`
+	IconURL string `json:"iconUrl"`
+	// IconVersion changes when the picture does, so a client can tell one icon
+	// from the next: the URL itself never changes, and is cached for a week.
+	IconVersion int `json:"iconVersion"`
+	// SearchPlatforms is empty when the account never chose, so the client
+	// falls back to its own default.
+	SearchPlatforms []string `json:"searchPlatforms"`
 }
 
 // accountUserEnvelope is what every account write answers with.
@@ -28,17 +34,21 @@ type accountUserEnvelope struct {
 
 func accountUser(user *store.User) accountUserEnvelope {
 	return accountUserEnvelope{User: accountUserResponse{
-		ID:          user.ID.String(),
-		Username:    user.Username,
-		DisplayName: user.DisplayName,
-		IconURL:     user.IconURL,
+		ID:              user.ID.String(),
+		Username:        user.Username,
+		DisplayName:     user.DisplayName,
+		IconURL:         user.IconURL,
+		IconVersion:     user.IconVersion,
+		SearchPlatforms: nonNilStrings(user.SearchPlatforms),
 	}}
 }
 
-// profilePatchRequest carries the display name: a plain text field the UI
-// saves or discards, with no password behind it.
+// profilePatchRequest carries the account settings the profile tab edits. The
+// fields are independent: a key that is absent leaves its setting alone, and
+// SearchPlatforms is a pointer so an empty list can clear it.
 type profilePatchRequest struct {
-	DisplayName string `json:"displayName"`
+	DisplayName     *string   `json:"displayName"`
+	SearchPlatforms *[]string `json:"searchPlatforms"`
 }
 
 // passwordChangeRequest proves the caller twice over: once with the current
@@ -60,21 +70,47 @@ type usernameChangeRequest struct {
 // up would reject.
 var usernameLike = regexp.MustCompile(`^[A-Za-z0-9._-]{3,32}$`)
 
-// handleMePatch sets the display name. Only the session proves the caller:
-// this is the account tab's save/discard field, not a credential change.
+// handleMePatch edits the account settings the profile tab owns: the display
+// name and which platforms a search asks by default. Each key is independent,
+// so a client may save one without touching the other. Only the session proves
+// the caller: this is a save/discard field, not a credential change.
 func (s *Server) handleMePatch(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.requireUser(w, r)
 	if !ok {
 		return
 	}
 	var req profilePatchRequest
-	if !decodeJSON(w, r, &req) {
+	if !decodeImageJSON(w, r, &req) {
 		return
 	}
-	displayName := strings.TrimSpace(req.DisplayName)
-	if err := s.store.UpdateProfile(r.Context(), user.ID, displayName, user.IconURL); err != nil {
-		writeStoreError(w, err, "account not found")
-		return
+	// Validate everything before writing, so a bad name changes nothing.
+	var platforms []string
+	if req.SearchPlatforms != nil {
+		platforms = make([]string, 0, len(*req.SearchPlatforms))
+		for _, name := range *req.SearchPlatforms {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			if !s.providerKnown(name) {
+				writeError(w, http.StatusBadRequest, "unknown provider "+name)
+				return
+			}
+			platforms = append(platforms, name)
+		}
+	}
+	if req.DisplayName != nil {
+		displayName := strings.TrimSpace(*req.DisplayName)
+		if err := s.store.UpdateProfile(r.Context(), user.ID, displayName, user.IconURL); err != nil {
+			writeStoreError(w, err, "account not found")
+			return
+		}
+	}
+	if req.SearchPlatforms != nil {
+		if err := s.store.SetSearchPlatforms(r.Context(), user.ID, platforms); err != nil {
+			writeStoreError(w, err, "account not found")
+			return
+		}
 	}
 	updated, err := s.store.User(r.Context(), user.ID)
 	if err != nil {
@@ -94,7 +130,7 @@ func (s *Server) handleMeIcon(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req playlistArtworkRequest
-	if !decodeJSON(w, r, &req) {
+	if !decodeImageJSON(w, r, &req) {
 		return
 	}
 
@@ -123,7 +159,7 @@ func (s *Server) handleMeIcon(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err, "the icon could not be stored")
 		return
 	}
-	if err := s.store.UpdateProfile(r.Context(), user.ID, user.DisplayName, iconURL); err != nil {
+	if err := s.store.SetIcon(r.Context(), user.ID, iconURL); err != nil {
 		writeStoreError(w, err, "the icon could not be recorded")
 		return
 	}
@@ -144,7 +180,7 @@ func (s *Server) handleMePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req passwordChangeRequest
-	if !decodeJSON(w, r, &req) {
+	if !decodeImageJSON(w, r, &req) {
 		return
 	}
 	if req.NewPassword == "" {
@@ -185,7 +221,7 @@ func (s *Server) handleMeUsername(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req usernameChangeRequest
-	if !decodeJSON(w, r, &req) {
+	if !decodeImageJSON(w, r, &req) {
 		return
 	}
 	match, err := auth.VerifyPassword(req.Password, user.PasswordHash)

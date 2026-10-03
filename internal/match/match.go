@@ -23,8 +23,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/provider"
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/provider"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 // DurationToleranceMs is how far two renditions may differ and still be the
@@ -48,6 +48,9 @@ const resolveLimit = 10
 // ErrNoPlayableVariant means the track still has no downloadable rendition
 // after resolution: nothing matched.
 var ErrNoPlayableVariant = errors.New("no downloadable variant available")
+
+// ErrUnknownProvider means the provider a caller named is not registered.
+var ErrUnknownProvider = errors.New("unknown provider")
 
 // Candidate is one side of a comparison.
 type Candidate struct {
@@ -116,7 +119,31 @@ func artistSimilarity(a, b []string) float64 {
 		// local file should still be able to join its track.
 		return 0.5
 	}
-	return jaccard(na, nb)
+	if score := jaccard(na, nb); score > 0 {
+		return score
+	}
+	// The same credits arrive spelled differently. Spotify's public playlist
+	// pages give one joined line per track, so a name with a comma in it looks
+	// like two people ("Tyler, The Creator" becomes "Tyler" and "The Creator"),
+	// and a featured artist can be credited on one side and not the other.
+	// Comparing the words of the credits, rather than the names they were split
+	// into, is what makes those the same artists.
+	if score := jaccard(artistWords(a), artistWords(b)); score > 0 {
+		return score
+	}
+	return 0
+}
+
+// artistWords is every word of every credit: what a credit line still shares
+// when it was split, joined or trimmed differently.
+func artistWords(names []string) map[string]bool {
+	out := make(map[string]bool)
+	for _, name := range names {
+		for word := range tokens(NormalizeArtist(name)) {
+			out[word] = true
+		}
+	}
+	return out
 }
 
 func albumSimilarity(a, b string) float64 {
@@ -305,6 +332,100 @@ func (m *Matcher) learnLocked(ctx context.Context, track *store.Track, variant *
 	if err := m.db.SetVariantArtwork(ctx, variant.ID, hit.ArtworkURL); err != nil {
 		m.logger.Warn("match: set variant artwork", "variant", variant.ID, "error", err)
 	}
+}
+
+// AttachToTrack stores a hit as a variant of exactly the given track. Unlike
+// Attach it never matches the hit against the library: the caller picked this
+// track deliberately. The write is idempotent for the same (provider,
+// providerTrackId), so posting the same pick twice returns the variant already
+// stored. An unregistered provider is ErrUnknownProvider.
+func (m *Matcher) AttachToTrack(ctx context.Context, trackID uuid.UUID, providerName string, hit provider.Track) (*store.Track, *store.Variant, error) {
+	p, ok := m.providers.Get(providerName)
+	if !ok {
+		return nil, nil, ErrUnknownProvider
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	track, err := m.db.Track(ctx, trackID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if existing, err := m.db.VariantByProviderTrack(ctx, providerName, hit.ProviderTrackID); err == nil {
+		if existing.TrackID != track.ID {
+			// The rendition somebody picked is already a variant of another row
+			// for the same recording: this library holds that song twice. The
+			// pick was made for this song, so the two are joined - the same
+			// thing resolution does when it finds the same situation.
+			if err := m.db.MergeTracks(ctx, track.ID, existing.TrackID); err != nil {
+				return nil, nil, err
+			}
+			kept, err := m.db.Track(ctx, track.ID)
+			if err != nil {
+				return nil, nil, err
+			}
+			// The merge re-pointed the variant, so the copy in hand is stale.
+			moved, err := m.db.VariantByProviderTrack(ctx, providerName, hit.ProviderTrackID)
+			if err != nil {
+				return nil, nil, err
+			}
+			return kept, moved, nil
+		}
+		m.learnLocked(ctx, track, existing, hit)
+		return track, existing, nil
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return nil, nil, err
+	}
+
+	// Fill the credits the track never had, so the pick leaves no empty row
+	// behind; what the track already knows is never clobbered.
+	if len(hit.Artists) > 0 {
+		artists, err := m.db.TrackArtists(ctx, track.ID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(artists) == 0 {
+			if err := m.db.SetTrackArtists(ctx, track.ID, hit.Artists); err != nil {
+				return nil, nil, err
+			}
+		}
+	}
+	if hit.Album != "" {
+		albums, err := m.db.TrackAlbums(ctx, track.ID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(albums) == 0 {
+			if err := m.db.SetTrackAlbums(ctx, track.ID, []string{hit.Album}); err != nil {
+				return nil, nil, err
+			}
+		}
+	}
+
+	variant := &store.Variant{
+		TrackID:         track.ID,
+		Provider:        providerName,
+		ProviderTrackID: hit.ProviderTrackID,
+		Title:           hit.Title,
+		Artists:         hit.Artists,
+		Album:           hit.Album,
+		DurationMs:      hit.DurationMs,
+		Downloadable:    p.Capabilities().Download,
+		ISRC:            hit.ISRC,
+	}
+	if err := m.db.CreateVariant(ctx, variant); err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			// Another attach won the race; use its variant.
+			if existing, lookupErr := m.db.VariantByProviderTrack(ctx, providerName, hit.ProviderTrackID); lookupErr == nil {
+				return track, existing, nil
+			}
+		}
+		return nil, nil, err
+	}
+
+	m.learnLocked(ctx, track, variant, hit)
+	return track, variant, nil
 }
 
 // findTrack looks for the canonical track a hit belongs to, or nil.
@@ -537,6 +658,23 @@ func (m *Matcher) Resolve(ctx context.Context, trackID uuid.UUID) ([]store.Varia
 		}
 		best, bestScore := bestHit(want, hits)
 		if best == nil || bestScore < m.threshold {
+			// One query can miss what another finds. The title alone is the
+			// other half of this search: credits are what providers spell
+			// differently, and a query carrying them can push the right answer
+			// out of the ten hits entirely. Asked only when the first found
+			// nothing, so a resolve that works costs exactly what it did.
+			if plain := strings.TrimSpace(track.Title); plain != "" && plain != query {
+				moreCtx, moreCancel := context.WithTimeout(ctx, SearchTimeout)
+				more, moreErr := p.Search(moreCtx, plain, provider.SearchOpts{Limit: resolveLimit})
+				moreCancel()
+				if moreErr != nil {
+					m.logger.Warn("match: resolution search failed", "provider", p.Name(), "track", trackID, "error", moreErr)
+				} else if better, betterScore := bestHit(want, more); better != nil && betterScore > bestScore {
+					best, bestScore = better, betterScore
+				}
+			}
+		}
+		if best == nil || bestScore < m.threshold {
 			m.logger.Debug("match: no resolution candidate above threshold",
 				"provider", p.Name(), "track", trackID, "score", bestScore)
 			continue
@@ -553,12 +691,26 @@ func (m *Matcher) Resolve(ctx context.Context, trackID uuid.UUID) ([]store.Varia
 			m.mu.Unlock()
 			return current, nil
 		}
-		_, _, attachErr := m.attachLocked(ctx, p.Name(), *best)
+		other, _, attachErr := m.attachLocked(ctx, p.Name(), *best)
 		m.mu.Unlock()
 		if attachErr != nil {
 			return nil, attachErr
 		}
-		m.logger.Info("resolved track onto a downloadable variant",
+		if other != nil && other.ID != trackID {
+			// The rendition is already a variant of another canonical track:
+			// this library holds the same recording twice, and the copy being
+			// resolved is the one without a source. Joining them is what makes
+			// it playable - the matcher has just said they are the same
+			// recording, by the same score that picked the hit.
+			if err := m.db.MergeTracks(ctx, trackID, other.ID); err != nil {
+				m.logger.Warn("match: could not join duplicate tracks",
+					"track", trackID, "other", other.ID, "error", err)
+			} else {
+				m.logger.Info("joined duplicate tracks",
+					"kept", trackID, "dropped", other.ID, "provider", p.Name(), "match_score", bestScore)
+			}
+		}
+		m.logger.Info("matched a rendition for a track with no source",
 			"track", trackID, "provider", p.Name(), "match_score", bestScore)
 		break
 	}
@@ -568,6 +720,12 @@ func (m *Matcher) Resolve(ctx context.Context, trackID uuid.UUID) ([]store.Varia
 		return nil, err
 	}
 	if !hasDownloadable(variants) {
+		// The rendition that matched is already a variant of another canonical
+		// track: this library holds the same recording twice, and this copy is
+		// the one still without a source. Joining the two is a merge, which is
+		// not this function's to do.
+		m.logger.Info("track still has no source after resolving",
+			"track", trackID, "hint", "the rendition is attached to another track with the same recording")
 		return variants, ErrNoPlayableVariant
 	}
 	return variants, nil
@@ -586,12 +744,30 @@ func bestHit(want Candidate, hits []provider.Track) (*provider.Track, float64) {
 			Album:      hit.Album,
 			DurationMs: hit.DurationMs,
 			ISRC:       hit.ISRC,
-		})
+		}) + rankBonus(i)
 		if score > bestScore {
 			best, bestScore = hit, score
 		}
 	}
 	return best, bestScore
+}
+
+// rankBonus is what a provider's own order is worth.
+//
+// A search answers in the order the platform thinks is relevant, and this
+// scoring throws that away: two candidates a hair apart are usually the same
+// answer, and the one the provider put first is the better guess. The bonus is
+// sized against the noise it absorbs - providers round durations to the second,
+// and the duration signal is worth 0.20 across five of them - so it settles
+// near-ties without ever promoting a wrong answer over a right one.
+func rankBonus(index int) float64 {
+	const first = 0.06
+	const step = 0.03
+	bonus := first - float64(index)*step
+	if bonus < 0 {
+		return 0
+	}
+	return bonus
 }
 
 func (m *Matcher) canDownload(providerName string) bool {

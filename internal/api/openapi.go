@@ -40,6 +40,7 @@ func (s *Server) routeTable() []route {
 		{"GET /api/v1/search", s.handleSearch},
 		{"GET /api/v1/tracks/{trackId}", s.handleTrack},
 		{"GET /api/v1/tracks/{trackId}/variants", s.handleTrackVariants},
+		{"GET /api/v1/tracks/{trackId}/lyrics", s.handleTrackLyrics},
 		{"POST /api/v1/tracks/{trackId}/resolve", s.handleTrackResolve},
 		{"POST /api/v1/library/import", s.handleLibraryImport},
 		{"POST /api/v1/radio", s.handleRadio},
@@ -48,6 +49,7 @@ func (s *Server) routeTable() []route {
 		{"GET /api/v1/albums/{albumId}", s.handleAlbum},
 		{"POST /api/v1/albums/{albumId}/sync", s.handleAlbumSync},
 		{"GET /api/v1/playlists/search", s.handlePlaylistSearch},
+		{"GET /api/v1/playlists/{playlistId}", s.handlePlaylistShared},
 		{"POST /api/v1/playlists/{playlistId}/sync", s.handlePlaylistSync},
 		{"GET /api/v1/artists/search", s.handleArtistSearch},
 		{"GET /api/v1/artists/{artistId}", s.handleArtist},
@@ -68,9 +70,17 @@ func (s *Server) routeTable() []route {
 		{"GET /api/v1/me/playback", s.handlePlaybackState},
 		{"PUT /api/v1/me/playback", s.handlePlaybackStateSave},
 		{"PUT /api/v1/me/providers/ranking", s.handleRankingPut},
+		{"POST /api/v1/me/plays", s.handleRecordPlay},
+		{"GET /api/v1/me/history", s.handleHistory},
+		{"GET /api/v1/me/stats/top", s.handleTopTracks},
 
 		{"GET /api/v1/me/playlists", s.handlePlaylistList},
 		{"POST /api/v1/me/playlists", s.handlePlaylistCreate},
+		{"POST /api/v1/me/playlists/import", s.handlePlaylistImportStart},
+		{"GET /api/v1/me/playlist-imports/{jobId}", s.handlePlaylistImportStatus},
+		{"POST /api/v1/me/playlists/{playlistId}/archives", s.handlePlaylistArchiveStart},
+		{"GET /api/v1/me/playlist-archives/{archiveId}", s.handlePlaylistArchiveStatus},
+		{"GET /api/v1/me/playlist-archives/{archiveId}/file", s.handlePlaylistArchiveFile},
 		{"GET /api/v1/me/playlists/{playlistId}", s.handlePlaylistGet},
 		{"PATCH /api/v1/me/playlists/{playlistId}", s.handlePlaylistRename},
 		{"DELETE /api/v1/me/playlists/{playlistId}", s.handlePlaylistDelete},
@@ -82,10 +92,15 @@ func (s *Server) routeTable() []route {
 		{"POST /api/v1/uploads", s.handleUploadCreate},
 		{"GET /api/v1/uploads", s.handleUploadList},
 		{"GET /api/v1/uploads/all", s.handleUploadListAll},
+		{"GET /api/v1/uploads/association", s.handleUploadAssociation},
+		{"GET /api/v1/uploads/duplicates", s.handleUploadDuplicates},
+		{"POST /api/v1/uploads/associate", s.handleUploadsAssociate},
+		{"GET /api/v1/users/{userId}/uploads", s.handleUserUploads},
 		{"PATCH /api/v1/uploads/{uploadId}", s.handleUploadPatch},
 		{"DELETE /api/v1/uploads/{uploadId}", s.handleUploadDelete},
 
 		{"GET /api/v1/tracks/{trackId}/sources", s.handleTrackSources},
+		{"POST /api/v1/tracks/{trackId}/sources", s.handleTrackSourceAttach},
 		{"POST /api/v1/variants/{variantId}/vote", s.handleVariantVote},
 		{"PUT /api/v1/me/tracks/{trackId}/preference", s.handleTrackPreference},
 
@@ -126,6 +141,7 @@ func (s *Server) routeTable() []route {
 		{"POST /api/v1/rooms/{roomId}/seek", s.handleRoomSeek},
 		{"POST /api/v1/rooms/{roomId}/vote", s.handleRoomVote},
 		{"POST /api/v1/rooms/{roomId}/ready", s.handleRoomReady},
+		{"POST /api/v1/rooms/{roomId}/out", s.handleRoomOut},
 	}
 }
 

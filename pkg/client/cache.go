@@ -41,7 +41,7 @@ type CacheEntry struct {
 // OpenCache opens (creating if needed) a media cache directory.
 func OpenCache(dir string) (*Cache, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, fmt.Errorf("prismusic: create cache dir: %w", err)
+		return nil, fmt.Errorf("musoak: create cache dir: %w", err)
 	}
 	cache := &Cache{dir: dir, index: map[string]CacheEntry{}}
 	if err := cache.load(); err != nil {
@@ -61,11 +61,11 @@ func (c *Cache) load() error {
 		if os.IsNotExist(err) {
 			return nil
 		}
-		return fmt.Errorf("prismusic: read cache index: %w", err)
+		return fmt.Errorf("musoak: read cache index: %w", err)
 	}
 	var entries []CacheEntry
 	if err := json.Unmarshal(raw, &entries); err != nil {
-		return fmt.Errorf("prismusic: parse cache index: %w", err)
+		return fmt.Errorf("musoak: parse cache index: %w", err)
 	}
 	for _, entry := range entries {
 		c.index[entry.VariantID] = entry
@@ -85,7 +85,7 @@ func (c *Cache) save() error {
 	}
 	tmp := c.indexPath() + ".part"
 	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
-		return fmt.Errorf("prismusic: write cache index: %w", err)
+		return fmt.Errorf("musoak: write cache index: %w", err)
 	}
 	return os.Rename(tmp, c.indexPath())
 }
@@ -163,7 +163,7 @@ func (c *Cache) Fetch(ctx context.Context, api *Client, variantID string) (Cache
 		return CacheEntry{}, err
 	}
 	if status.State != MediaReady {
-		return CacheEntry{}, fmt.Errorf("prismusic: variant %s is %s: %s", variantID, status.State, status.Error)
+		return CacheEntry{}, fmt.Errorf("musoak: variant %s is %s: %s", variantID, status.State, status.Error)
 	}
 
 	final := c.Path(variantID)
@@ -175,7 +175,7 @@ func (c *Cache) Fetch(ctx context.Context, api *Client, variantID string) (Cache
 	}
 	if err := os.Rename(tmp, final); err != nil {
 		_ = os.Remove(tmp)
-		return CacheEntry{}, fmt.Errorf("prismusic: store rendition: %w", err)
+		return CacheEntry{}, fmt.Errorf("musoak: store rendition: %w", err)
 	}
 
 	entry := CacheEntry{
@@ -203,19 +203,19 @@ func (c *Cache) download(ctx context.Context, api *Client, variantID, path strin
 
 	file, err := os.Create(path)
 	if err != nil {
-		return "", 0, fmt.Errorf("prismusic: create %s: %w", path, err)
+		return "", 0, fmt.Errorf("musoak: create %s: %w", path, err)
 	}
 	defer file.Close()
 
 	hash := sha256.New()
 	size, err := io.Copy(io.MultiWriter(file, hash), resp.Body)
 	if err != nil {
-		return "", 0, fmt.Errorf("prismusic: download %s: %w", variantID, err)
+		return "", 0, fmt.Errorf("musoak: download %s: %w", variantID, err)
 	}
 	sum := hex.EncodeToString(hash.Sum(nil))
 
 	if advertised := strings.Trim(resp.Header.Get("ETag"), `"`); advertised != "" && advertised != sum {
-		return "", 0, fmt.Errorf("prismusic: variant %s failed its checksum (%s != %s)", variantID, sum, advertised)
+		return "", 0, fmt.Errorf("musoak: variant %s failed its checksum (%s != %s)", variantID, sum, advertised)
 	}
 	return sum, size, nil
 }

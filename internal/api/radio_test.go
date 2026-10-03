@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"testing"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/provider"
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/provider"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 // fakeRadioProvider is a station-capable provider with canned suggestions.

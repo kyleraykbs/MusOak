@@ -6,7 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/config"
+	"codeberg.org/kyleraykbs/musoak/internal/config"
 )
 
 func newTestServer(t *testing.T) *Server {
@@ -48,12 +48,14 @@ func TestEnabledProvidersAreRegistered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if names := s.providers.Names(); len(names) != 1 || names[0] != "ytmusic" {
-		t.Errorf("providers = %v, want [ytmusic]", names)
+	if names := s.providers.Names(); len(names) != 2 || names[0] != "ytmusic" || names[1] != "youtube" {
+		t.Errorf("providers = %v, want [ytmusic youtube] (what the default configuration enables)", names)
 	}
 
 	cfg.Providers.YTMusic.Enabled = false
 	cfg.Providers.Spotify.Enabled = false
+	// The plain YouTube provider would reach the network; a test wants none of it.
+	cfg.Providers.YouTube.Enabled = false
 	off, err := New(cfg, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("New: %v", err)

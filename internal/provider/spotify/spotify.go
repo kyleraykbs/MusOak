@@ -22,7 +22,7 @@ import (
 	"sync"
 	"time"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/provider"
+	"codeberg.org/kyleraykbs/musoak/internal/provider"
 )
 
 // Name is the provider id.
@@ -73,14 +73,24 @@ func (p *Provider) Name() string { return Name }
 
 // Capabilities implements provider.Provider: search only, never download.
 func (p *Provider) Capabilities() provider.Caps {
+	// Without credentials the Web API is not there, so search and browsing
+	// cannot work. A public playlist still can - its embed page needs no
+	// account, which is exactly what importing one from here is for.
+	configured := p.configured()
 	return provider.Caps{
-		Search:        true,
+		Search:        configured,
 		Download:      false,
-		SearchAlbums:  true,
-		SearchArtists: true,
-		Radio:         true,
+		SearchAlbums:  configured,
+		SearchArtists: configured,
+		Radio:         configured,
 		Playlists:     true,
 	}
+}
+
+// configured reports whether the provider holds the credentials the Web API
+// needs. A household without them can still read a playlist by its link.
+func (p *Provider) configured() bool {
+	return strings.TrimSpace(p.clientID) != "" && strings.TrimSpace(p.clientSecret) != ""
 }
 
 // MissingDeps implements provider.DependencyChecker: Spotify needs nothing
@@ -238,6 +248,11 @@ func (p *Provider) SearchArtists(ctx context.Context, q string, opts provider.Se
 // SearchPlaylists implements provider.PlaylistSearcher: playlists are metadata
 // here too, so a playlist's tracks still play through matched renditions.
 func (p *Provider) SearchPlaylists(ctx context.Context, q string, opts provider.SearchOpts) ([]provider.Playlist, error) {
+	if !p.configured() {
+		// Searching needs the Web API. The embed page can be read but not
+		// searched, so say what to do instead of failing obscurely.
+		return nil, errors.New("spotify: no client credentials - import by link instead")
+	}
 	var page struct {
 		Playlists struct {
 			Items []struct {
@@ -276,6 +291,12 @@ func (p *Provider) SearchPlaylists(ctx context.Context, q string, opts provider.
 
 // Playlist implements provider.PlaylistSearcher.
 func (p *Provider) Playlist(ctx context.Context, providerPlaylistID string) (*provider.PlaylistDetail, error) {
+	// No credentials, no API - but a public playlist is readable from its embed
+	// page, and its tracks are enough to find the same songs on a provider that
+	// can be played. That is what an import needs.
+	if !p.configured() {
+		return p.publicPlaylist(ctx, providerPlaylistID)
+	}
 	var playlist struct {
 		ID          string         `json:"id"`
 		Name        string         `json:"name"`

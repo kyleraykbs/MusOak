@@ -443,7 +443,7 @@ func TestProviderRankings(t *testing.T) {
 }
 
 func TestMigrationsAreIdempotentOnReopen(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "prismusic.db")
+	path := filepath.Join(t.TempDir(), "musoak.db")
 	ctx := context.Background()
 
 	first, err := Open(path)

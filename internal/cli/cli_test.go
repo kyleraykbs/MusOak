@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/api"
-	"codeberg.org/kyleraykbs/prismusic/internal/config"
+	"codeberg.org/kyleraykbs/musoak/internal/api"
+	"codeberg.org/kyleraykbs/musoak/internal/config"
 )
 
 // lockedBuffer collects CLI output from the playback goroutine too.
@@ -40,7 +40,7 @@ func requireMpv(t *testing.T) {
 		t.Skip("mpv is not installed")
 	}
 	// Headless playback: no window, no audio device, no terminal noise.
-	t.Setenv("PRISM_MPV_ARGS", "--ao=null --no-video --really-quiet")
+	t.Setenv("MUSOAK_MPV_ARGS", "--ao=null --no-video --really-quiet")
 }
 
 func testApp(t *testing.T, mutate func(*config.Config)) (*App, *lockedBuffer) {
@@ -52,6 +52,8 @@ func testApp(t *testing.T, mutate func(*config.Config)) (*App, *lockedBuffer) {
 	cfg.Client.CacheDir = t.TempDir()
 	cfg.Providers.YTMusic.Enabled = false
 	cfg.Providers.Spotify.Enabled = false
+	// The plain YouTube provider would reach the network; a test wants none of it.
+	cfg.Providers.YouTube.Enabled = false
 	if mutate != nil {
 		mutate(cfg)
 	}

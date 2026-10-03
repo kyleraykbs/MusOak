@@ -6,7 +6,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 type favoriteRequest struct {
@@ -42,6 +42,7 @@ func (s *Server) handleFavoritesList(w http.ResponseWriter, r *http.Request) {
 		}
 		tracks = append(tracks, response)
 	}
+	s.withPlays(r.Context(), user, trackRefs(tracks))
 	writeJSON(w, http.StatusOK, map[string]any{"tracks": tracks})
 }
 

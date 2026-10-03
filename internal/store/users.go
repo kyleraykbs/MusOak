@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,14 +18,18 @@ func (d *DB) CreateUser(ctx context.Context, u *User) error {
 	if u.CreatedAt.IsZero() {
 		u.CreatedAt = time.Now()
 	}
-	_, err := d.db.ExecContext(ctx,
-		`INSERT INTO users (id, username, password_hash, display_name, icon_url, last_played_at, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		u.ID.String(), u.Username, u.PasswordHash, u.DisplayName, u.IconURL, u.LastPlayedAt.UnixMilli(), u.CreatedAt.UnixMilli())
+	platforms, err := marshalSearchPlatforms(u.SearchPlatforms)
+	if err != nil {
+		return err
+	}
+	_, err = d.db.ExecContext(ctx,
+		`INSERT INTO users (id, username, password_hash, display_name, icon_url, search_platforms, last_played_at, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		u.ID.String(), u.Username, u.PasswordHash, u.DisplayName, u.IconURL, platforms, u.LastPlayedAt.UnixMilli(), u.CreatedAt.UnixMilli())
 	return mapErr(err)
 }
 
-const userColumns = `id, username, password_hash, display_name, icon_url, last_played_at, created_at`
+const userColumns = `id, username, password_hash, display_name, icon_url, icon_version, search_platforms, last_played_at, created_at`
 
 // User returns the account by id.
 func (d *DB) User(ctx context.Context, id uuid.UUID) (*User, error) {
@@ -41,15 +47,21 @@ func scanUser(row rowScanner) (*User, error) {
 	var (
 		u          User
 		id         string
+		searchRaw  string
 		created    int64
 		lastPlayed int64
 	)
-	if err := row.Scan(&id, &u.Username, &u.PasswordHash, &u.DisplayName, &u.IconURL, &lastPlayed, &created); err != nil {
+	if err := row.Scan(&id, &u.Username, &u.PasswordHash, &u.DisplayName, &u.IconURL, &u.IconVersion, &searchRaw, &lastPlayed, &created); err != nil {
 		return nil, mapErr(err)
 	}
 	var err error
 	if u.ID, err = parseUUID(id); err != nil {
 		return nil, err
+	}
+	if searchRaw != "" {
+		if err := json.Unmarshal([]byte(searchRaw), &u.SearchPlatforms); err != nil {
+			return nil, fmt.Errorf("store: bad search_platforms for user %s: %w", id, err)
+		}
 	}
 	u.CreatedAt = time.UnixMilli(created).UTC()
 	u.LastPlayedAt = time.UnixMilli(lastPlayed).UTC()

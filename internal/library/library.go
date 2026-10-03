@@ -15,13 +15,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/match"
-	"codeberg.org/kyleraykbs/prismusic/internal/provider"
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/match"
+	"codeberg.org/kyleraykbs/musoak/internal/provider"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 // maxProviderAlbums bounds how many albums one artist sync will pull, so a
@@ -54,6 +55,7 @@ type Store interface {
 	store.AlbumRepo
 	store.ArtistRepo
 	store.ExternalPlaylistRepo
+	store.PlaylistRepo
 }
 
 // Service browses and syncs albums and artists.
@@ -116,8 +118,11 @@ type ArtistSyncResult struct {
 
 // SearchAlbums fans out to the album-capable providers and matches every hit
 // into the canonical library, so the same record from two sources is one album.
-func (s *Service) SearchAlbums(ctx context.Context, query string, limit int) ([]store.Album, []ProviderError, error) {
-	results := s.providers.SearchAlbums(ctx, query, provider.SearchOpts{Limit: limit})
+// An empty providers list searches every provider.
+func (s *Service) SearchAlbums(
+	ctx context.Context, query string, limit int, providers []string,
+) ([]store.Album, []ProviderError, error) {
+	results := s.providers.SearchSomeAlbums(ctx, providers, query, provider.SearchOpts{Limit: limit})
 
 	var (
 		albums   []store.Album
@@ -146,9 +151,12 @@ func (s *Service) SearchAlbums(ctx context.Context, query string, limit int) ([]
 	return albums, problems, nil
 }
 
-// SearchArtists fans out to the artist-capable providers.
-func (s *Service) SearchArtists(ctx context.Context, query string, limit int) ([]store.Artist, []ProviderError, error) {
-	results := s.providers.SearchArtists(ctx, query, provider.SearchOpts{Limit: limit})
+// SearchArtists fans out to the artist-capable providers. An empty providers
+// list searches every provider.
+func (s *Service) SearchArtists(
+	ctx context.Context, query string, limit int, providers []string,
+) ([]store.Artist, []ProviderError, error) {
+	results := s.providers.SearchSomeArtists(ctx, providers, query, provider.SearchOpts{Limit: limit})
 
 	var (
 		artists  []store.Artist
@@ -178,11 +186,12 @@ func (s *Service) SearchArtists(ctx context.Context, query string, limit int) ([
 }
 
 // SearchPlaylists fans out to the playlist-capable providers and records every
-// hit, so the library can serve its cover and remember what it synced.
+// hit, so the library can serve its cover and remember what it synced. An
+// empty providers list searches every provider.
 func (s *Service) SearchPlaylists(
-	ctx context.Context, query string, limit int,
+	ctx context.Context, query string, limit int, providers []string,
 ) ([]store.ExternalPlaylist, []ProviderError, error) {
-	results := s.providers.SearchPlaylists(ctx, query, provider.SearchOpts{Limit: limit})
+	results := s.providers.SearchSomePlaylists(ctx, providers, query, provider.SearchOpts{Limit: limit})
 
 	var (
 		playlists []store.ExternalPlaylist
@@ -234,6 +243,85 @@ func (s *Service) GetPlaylist(ctx context.Context, playlistID uuid.UUID) (*store
 		return nil, nil, err
 	}
 	return playlist, tracks, nil
+}
+
+// PlaylistImportResult says what an import brought over.
+type PlaylistImportResult struct {
+	// Playlist is the account's own playlist, the one that was created.
+	Playlist *store.Playlist
+	// Source is the provider playlist it was copied from.
+	Source provider.Playlist
+	// Added is how many tracks the playlist now holds.
+	Added int
+	// Playable is how many of them ended up with a rendition that can be
+	// played; the rest are metadata until something can be found for them.
+	Playable int
+	Errors   []ProviderError
+}
+
+// ImportPlaylist copies a provider's playlist into one of the account's own.
+//
+// Each track is matched into the canonical library, and then resolved: that
+// second step is the point of the whole thing. A Spotify playlist has no audio
+// here, so its songs are looked for on a provider that does have them - the
+// household ends up with its own playlist of renditions it can play.
+func (s *Service) ImportPlaylist(
+	ctx context.Context, userID uuid.UUID, providerName, providerPlaylistID, name string,
+	progress func(done, total int),
+) (*PlaylistImportResult, error) {
+	detail, err := s.providers.Playlist(ctx, providerName, providerPlaylistID)
+	if err != nil {
+		return nil, err
+	}
+	if len(detail.Tracks) == 0 {
+		return nil, fmt.Errorf("%w: %s is empty", ErrNoPlaylist, providerPlaylistID)
+	}
+
+	result := &PlaylistImportResult{Source: detail.Playlist}
+	total := len(detail.Tracks)
+	if progress != nil {
+		progress(0, total)
+	}
+	ids := make([]uuid.UUID, 0, total)
+	for index, hit := range detail.Tracks {
+		track, _, err := s.matcher.Attach(ctx, providerName, hit)
+		if err != nil {
+			result.Errors = append(result.Errors, ProviderError{Provider: providerName, Error: err.Error()})
+		} else {
+			ids = append(ids, track.ID)
+			if _, err := s.matcher.Resolve(ctx, track.ID); err == nil {
+				result.Playable++
+			}
+		}
+		// One track at a time is the only honest measure of this job: each one
+		// is a provider search.
+		if progress != nil {
+			progress(index+1, total)
+		}
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("%w: nothing in %s could be matched", ErrNoPlaylist, providerPlaylistID)
+	}
+
+	title := strings.TrimSpace(name)
+	if title == "" {
+		title = strings.TrimSpace(detail.Title)
+	}
+	if title == "" {
+		title = "Imported playlist"
+	}
+	playlist := &store.Playlist{UserID: userID, Name: title}
+	if err := s.db.CreatePlaylist(ctx, playlist); err != nil {
+		return nil, err
+	}
+	if err := s.db.AppendPlaylistItems(ctx, playlist.ID, ids); err != nil {
+		return nil, err
+	}
+	result.Playlist = playlist
+	result.Added = len(ids)
+	s.logger.Info("playlist imported", "playlist", playlist.ID, "provider", providerName,
+		"source", providerPlaylistID, "tracks", result.Added, "playable", result.Playable)
+	return result, nil
 }
 
 // SyncPlaylist pulls a provider playlist's tracks into the canonical library,
@@ -379,11 +467,23 @@ func (s *Service) SyncAlbum(ctx context.Context, albumID uuid.UUID, providers []
 	}
 
 	result := &SyncResult{AlbumID: albumID, Providers: providersFor(selected)}
+	// Attaching a track links it to its album, so the album's own tracklist is
+	// already growing while the loop runs: what the sync added is the album's
+	// growth, not what AppendAlbumTracks had left to insert.
+	before, err := s.db.AlbumTracks(ctx, albumID)
+	if err != nil {
+		return nil, err
+	}
 	for _, variant := range selected {
 		detail, err := s.providers.Album(ctx, variant.Provider, variant.ProviderAlbumID)
 		if err != nil {
 			result.Errors = append(result.Errors, ProviderError{Provider: variant.Provider, Error: err.Error()})
 			continue
+		}
+		// The release's size is what tells a client whether this album is
+		// complete, and the tracklist is the only place to learn it.
+		if err := s.db.SetAlbumVariantTrackCount(ctx, variant.ID, len(detail.Tracks)); err != nil {
+			return nil, err
 		}
 
 		ids := make([]uuid.UUID, 0, len(detail.Tracks))
@@ -394,13 +494,11 @@ func (s *Service) SyncAlbum(ctx context.Context, albumID uuid.UUID, providers []
 			}
 			ids = append(ids, track.ID)
 		}
-		added, err := s.db.AppendAlbumTracks(ctx, albumID, ids)
-		if err != nil {
+		if _, err := s.db.AppendAlbumTracks(ctx, albumID, ids); err != nil {
 			return nil, err
 		}
-		result.Added += added
 		s.logger.Info("album synced", "album", albumID, "provider", variant.Provider,
-			"tracks", len(ids), "added", added)
+			"tracks", len(ids))
 	}
 
 	tracks, err := s.db.AlbumTracks(ctx, albumID)
@@ -408,6 +506,7 @@ func (s *Service) SyncAlbum(ctx context.Context, albumID uuid.UUID, providers []
 		return nil, err
 	}
 	result.Tracks = tracks
+	result.Added = len(tracks) - len(before)
 
 	// An album found without credits learns them from its own tracklist, so a
 	// bare provider result becomes a properly attributed album.

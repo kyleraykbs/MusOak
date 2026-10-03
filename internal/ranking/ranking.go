@@ -11,13 +11,67 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/config"
-	"codeberg.org/kyleraykbs/prismusic/internal/store"
+	"codeberg.org/kyleraykbs/musoak/internal/config"
+	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
 // ErrInvalidRanking means the submitted order names an unknown or repeated
 // provider.
 var ErrInvalidRanking = fmt.Errorf("invalid provider ranking")
+
+// SlotSelf and SlotUploaded are the two reserved names an effective order
+// carries besides real providers. They are not providers: whichever side
+// chooses a rendition resolves them against a track's user-sourced variants,
+// SlotSelf to the caller's own upload and SlotUploaded to the best-liked
+// upload by somebody else.
+const (
+	SlotSelf     = "self"
+	SlotUploaded = "uploaded"
+)
+
+// slotNames is the reserved pair in preference order: your own copy first,
+// the household's favourite second.
+func slotNames() []string { return []string{SlotSelf, SlotUploaded} }
+
+// IsSlot reports whether name is a reserved, non-provider order slot.
+func IsSlot(name string) bool {
+	return name == SlotSelf || name == SlotUploaded
+}
+
+// withSlots puts the reserved slots at the head of order, leaving the place of
+// any slot the user ranked themselves. An order stored before the slots
+// existed gains them here, so nobody loses the new choices.
+func withSlots(order []string) []string {
+	present := make(map[string]bool, 2)
+	for _, name := range order {
+		if IsSlot(name) {
+			present[name] = true
+		}
+	}
+	if len(present) == len(slotNames()) {
+		return order
+	}
+	out := make([]string, 0, len(order)+len(slotNames())-len(present))
+	for _, name := range slotNames() {
+		if !present[name] {
+			out = append(out, name)
+		}
+	}
+	return append(out, order...)
+}
+
+// providersOnly strips the reserved slots, leaving the real providers of a
+// stored order. Slots are positions in a user's own list, never providers that
+// the aggregate should average.
+func providersOnly(order []string) []string {
+	out := make([]string, 0, len(order))
+	for _, name := range order {
+		if !IsSlot(name) {
+			out = append(out, name)
+		}
+	}
+	return out
+}
 
 // Service stores per-user rankings and caches the aggregate order.
 type Service struct {
@@ -26,6 +80,7 @@ type Service struct {
 	logger   *slog.Logger
 
 	mu        sync.RWMutex
+	enabled   []string
 	aggregate []string
 	dirty     bool
 }
@@ -44,6 +99,46 @@ func New(db store.RankingRepo, defaults []string, logger *slog.Logger) *Service 
 	}
 }
 
+// SetEnabledProviders records the enabled provider names in registration
+// order. Every order this service hands out is completed with them, so a
+// configured default that predates a provider still covers it.
+func (s *Service) SetEnabledProviders(names []string) {
+	s.mu.Lock()
+	s.enabled = append([]string(nil), names...)
+	s.dirty = true
+	s.mu.Unlock()
+}
+
+// complete appends the enabled providers that order does not already name, in
+// registration order. It never disturbs what is already there.
+func complete(enabled, order []string) []string {
+	if len(enabled) == 0 {
+		return order
+	}
+	seen := make(map[string]bool, len(order)+len(enabled))
+	for _, name := range order {
+		seen[name] = true
+	}
+	missing := 0
+	for _, name := range enabled {
+		if !seen[name] {
+			missing++
+		}
+	}
+	if missing == 0 {
+		return order
+	}
+	out := make([]string, 0, len(order)+missing)
+	out = append(out, order...)
+	for _, name := range enabled {
+		if !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
 // Validate checks a submitted order: known providers, no repeats.
 func Validate(providers []string) error {
 	if len(providers) == 0 {
@@ -51,7 +146,7 @@ func Validate(providers []string) error {
 	}
 	seen := make(map[string]bool, len(providers))
 	for _, provider := range providers {
-		if !config.KnownProvider(provider) {
+		if !config.KnownProvider(provider) && !IsSlot(provider) {
 			return fmt.Errorf("%w: unknown provider %q", ErrInvalidRanking, provider)
 		}
 		if seen[provider] {
@@ -77,13 +172,17 @@ func (s *Service) Set(ctx context.Context, userID uuid.UUID, providers []string)
 }
 
 // User returns the effective order for a user: their own, or the aggregate.
+// Either way it ends with any enabled provider the order did not name.
 func (s *Service) User(ctx context.Context, userID uuid.UUID) ([]string, error) {
 	own, err := s.db.Ranking(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
 	if len(own) > 0 {
-		return own, nil
+		s.mu.RLock()
+		enabled := append([]string(nil), s.enabled...)
+		s.mu.RUnlock()
+		return withSlots(complete(enabled, own)), nil
 	}
 	return s.Aggregate(ctx)
 }
@@ -98,6 +197,7 @@ func (s *Service) Aggregate(ctx context.Context) ([]string, error) {
 		s.mu.RUnlock()
 		return out, nil
 	}
+	enabled := append([]string(nil), s.enabled...)
 	s.mu.RUnlock()
 
 	all, err := s.db.AllRankings(ctx)
@@ -105,29 +205,31 @@ func (s *Service) Aggregate(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 
+	// A stored order may name the reserved slots; they lead every effective
+	// order but are not providers, so the mean is over the providers alone.
+	rankings := make([][]string, 0, len(all))
+	for _, providers := range all {
+		if ranked := providersOnly(providers); len(ranked) > 0 {
+			rankings = append(rankings, ranked)
+		}
+	}
+	if len(rankings) == 0 {
+		return withSlots(complete(enabled, append([]string(nil), s.defaults...))), nil
+	}
+
 	universe := make(map[string]bool)
 	for _, provider := range s.defaults {
 		universe[provider] = true
 	}
-	contributing := 0
-	for _, providers := range all {
-		if len(providers) == 0 {
-			continue
-		}
-		contributing++
+	contributing := len(rankings)
+	for _, providers := range rankings {
 		for _, provider := range providers {
 			universe[provider] = true
 		}
 	}
-	if contributing == 0 {
-		return append([]string(nil), s.defaults...), nil
-	}
 
 	sum := make(map[string]float64, len(universe))
-	for _, providers := range all {
-		if len(providers) == 0 {
-			continue
-		}
+	for _, providers := range rankings {
 		rank := make(map[string]float64, len(providers))
 		for i, provider := range providers {
 			rank[provider] = float64(i) / float64(len(providers))
@@ -158,6 +260,8 @@ func (s *Service) Aggregate(ctx context.Context) ([]string, error) {
 		}
 		return order[i] < order[j]
 	})
+
+	order = withSlots(complete(enabled, order))
 
 	s.mu.Lock()
 	s.aggregate = append([]string(nil), order...)

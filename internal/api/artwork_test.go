@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/provider"
+	"codeberg.org/kyleraykbs/musoak/internal/provider"
 )
 
 // artworkProvider returns one hit carrying a cover URL.

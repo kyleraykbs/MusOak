@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/coder/websocket"
@@ -53,6 +54,20 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+
+	// A WebSocket cannot carry the headers the rest of the API uses, so the
+	// identity travels in the query - that is how the web client names itself.
+	// Without this the socket is nobody's, and nothing is ever disconnected.
+	identity := strings.TrimSpace(r.URL.Query().Get("memberId"))
+	if identity == "" {
+		if member, ok := s.callerMember(r, false); ok {
+			identity = member.ID
+		}
+	}
+	if identity != "" {
+		s.rooms.Connect(identity)
+		defer s.rooms.Disconnect(identity)
+	}
 
 	events, unsubscribe := s.rooms.Subscribe()
 	defer unsubscribe()

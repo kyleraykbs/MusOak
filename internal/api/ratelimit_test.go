@@ -1,12 +1,112 @@
 package api
 
 import (
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
-	"codeberg.org/kyleraykbs/prismusic/internal/config"
+	"codeberg.org/kyleraykbs/musoak/internal/config"
 )
+
+// mustCIDRs parses trusted-proxy networks for the resolution tests.
+func mustCIDRs(t *testing.T, cidrs ...string) []*net.IPNet {
+	t.Helper()
+	nets := make([]*net.IPNet, 0, len(cidrs))
+	for _, cidr := range cidrs {
+		_, n, err := net.ParseCIDR(cidr)
+		if err != nil {
+			t.Fatalf("ParseCIDR(%q): %v", cidr, err)
+		}
+		nets = append(nets, n)
+	}
+	return nets
+}
+
+func TestClientKeyIgnoresForwardedHeaderWithoutTrustedProxies(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/search", nil)
+	r.RemoteAddr = "203.0.113.7:4321"
+	r.Header.Set("X-Forwarded-For", "1.2.3.4")
+
+	if got := clientKey(r, nil); got != "203.0.113.7" {
+		t.Errorf("clientKey = %q, want the socket peer 203.0.113.7", got)
+	}
+}
+
+func TestClientKeyResolvesForwardedClientBehindTrustedProxy(t *testing.T) {
+	trusted := mustCIDRs(t, "127.0.0.1/32", "10.0.0.0/8")
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/search", nil)
+	r.RemoteAddr = "127.0.0.1:5555"
+	r.Header.Set("X-Forwarded-For", "1.2.3.4, 127.0.0.1")
+
+	if got := clientKey(r, trusted); got != "1.2.3.4" {
+		t.Errorf("clientKey = %q, want the forwarded client 1.2.3.4", got)
+	}
+}
+
+func TestClientKeyAllTrustedChainFallsBackToPeer(t *testing.T) {
+	trusted := mustCIDRs(t, "10.0.0.0/8")
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/search", nil)
+	r.RemoteAddr = "10.0.0.5:5555"
+	r.Header.Set("X-Forwarded-For", "10.0.0.9, 10.0.0.5")
+
+	if got := clientKey(r, trusted); got != "10.0.0.5" {
+		t.Errorf("clientKey = %q, want the socket peer 10.0.0.5", got)
+	}
+}
+
+func TestClientKeyMalformedForwardedHeaderFallsBackToPeer(t *testing.T) {
+	trusted := mustCIDRs(t, "10.0.0.0/8")
+	cases := map[string]string{
+		"absent":    "",
+		"garbage":   "not-an-ip",
+		"empty mid": "1.2.3.4, , 10.0.0.5",
+	}
+	for name, header := range cases {
+		t.Run(name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/api/v1/search", nil)
+			r.RemoteAddr = "10.0.0.5:5555"
+			if header != "" {
+				r.Header.Set("X-Forwarded-For", header)
+			}
+			if got := clientKey(r, trusted); got != "10.0.0.5" {
+				t.Errorf("clientKey = %q, want the socket peer 10.0.0.5", got)
+			}
+		})
+	}
+}
+
+func TestRateLimitKeysOnResolvedClient(t *testing.T) {
+	c := newHTTPTestServer(t, func(cfg *config.Config) {
+		cfg.RateLimit.SearchPerMinute = 60
+		cfg.RateLimit.LoginPerMinute = 60
+		cfg.TrustedProxies = []string{"10.0.0.0/8"}
+	})
+	// One request per client, reusing the trust list the server parsed so a
+	// wiring mistake shows up as a wrong bucket below.
+	c.searchLimiter = newLimiter(1, 1, c.searchLimiter.trusted...)
+
+	search := func(peer, forwarded string) int {
+		r := httptest.NewRequest(http.MethodGet, "/api/v1/search?q=x", nil)
+		r.RemoteAddr = peer
+		r.Header.Set("X-Forwarded-For", forwarded)
+		rec := httptest.NewRecorder()
+		c.Server.Handler().ServeHTTP(rec, r)
+		return rec.Code
+	}
+
+	// The same client, forwarded by two different proxies, shares one bucket.
+	if code := search("10.0.0.5:1111", "1.2.3.4, 10.0.0.5"); code != http.StatusOK {
+		t.Fatalf("first search = %d, want 200", code)
+	}
+	if code := search("10.0.0.9:2222", "1.2.3.4, 10.0.0.9"); code != http.StatusTooManyRequests {
+		t.Fatalf("same client via another proxy = %d, want 429", code)
+	}
+	// A different client still has its own budget.
+	if code := search("10.0.0.5:3333", "5.6.7.8, 10.0.0.5"); code != http.StatusOK {
+		t.Fatalf("different client = %d, want 200", code)
+	}
+}
 
 func TestSearchRateLimit(t *testing.T) {
 	c := newHTTPTestServer(t, func(cfg *config.Config) {
