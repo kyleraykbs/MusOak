@@ -1499,20 +1499,28 @@ paths:
         Finds accounts by name. Each entry carries what the caller's
         relationship to them is; `online` is derived from `lastPlayedAt`, which
         counts as online for five minutes.
+
+        An empty `q` asks for the whole server. A server holding no more than
+        fifty accounts answers with all of them and `directory: true`; a larger
+        one answers with nothing and `directory: false`, so that a client can
+        say "too many to list" rather than "nobody is here".
       operationId: searchUsers
-      parameters: [{ $ref: "#/components/parameters/SearchQuery" }]
+      parameters: [{ $ref: "#/components/parameters/PeopleQuery" }]
       responses:
         "200":
-          description: Matching accounts.
+          description: Matching accounts, or the whole server when it is small enough to list.
           content:
             application/json:
               schema:
                 type: object
-                required: [users]
+                required: [users, directory]
                 properties:
                   users:
                     type: array
                     items: { $ref: "#/components/schemas/UserProfile" }
+                  directory:
+                    type: boolean
+                    description: Whether an empty `q` was answered with the whole server.
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
@@ -2442,6 +2450,13 @@ components:
       name: q
       in: query
       required: true
+      schema: { type: string }
+    PeopleQuery:
+      name: q
+      in: query
+      description: |
+        A name to look for. Empty asks for the whole server, which only a small
+        one answers.
       schema: { type: string }
     SearchLimit:
       name: limit

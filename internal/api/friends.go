@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"codeberg.org/kyleraykbs/musoak/internal/store"
+	"strings"
 )
 
 // presenceWindow is how recently an account must have played something to
@@ -19,6 +20,13 @@ const presenceWindow = 5 * time.Minute
 
 // maxUserSearch bounds a people search to a page of names.
 const maxUserSearch = 20
+
+// directoryUserLimit is how many accounts a server may hold and still answer an
+// empty people search with all of them. Below it a list is what somebody wants -
+// typing a name to find a person you have not met is a guessing game - and above
+// it the answer is nothing, which the client reports as too many to list rather
+// than as nobody being here.
+const directoryUserLimit = 50
 
 // publicUserResponse is an account as other people see it: no password material,
 // but how it relates to the viewer and what they are playing right now.
@@ -223,7 +231,29 @@ func (s *Server) handleUserSearch(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	users, err := s.store.SearchUsers(r.Context(), r.URL.Query().Get("q"), maxUserSearch)
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	limit := maxUserSearch
+	// An empty search is a request for the whole server. A small one answers
+	// with everybody; a large one answers with nothing and says which it was,
+	// because an empty page reads as "nobody is here" otherwise.
+	directory := false
+	if query == "" {
+		total, err := s.store.CountUsers(r.Context())
+		if err != nil {
+			writeStoreError(w, err, "users unavailable")
+			return
+		}
+		if total > directoryUserLimit {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"users":     []publicUserResponse{},
+				"directory": false,
+			})
+			return
+		}
+		directory = true
+		limit = directoryUserLimit
+	}
+	users, err := s.store.SearchUsers(r.Context(), query, limit)
 	if err != nil {
 		writeStoreError(w, err, "users unavailable")
 		return
@@ -246,7 +276,7 @@ func (s *Server) handleUserSearch(w http.ResponseWriter, r *http.Request) {
 		}
 		responses = append(responses, response)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"users": responses})
+	writeJSON(w, http.StatusOK, map[string]any{"users": responses, "directory": directory})
 }
 
 // handleUserGet is the friend page: the account plus the four lists the page

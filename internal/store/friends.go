@@ -292,6 +292,15 @@ func (d *DB) SearchUsers(ctx context.Context, query string, limit int) ([]User, 
 	return scanPublicUsers(rows)
 }
 
+// CountUsers is how many accounts the server holds.
+func (d *DB) CountUsers(ctx context.Context) (int, error) {
+	var total int
+	if err := d.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&total); err != nil {
+		return 0, mapErr(err)
+	}
+	return total, nil
+}
+
 // UserForViewer returns one account and how it relates to the viewer.
 func (d *DB) UserForViewer(ctx context.Context, viewerID, userID uuid.UUID) (*User, Relationship, error) {
 	user, err := scanPublicUser(d.db.QueryRowContext(ctx,

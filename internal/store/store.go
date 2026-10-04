@@ -188,6 +188,8 @@ type UserRepo interface {
 	CreateUser(ctx context.Context, u *User) error
 	User(ctx context.Context, id uuid.UUID) (*User, error)
 	UserByUsername(ctx context.Context, username string) (*User, error)
+	// CountUsers is how many accounts the server holds.
+	CountUsers(ctx context.Context) (int, error)
 	// SetSearchPlatforms replaces the platforms a search asks by default; an
 	// empty list clears the preference.
 	SetSearchPlatforms(ctx context.Context, userID uuid.UUID, platforms []string) error

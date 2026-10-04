@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"codeberg.org/kyleraykbs/musoak/internal/store"
+	"fmt"
 	"github.com/google/uuid"
 )
 
@@ -517,5 +519,65 @@ func TestOnlineDerivedFromLastPlayedAt(t *testing.T) {
 	}
 	if page.User.LastPlayedAt == nil {
 		t.Error("the last played time is still worth showing")
+	}
+}
+
+// A server small enough to be read whole answers an empty people search with
+// everybody. On a handful of accounts a list is what finding somebody you have
+// not met needs; typing a name first is a guessing game.
+func TestPeopleSearchListsEveryoneOnASmallServer(t *testing.T) {
+	c := newHTTPTestServer(t, nil)
+	token := c.register("kyle", "hunter2hunter2")
+	c.register("sam", "hunter2hunter2")
+
+	var out struct {
+		Users     []publicUserResponse `json:"users"`
+		Directory bool                 `json:"directory"`
+	}
+	c.decode(c.do(http.MethodGet, "/api/v1/users?q=", token, nil), &out)
+	if len(out.Users) != 2 {
+		t.Fatalf("an empty search returned %d people, want both", len(out.Users))
+	}
+	if !out.Directory {
+		t.Error("the answer should say it listed the server")
+	}
+
+	// A name narrows it, and that is not a listing.
+	out.Users, out.Directory = nil, false
+	c.decode(c.do(http.MethodGet, "/api/v1/users?q=sam", token, nil), &out)
+	if len(out.Users) != 1 || out.Directory {
+		t.Errorf("a named search returned %d people, directory %v", len(out.Users), out.Directory)
+	}
+}
+
+// Past the limit the answer is nothing, and says so: an empty page would
+// otherwise read as a server nobody is on.
+func TestPeopleSearchRefusesToListALargeServer(t *testing.T) {
+	c := newHTTPTestServer(t, nil)
+	token := c.register("kyle", "hunter2hunter2")
+	// Made directly: registering fifty more accounts would only test argon2.
+	for i := 0; i <= directoryUserLimit; i++ {
+		err := c.store.CreateUser(context.Background(), &store.User{
+			Username:     fmt.Sprintf("person%03d", i),
+			PasswordHash: "x",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var out struct {
+		Users     []publicUserResponse `json:"users"`
+		Directory bool                 `json:"directory"`
+	}
+	c.decode(c.do(http.MethodGet, "/api/v1/users?q=", token, nil), &out)
+	if len(out.Users) != 0 || out.Directory {
+		t.Errorf("an empty search on a big server returned %d people, directory %v", len(out.Users), out.Directory)
+	}
+
+	// Searching by name still works: the limit is on listing, not on finding.
+	c.decode(c.do(http.MethodGet, "/api/v1/users?q=person001", token, nil), &out)
+	if len(out.Users) != 1 {
+		t.Errorf("a named search on a big server returned %d people, want 1", len(out.Users))
 	}
 }
