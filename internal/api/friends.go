@@ -712,6 +712,14 @@ func (s *Server) handleNotifications(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The Friends tab carries how many people are waiting on an answer, and the
+	// bell's poll is what keeps it current: one request, not two.
+	friendRequests, err := s.store.CountIncomingFriendRequests(r.Context(), caller.ID)
+	if err != nil {
+		writeStoreError(w, err, "notifications unavailable")
+		return
+	}
+
 	// One lookup for every sender on the page rather than one per row.
 	senders := make([]uuid.UUID, 0, len(entries))
 	for _, entry := range entries {
@@ -760,7 +768,11 @@ func (s *Server) handleNotifications(w http.ResponseWriter, r *http.Request) {
 		}
 		responses = append(responses, response)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"notifications": responses, "unread": unread})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"notifications":  responses,
+		"unread":         unread,
+		"friendRequests": friendRequests,
+	})
 }
 
 // handleNotificationsRead marks everything read; the badge goes to zero.

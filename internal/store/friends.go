@@ -234,6 +234,19 @@ func (d *DB) IncomingFriendRequests(ctx context.Context, userID uuid.UUID) ([]Us
 	return scanPublicUsers(rows)
 }
 
+// CountIncomingFriendRequests is how many people are waiting on an answer: the
+// number the Friends tab carries before it is ever opened.
+func (d *DB) CountIncomingFriendRequests(ctx context.Context, userID uuid.UUID) (int, error) {
+	var count int
+	err := d.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM friendships WHERE friend_id = ? AND state = ?`,
+		userID.String(), statePending).Scan(&count)
+	if err != nil {
+		return 0, mapErr(err)
+	}
+	return count, nil
+}
+
 // OutgoingFriendRequests lists the requests userID is still waiting on.
 func (d *DB) OutgoingFriendRequests(ctx context.Context, userID uuid.UUID) ([]User, error) {
 	rows, err := d.db.QueryContext(ctx, `
