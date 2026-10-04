@@ -30,6 +30,7 @@ import (
 	"codeberg.org/kyleraykbs/musoak/internal/ranking"
 	"codeberg.org/kyleraykbs/musoak/internal/rooms"
 	"codeberg.org/kyleraykbs/musoak/internal/store"
+	"github.com/google/uuid"
 )
 
 // ShutdownTimeout bounds graceful shutdown after the context is cancelled.
@@ -94,6 +95,15 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 	s.auth = auth.New(cfg, db, logger)
 	s.ranking = ranking.New(db, cfg.DefaultProviderOrder, logger)
 	s.rooms = rooms.NewManager(cfg, db, s.matcher, s.ranking, logger)
+	// The room fetches what it is about to play. The server knows the queue and
+	// the assigned renditions, so warming belongs here rather than in each
+	// client: a member running an old frontend, or none of the clever ones,
+	// still finds the next song waiting for them.
+	s.rooms.SetWarm(func(variantID uuid.UUID) {
+		if _, err := s.media.Ensure(context.Background(), variantID); err != nil {
+			logger.Debug("room: could not warm a rendition", "variant", variantID, "error", err)
+		}
+	})
 	s.radio = radio.New(db, s.providers, s.matcher, logger)
 	s.library = library.New(db, s.providers, s.matcher, logger)
 	s.artwork = artwork.New(filepath.Join(cfg.StorageDir, "artwork"), db, logger)

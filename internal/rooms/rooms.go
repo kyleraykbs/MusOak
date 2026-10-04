@@ -254,6 +254,33 @@ type Manager struct {
 	store   Store
 	matcher *match.Matcher
 	ranking *ranking.Service
+	// warm asks for a rendition to be fetched before anybody needs it. The room
+	// is what assigns variants and knows the play order, so the room is what can
+	// say which files the next song will need - and a client's own warming is
+	// only ever as good as the version of the client doing it.
+	warm func(uuid.UUID)
+}
+
+// SetWarm installs the callback the room uses to fetch a rendition ahead of
+// time. Without one the room does not warm anything: nothing else depends on it.
+func (m *Manager) SetWarm(fn func(uuid.UUID)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.warm = fn
+}
+
+// warmLocked asks for the assigned renditions of a playback to be fetched. It
+// is called once the assignment is known, which is the earliest moment anybody
+// can say what the song will be played from.
+func (m *Manager) warmLocked(playback *playback) {
+	if m.warm == nil || playback == nil {
+		return
+	}
+	for _, variantID := range playback.variants {
+		if variantID != uuid.Nil {
+			go m.warm(variantID)
+		}
+	}
 }
 
 // NewManager returns a room manager.
@@ -1274,6 +1301,11 @@ func (m *Manager) prepare(roomID, itemID string) {
 	target.variants = assignments
 	target.durations = durations
 	target.prepared = true
+	// Fetch what this song will be played from, now that it is known. For the
+	// song prepared behind the current one that is the whole point: the file is
+	// here before the advance, whoever is listening and whatever their client
+	// knows how to do.
+	m.warmLocked(target)
 	if target == room.current {
 		// Someone who arrived mid-track has a file the room has not reckoned
 		// with, and the end of the song moves.

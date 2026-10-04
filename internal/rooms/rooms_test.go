@@ -1529,3 +1529,54 @@ func TestRoomWaitsWhenNobodyIsReadyAhead(t *testing.T) {
 		t.Error("nothing said the second file was here; the room should still be waiting")
 	}
 }
+
+// The room asks for the renditions of the song it has prepared, so that a
+// client's own warming is a bonus rather than the only thing standing between
+// the room and a download. A member running an old frontend cannot warm at all,
+// and used to cost the room the whole readiness timeout.
+func TestRoomWarmsWhatItIsAboutToPlay(t *testing.T) {
+	f := newFixture(t, nil)
+	ctx := context.Background()
+
+	var mu sync.Mutex
+	warmed := map[uuid.UUID]bool{}
+	f.m.SetWarm(func(id uuid.UUID) {
+		mu.Lock()
+		defer mu.Unlock()
+		warmed[id] = true
+	})
+
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "a"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	roomID := snapshot.ID
+	first, _ := f.trackWithVariants("First", variantSpec{
+		provider: "local", providerTrackID: "First", durationMs: 180_000, downloadable: true,
+	})
+	second, secondVariants := f.trackWithVariants("Second", variantSpec{
+		provider: "local", providerTrackID: "Second", durationMs: 180_000, downloadable: true,
+	})
+	if _, err := f.enqueue(ctx, roomID, "a", first.ID); err != nil {
+		t.Fatalf("Enqueue(first): %v", err)
+	}
+	if _, err := f.enqueue(ctx, roomID, "a", second.ID); err != nil {
+		t.Fatalf("Enqueue(second): %v", err)
+	}
+	if _, err := f.m.Ready(roomID, "a", first.ID, uuid.Nil, 180_000); err != nil {
+		t.Fatalf("Ready(first): %v", err)
+	}
+	f.nextPrepared(roomID)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		got := warmed[secondVariants[0].ID]
+		mu.Unlock()
+		if got {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Error("the room never asked for the prepared song's rendition")
+}
