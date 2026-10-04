@@ -223,7 +223,9 @@ type SkipRules struct {
 	SkipThreshold        float64 `json:"skipThreshold"`
 	MinVotersForSkip     int     `json:"minVotersForSkip"`
 	VoterFractionForSkip float64 `json:"voterFractionForSkip"`
-	ReadyTimeoutSeconds  int     `json:"readyTimeoutSeconds"`
+	// ReadyFraction is how much of the room must have the song to start it.
+	ReadyFraction       float64 `json:"readyFraction"`
+	ReadyTimeoutSeconds int     `json:"readyTimeoutSeconds"`
 }
 
 // Store is the repository slice rooms need.
@@ -1418,17 +1420,33 @@ func (m *Manager) maybeStartLocked(room *room) {
 	if playback == nil || playback.startedAtMs != 0 || !playback.prepared {
 		return
 	}
-	if !playback.timedOut {
-		for memberID := range room.members {
-			if room.out[memberID] {
-				continue
-			}
-			if _, ready := playback.ready[memberID]; !ready {
-				return
-			}
-		}
+	if !playback.timedOut && !m.quorumReadyLocked(room, playback) {
+		return
 	}
 	m.startLocked(room, playback)
+}
+
+// quorumReadyLocked reports whether enough of the room has the song to begin.
+//
+// Waiting for every last member is what a room's slowest connection used to
+// cost everybody. The window in the rules is the backstop; this is what usually
+// ends the wait first. A member sitting the song out, or one who is not here,
+// is not somebody to wait for.
+func (m *Manager) quorumReadyLocked(room *room, playback *playback) bool {
+	playing, ready := 0, 0
+	for memberID := range room.members {
+		if room.out[memberID] {
+			continue
+		}
+		playing++
+		if _, ok := playback.ready[memberID]; ok {
+			ready++
+		}
+	}
+	if playing == 0 {
+		return true
+	}
+	return float64(ready) >= float64(playing)*m.cfg.ListenTogether.ReadyFraction
 }
 
 // startLocked fixes the timeline and the start instant, then announces
@@ -1618,6 +1636,7 @@ func (m *Manager) snapshotLocked(room *room) *Snapshot {
 			SkipThreshold:        m.cfg.ListenTogether.SkipThreshold,
 			MinVotersForSkip:     m.cfg.ListenTogether.MinVotersForSkip,
 			VoterFractionForSkip: m.cfg.ListenTogether.VoterFractionForSkip,
+			ReadyFraction:        m.cfg.ListenTogether.ReadyFraction,
 			ReadyTimeoutSeconds:  m.cfg.ListenTogether.ReadyTimeoutSeconds,
 		},
 	}

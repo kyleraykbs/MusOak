@@ -77,7 +77,12 @@ type ListenTogether struct {
 	SkipThreshold        float64 `json:"skipThreshold"`
 	MinVotersForSkip     int     `json:"minVotersForSkip"`
 	VoterFractionForSkip float64 `json:"voterFractionForSkip"`
-	ReadyTimeoutSeconds  int     `json:"readyTimeoutSeconds"`
+	// ReadyFraction is how much of the room has to have the song before it
+	// starts: waiting for the last member is waiting for the slowest one.
+	ReadyFraction float64 `json:"readyFraction"`
+	// ReadyTimeoutSeconds is how long the room waits for that fraction before
+	// starting anyway. Members who missed it are catching up.
+	ReadyTimeoutSeconds int `json:"readyTimeoutSeconds"`
 }
 
 // Match tunes cross-provider track merging.
@@ -159,7 +164,8 @@ func Default() *Config {
 			SkipThreshold:        2.0,
 			MinVotersForSkip:     2,
 			VoterFractionForSkip: 0.5,
-			ReadyTimeoutSeconds:  30,
+			ReadyFraction:        0.75,
+			ReadyTimeoutSeconds:  6,
 		},
 		Match:  Match{Threshold: DefaultMatchThreshold},
 		Client: Client{CacheDir: DefaultCacheDir()},

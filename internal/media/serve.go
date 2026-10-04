@@ -41,6 +41,12 @@ func (m *Manager) ServeFile(w http.ResponseWriter, r *http.Request, variantID uu
 
 	w.Header().Set("ETag", `"`+file.SHA256+`"`)
 	w.Header().Set("Content-Type", "audio/ogg")
+	// A rendition is immutable in practice: the bytes for a variant are written
+	// once, and the ETag is their hash. Without a lifetime a browser keeps
+	// nothing, so a client that fetched a song ahead of time fetches it again
+	// when it plays - which is how a room that started on time was heard a
+	// minute late. Private, because a library is not a public cache's business.
+	w.Header().Set("Cache-Control", "private, max-age=604800")
 	w.Header().Set("X-Content-SHA256", file.SHA256)
 
 	// Serving a file is what keeps it in the cache; only refresh the record

@@ -3036,6 +3036,14 @@ components:
         skipThreshold: { type: number, format: double }
         minVotersForSkip: { type: integer }
         voterFractionForSkip: { type: number, format: double }
+        readyFraction:
+          type: number
+          format: double
+          description: |
+            How much of the room must have the song before it starts. Waiting
+            for every last member is waiting for the slowest connection in the
+            room; the timeout is what ends that wait when even this does not
+            arrive, and whoever missed it is catching up.
         readyTimeoutSeconds: { type: integer }
 
     RoomMember:

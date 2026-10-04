@@ -1580,3 +1580,69 @@ func TestRoomWarmsWhatItIsAboutToPlay(t *testing.T) {
 	}
 	t.Error("the room never asked for the prepared song's rendition")
 }
+
+// A room starts on a quorum of its members, not on all of them: waiting for the
+// last one is waiting for the slowest connection in the room.
+func TestRoomStartsOnAQuorumOfMembers(t *testing.T) {
+	f := newFixture(t, nil)
+	ctx := context.Background()
+
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "a"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	roomID := snapshot.ID
+	for _, id := range []string{"b", "c", "d"} {
+		if _, err := f.m.Join(roomID, Member{ID: id}, "", ""); err != nil {
+			t.Fatalf("Join(%s): %v", id, err)
+		}
+	}
+	track := f.track("Song")
+	if _, err := f.enqueue(ctx, roomID, "a", track.ID); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	// Three of four is the fraction. The fourth has not reported and is not
+	// waited for.
+	for _, id := range []string{"a", "b", "c"} {
+		if _, err := f.m.Ready(roomID, id, track.ID, uuid.Nil, 180_000); err != nil {
+			t.Fatalf("Ready(%s): %v", id, err)
+		}
+	}
+	if got := f.current(f.get(roomID)).StartedAtMs; got == 0 {
+		t.Error("three of four members is the quorum; the room should have started")
+	}
+}
+
+// Half a room is not a quorum, so the room waits - and the window in the rules
+// is what ends that wait, rather than a member who may never arrive.
+func TestRoomWaitsTheWindowThenStartsAnyway(t *testing.T) {
+	f := newFixture(t, nil)
+	ctx := context.Background()
+
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "a"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	roomID := snapshot.ID
+	if _, err := f.m.Join(roomID, Member{ID: "b"}, "", ""); err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+	track := f.track("Song")
+	if _, err := f.enqueue(ctx, roomID, "a", track.ID); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	if _, err := f.m.Ready(roomID, "a", track.ID, uuid.Nil, 180_000); err != nil {
+		t.Fatalf("Ready: %v", err)
+	}
+	if got := f.current(f.get(roomID)).StartedAtMs; got != 0 {
+		t.Fatal("one of two members is not a quorum; the room should still be waiting")
+	}
+
+	// The window passes, and the room starts with whoever is here.
+	f.clock.Advance(6 * time.Second)
+	if got := f.current(f.get(roomID)).StartedAtMs; got == 0 {
+		t.Error("the window passed; the room should have started anyway")
+	}
+}
