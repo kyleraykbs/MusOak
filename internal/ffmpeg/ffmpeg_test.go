@@ -106,3 +106,41 @@ func TestMissingReportsAbsentBinaries(t *testing.T) {
 		t.Skip("system ffmpeg unavailable; nothing more to check")
 	}
 }
+
+// A download that ends in silence must not keep it: a room plays to the end of
+// the file, so a file that ends in two seconds of silence is two seconds of the
+// room sitting quiet before the next song.
+func TestToOpusTrimsTrailingSilence(t *testing.T) {
+	dir := t.TempDir()
+	if len(Missing()) > 0 {
+		t.Skipf("ffmpeg/ffprobe unavailable: %v", Missing())
+	}
+	ctx := context.Background()
+
+	src := filepath.Join(dir, "padded.opus")
+	if _, err := run(ctx, ffmpegName,
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=1.5",
+		"-af", "apad", "-t", "3.5",
+		"-c:a", "libopus", "-f", "opus", src); err != nil {
+		t.Fatalf("render padded tone: %v", err)
+	}
+	if srcDur, err := Duration(ctx, src); err != nil || srcDur < 3400*time.Millisecond {
+		t.Fatalf("fixture duration = %v (err %v), want ~3.5s", srcDur, err)
+	}
+
+	dst := filepath.Join(dir, "trimmed.opus")
+	if err := ToOpus(ctx, src, dst); err != nil {
+		t.Fatalf("ToOpus: %v", err)
+	}
+	dstDur, err := Duration(ctx, dst)
+	if err != nil {
+		t.Fatalf("Duration(dst): %v", err)
+	}
+	if dstDur > 1900*time.Millisecond {
+		t.Errorf("duration = %v, want the trailing silence cut back to ~1.5s", dstDur)
+	}
+	if dstDur < 1300*time.Millisecond {
+		t.Errorf("duration = %v, want the tone kept", dstDur)
+	}
+}
