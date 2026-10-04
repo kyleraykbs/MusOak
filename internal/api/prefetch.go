@@ -49,6 +49,13 @@ func (a playlistPrefetch) Ensure(ctx context.Context, variantID uuid.UUID) (stri
 	return a.server.media.Ensure(ctx, variantID)
 }
 
+// TrimMedia walks the library and takes the silence off the renditions that end
+// in some, so the stored length of a song is the length of the music. It is a
+// maintenance pass, not part of serving, and it is safe to run again.
+func (s *Server) TrimMedia(ctx context.Context, progress func(done, total int)) (int, int, error) {
+	return s.media.TrimAll(ctx, progress)
+}
+
 // startPrefetch builds the prefetcher when the configuration wants one.
 func (s *Server) startPrefetch() {
 	if !s.cfg.Media.PrefetchPlaylists {

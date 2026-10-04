@@ -72,8 +72,34 @@ func AudioCodec(ctx context.Context, path string) (string, error) {
 }
 
 // ToOpus writes dst as an Ogg/Opus file. Opus input is remuxed bit-exactly,
-// anything else is encoded.
+// anything else is encoded. A file that ends in silence is cut where the sound
+// stops, so the stored length is the length of the music.
 func ToOpus(ctx context.Context, src, dst string) error {
+	return TrimTo(ctx, src, dst, TrailingSilence(ctx, src))
+}
+
+// TrailingSilence reports where a file's sound stops, or zero when there is
+// nothing worth cutting.
+//
+// A download often ends in a second or two of silence. Kept, it becomes a
+// second or two of the room sitting in silence before the next song: the room
+// plays to the end of the file, and the file ends where the silence ends.
+func TrailingSilence(ctx context.Context, src string) time.Duration {
+	duration, err := Duration(ctx, src)
+	if err != nil {
+		return 0
+	}
+	end, err := AudibleEnd(ctx, src, duration)
+	if err != nil || end <= 0 || duration-end < trailingSilenceFloor {
+		return 0
+	}
+	return end
+}
+
+// TrimTo writes src as an Ogg/Opus file, stopping at end when it is positive.
+// Opus input is copied bit-exactly; anything else is encoded, and either way
+// every sample that is kept is the sample that was there.
+func TrimTo(ctx context.Context, src, dst string, end time.Duration) error {
 	codec, err := AudioCodec(ctx, src)
 	if err != nil {
 		return err
@@ -84,15 +110,8 @@ func ToOpus(ctx context.Context, src, dst string) error {
 	} else {
 		args = append(args, "-c:a", "libopus", "-b:a", "192k")
 	}
-	// A download often ends in a second or two of silence. Kept, it becomes a
-	// second or two of the room sitting in silence before the next song: the
-	// room plays to the end of the file, and the file ends where the silence
-	// ends. Cutting it here makes the stored length the length of the music,
-	// and the copy path leaves every sample of what is left untouched.
-	if duration, err := Duration(ctx, src); err == nil {
-		if end, err := AudibleEnd(ctx, src, duration); err == nil && end > 0 && duration-end >= trailingSilenceFloor {
-			args = append(args, "-t", strconv.FormatFloat(end.Seconds(), 'f', 3, 64))
-		}
+	if end > 0 {
+		args = append(args, "-t", strconv.FormatFloat(end.Seconds(), 'f', 3, 64))
 	}
 	args = append(args, "-f", "opus", dst)
 	if _, err := run(ctx, ffmpegName, args...); err != nil {

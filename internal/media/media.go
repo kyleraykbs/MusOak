@@ -234,6 +234,88 @@ func (m *Manager) fetch(ctx context.Context, variantID uuid.UUID) (string, error
 	return final, nil
 }
 
+// TrimTrailingSilence takes the silence off the end of a rendition that ends in
+// some, in place, and records the new length. It reports whether it rewrote the
+// file.
+//
+// A room plays to the end of the file, so a file that ends in a second of
+// silence is a second of the room sitting quiet before the next song. Downloads
+// are cut as they arrive; this is for the ones fetched before that was true.
+func (m *Manager) TrimTrailingSilence(ctx context.Context, variantID uuid.UUID) (bool, error) {
+	file, err := m.db.MediaFile(ctx, variantID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	info, err := os.Stat(file.Path)
+	if err != nil || info.Size() == 0 {
+		return false, nil
+	}
+
+	end := ffmpeg.TrailingSilence(ctx, file.Path)
+	if end <= 0 {
+		return false, nil
+	}
+
+	tmp := file.Path + ".trim"
+	defer os.Remove(tmp)
+	if err := ffmpeg.TrimTo(ctx, file.Path, tmp, end); err != nil {
+		return false, err
+	}
+	sum, size, err := hashFile(tmp)
+	if err != nil {
+		return false, err
+	}
+	trimmed, err := ffmpeg.Duration(ctx, tmp)
+	if err != nil {
+		return false, err
+	}
+	// The rename is the point of visibility, exactly as it is for a download.
+	if err := os.Rename(tmp, file.Path); err != nil {
+		return false, err
+	}
+
+	before := file.DurationMs
+	file.SHA256 = sum
+	file.Bytes = size
+	file.DurationMs = trimmed.Milliseconds()
+	if err := m.db.UpsertMediaFile(ctx, file); err != nil {
+		return false, err
+	}
+	m.logger.Info("media: cut the silence off the end",
+		"variant", variantID, "was_ms", before, "now_ms", file.DurationMs)
+	return true, nil
+}
+
+// TrimAll walks every rendition on disk and takes the silence off the ones that
+// end in some. It is for a library fetched before the transcode cut them, and it
+// is safe to run again: a file with nothing to cut is left exactly as it is.
+func (m *Manager) TrimAll(ctx context.Context, progress func(done, total int)) (int, int, error) {
+	files, err := m.db.MediaFiles(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	trimmed := 0
+	for i, file := range files {
+		if err := ctx.Err(); err != nil {
+			return trimmed, i, err
+		}
+		changed, err := m.TrimTrailingSilence(ctx, file.VariantID)
+		switch {
+		case err != nil:
+			m.logger.Warn("media: could not trim a rendition", "variant", file.VariantID, "error", err)
+		case changed:
+			trimmed++
+		}
+		if progress != nil {
+			progress(i+1, len(files))
+		}
+	}
+	return trimmed, len(files), nil
+}
+
 // SetDownloadRetry tunes the retry schedule. Tests use it to keep the suite
 // fast; deployments with an unreliable provider may raise the attempts.
 func (m *Manager) SetDownloadRetry(attempts int, backoff time.Duration) {
