@@ -168,6 +168,10 @@ type room struct {
 	queues  map[string][]QueueItem
 	master  []QueueItem
 	current *playback
+	// next is the song after this one, built while this one plays: its
+	// renditions are assigned and members may report ready for it, so that the
+	// advance does not begin with a download nobody has started yet.
+	next *playback
 	// out is who is sitting the room out. Their file is not what the room's
 	// song is measured by and the room does not wait for them: with the
 	// shortest copy in the room ending the song, a member holding a short or
@@ -189,6 +193,7 @@ type Snapshot struct {
 	MasterQueue []QueueItem            `json:"masterQueue"`
 	Queue       []QueueItem            `json:"queue"`
 	Current     *PlaybackView          `json:"current,omitempty"`
+	Next        *QueueItem             `json:"next,omitempty"`
 	ServerNowMs int64                  `json:"serverNowMs"`
 	Skip        SkipRules              `json:"skip"`
 }
@@ -206,11 +211,11 @@ type PlaybackView struct {
 	// Prepared is set once the renditions have been assigned. A track starts
 	// only after that, so a client can tell "waiting on the room" from "waiting
 	// on me".
-	Prepared bool `json:"prepared"`
-	Awaiting    []string          `json:"awaiting"`
-	CatchingUp  []string          `json:"catchingUp"`
-	Votes       map[string]int    `json:"votes"`
-	MeanScore   float64           `json:"meanScore"`
+	Prepared   bool           `json:"prepared"`
+	Awaiting   []string       `json:"awaiting"`
+	CatchingUp []string       `json:"catchingUp"`
+	Votes      map[string]int `json:"votes"`
+	MeanScore  float64        `json:"meanScore"`
 }
 
 // SkipRules are the tunables clients show next to the vote buttons.
@@ -905,8 +910,8 @@ func (m *Manager) Ready(roomID, memberID string, trackID, variantID uuid.UUID, d
 	if _, ok := room.members[memberID]; !ok {
 		return nil, ErrMemberNotFound
 	}
-	playback := room.current
-	if playback == nil || playback.item.TrackID != trackID {
+	playback := room.playbackForTrack(trackID)
+	if playback == nil {
 		return nil, ErrNoPlayback
 	}
 
@@ -925,6 +930,12 @@ func (m *Manager) Ready(roomID, memberID string, trackID, variantID uuid.UUID, d
 
 	// A member may change which file they play, and a member may arrive: either
 	// can change the shortest file in the room, and so the end of the track.
+	// Readiness for the song prepared behind this one is kept, not announced:
+	// there is nothing for the room to show about a song it has not started.
+	if playback != room.current {
+		return m.snapshotLocked(room), nil
+	}
+
 	state := map[string]any{
 		"ready":   len(playback.ready),
 		"members": len(room.members),
@@ -1100,7 +1111,43 @@ func queueDataLocked(room *room) map[string]any {
 		"queues":      queues,
 		"masterQueue": append([]QueueItem(nil), room.master...),
 		"queue":       pendingLocked(room),
+		"next":        nextItemLocked(room),
 	}
+}
+
+// nextItemLocked is the song prepared behind the current one, reported so that
+// clients fetch it while there is still time. Only while it is still what the
+// room would play next: a queue that changed underneath it is not news.
+func nextItemLocked(room *room) *QueueItem {
+	if room.next == nil || len(room.master) < 2 || room.master[1].ID != room.next.item.ID {
+		return nil
+	}
+	item := room.next.item
+	return &item
+}
+
+// playbackFor finds the playback an item belongs to: the one playing, or the
+// one prepared behind it.
+func (r *room) playbackFor(itemID string) *playback {
+	if r.current != nil && r.current.item.ID == itemID {
+		return r.current
+	}
+	if r.next != nil && r.next.item.ID == itemID {
+		return r.next
+	}
+	return nil
+}
+
+// playbackForTrack is the same by canonical track, which is what a readiness
+// report names.
+func (r *room) playbackForTrack(trackID uuid.UUID) *playback {
+	if r.current != nil && r.current.item.TrackID == trackID {
+		return r.current
+	}
+	if r.next != nil && r.next.item.TrackID == trackID {
+		return r.next
+	}
+	return nil
 }
 
 // beginNextLocked moves the next master-queue item into preparation. The item
@@ -1116,24 +1163,32 @@ func (m *Manager) beginNextLocked(room *room) {
 	}
 
 	item := room.master[0]
-	playback := &playback{
-		item:     item,
-		variants: map[string]uuid.UUID{},
-		ready:    map[string]ReadyReport{},
-		votes:    map[string]int{},
+	// A playback prepared while the last song played is this one: keep it, and
+	// every readiness report its members have already made about it.
+	playback := room.next
+	if playback != nil && playback.item.ID != item.ID {
+		playback = nil
 	}
-	if track, err := m.store.Track(context.Background(), item.TrackID); err == nil {
-		playback.fallbackMs = track.DurationMs
+	if playback == nil {
+		playback = m.newPlayback(item)
 	}
+	room.next = nil
 	room.current = playback
 
 	data := queueDataLocked(room)
 	data["preparing"] = item
 	m.publishLocked(room, EventQueueUpdated, data)
 
-	// Variant assignment needs the providers (and possibly the network), so it
-	// happens off the lock.
-	go m.prepare(room.id, item.ID)
+	if playback.prepared {
+		// Assigned while the last song played. If the members are ready - which
+		// is what preparing ahead is for - the room starts now instead of
+		// waiting out a timeout for files it already has.
+		m.maybeStartLocked(room)
+	} else {
+		// Variant assignment needs the providers (and possibly the network), so
+		// it happens off the lock.
+		go m.prepare(room.id, item.ID)
+	}
 
 	timeout := time.Duration(m.cfg.ListenTogether.ReadyTimeoutSeconds) * time.Second
 	if len(room.members) == 0 || timeout <= 0 {
@@ -1165,11 +1220,16 @@ func (m *Manager) prepare(roomID, itemID string) {
 
 	m.mu.Lock()
 	room, ok := m.rooms[roomID]
-	if !ok || room.current == nil || room.current.item.ID != itemID {
+	if !ok {
 		m.mu.Unlock()
 		return
 	}
-	trackID := room.current.item.TrackID
+	target := room.playbackFor(itemID)
+	if target == nil {
+		m.mu.Unlock()
+		return
+	}
+	trackID := target.item.TrackID
 	members := make([]Member, 0, len(room.order))
 	for _, memberID := range room.order {
 		if member, ok := room.members[memberID]; ok {
@@ -1204,16 +1264,23 @@ func (m *Manager) prepare(roomID, itemID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	room, ok = m.rooms[roomID]
-	if !ok || room.current == nil || room.current.item.ID != itemID {
+	if !ok {
 		return
 	}
-	room.current.variants = assignments
-	room.current.durations = durations
-	room.current.prepared = true
-	// Someone who arrived mid-track has a file the room has not reckoned with.
-	m.retimeLocked(room, room.current)
+	target = room.playbackFor(itemID)
+	if target == nil {
+		return
+	}
+	target.variants = assignments
+	target.durations = durations
+	target.prepared = true
+	if target == room.current {
+		// Someone who arrived mid-track has a file the room has not reckoned
+		// with, and the end of the song moves.
+		m.retimeLocked(room, target)
+	}
 	m.publishLocked(room, EventTrackPrepared, map[string]any{
-		"item":     room.current.item,
+		"item":     target.item,
 		"variants": assignments,
 	})
 	m.maybeStartLocked(room)
@@ -1360,6 +1427,40 @@ func (m *Manager) startLocked(room *room, playback *playback) {
 		"room", room.id, "title", playback.item.Title,
 		"timeline_ms", timeline, "ready", len(playback.ready), "members", len(room.members))
 	m.scheduleAdvanceLocked(room, playback)
+	m.prepareNextLocked(room)
+}
+
+// newPlayback is a playback waiting for its renditions: the room's clock
+// starts at zero and the assignment fills in the rest.
+func (m *Manager) newPlayback(item QueueItem) *playback {
+	playback := &playback{
+		item:     item,
+		variants: map[string]uuid.UUID{},
+		ready:    map[string]ReadyReport{},
+		votes:    map[string]int{},
+	}
+	if track, err := m.store.Track(context.Background(), item.TrackID); err == nil {
+		playback.fallbackMs = track.DurationMs
+	}
+	return playback
+}
+
+// prepareNextLocked builds the playback for the song after this one, without
+// starting it. Its renditions are assigned now, and members may report ready
+// for it, so that the advance has nothing left to wait for: a download that
+// would otherwise begin at the end of the song happens during it instead.
+func (m *Manager) prepareNextLocked(room *room) {
+	if len(room.master) < 2 {
+		room.next = nil
+		return
+	}
+	item := room.master[1]
+	if room.next != nil && room.next.item.ID == item.ID {
+		return
+	}
+	room.next = m.newPlayback(item)
+	go m.prepare(room.id, item.ID)
+	m.publishLocked(room, EventQueueUpdated, queueDataLocked(room))
 }
 
 // scheduleAdvanceLocked (re)schedules the end of the current track.
@@ -1495,6 +1596,7 @@ func (m *Manager) snapshotLocked(room *room) *Snapshot {
 			snapshot.Members = append(snapshot.Members, member)
 		}
 	}
+	snapshot.Next = nextItemLocked(room)
 
 	playback := room.current
 	if playback == nil {

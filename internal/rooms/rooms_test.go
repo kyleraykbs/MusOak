@@ -1417,3 +1417,115 @@ func TestJoinTakesOverTheGuestMembership(t *testing.T) {
 		t.Errorf("the guest still holds a queue: %+v", mine)
 	}
 }
+
+// nextPrepared waits for the renditions of the song the room has prepared
+// behind the one playing. Assignment runs off the lock, exactly as it does for
+// the current song.
+func (f *fixture) nextPrepared(roomID string) {
+	f.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		f.m.mu.Lock()
+		room := f.m.rooms[roomID]
+		ready := room != nil && room.next != nil && room.next.prepared
+		f.m.mu.Unlock()
+		if ready {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	f.t.Fatal("the room never prepared the next song")
+}
+
+// The room prepares the song after this one while this one plays, and takes a
+// member's readiness for it. That is what makes the advance cost nothing: a
+// download that only begins when the song ends is what the readiness timeout
+// gets spent waiting on, and a room that has been told the next file is here
+// has nothing to wait for.
+func TestRoomStartsThePreparedSongWithoutWaiting(t *testing.T) {
+	f := newFixture(t, nil)
+	ctx := context.Background()
+
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "a"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	roomID := snapshot.ID
+	first := f.track("First")
+	second := f.track("Second")
+	if _, err := f.enqueue(ctx, roomID, "a", first.ID); err != nil {
+		t.Fatalf("Enqueue(first): %v", err)
+	}
+	if _, err := f.enqueue(ctx, roomID, "a", second.ID); err != nil {
+		t.Fatalf("Enqueue(second): %v", err)
+	}
+
+	// The first song starts once the member says its file is here.
+	if _, err := f.m.Ready(roomID, "a", first.ID, uuid.Nil, 180_000); err != nil {
+		t.Fatalf("Ready(first): %v", err)
+	}
+	if got := f.current(f.get(roomID)).Item.Title; got != "First" {
+		t.Fatalf("playing = %q, want First", got)
+	}
+
+	// While it plays, the room names what comes next, and the member says that
+	// one is here too - which is the whole point of naming it early.
+	state := f.get(roomID)
+	if state.Next == nil || state.Next.TrackID != second.ID {
+		t.Fatalf("next = %+v, want Second", state.Next)
+	}
+	f.nextPrepared(roomID)
+	if _, err := f.m.Ready(roomID, "a", second.ID, uuid.Nil, 180_000); err != nil {
+		t.Fatalf("Ready(second): %v", err)
+	}
+
+	// The first song ends. The second starts on that instant, not after the
+	// readiness timeout: nothing is left to wait for.
+	f.clock.Advance(180 * time.Second)
+
+	state = f.get(roomID)
+	current := state.Current
+	if current == nil || current.Item.TrackID != second.ID {
+		t.Fatalf("after the first song the room is on %+v, want Second", current)
+	}
+	if current.StartedAtMs == 0 {
+		t.Error("the prepared song did not start")
+	}
+	if state.Next != nil {
+		t.Errorf("next = %+v after the advance, want none", state.Next)
+	}
+}
+
+// Without being told, the room waits: the prepared song is known but nobody has
+// said its file is here, which is what the timeout is for.
+func TestRoomWaitsWhenNobodyIsReadyAhead(t *testing.T) {
+	f := newFixture(t, nil)
+	ctx := context.Background()
+
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "a"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	roomID := snapshot.ID
+	first := f.track("First")
+	second := f.track("Second")
+	if _, err := f.enqueue(ctx, roomID, "a", first.ID); err != nil {
+		t.Fatalf("Enqueue(first): %v", err)
+	}
+	if _, err := f.enqueue(ctx, roomID, "a", second.ID); err != nil {
+		t.Fatalf("Enqueue(second): %v", err)
+	}
+	if _, err := f.m.Ready(roomID, "a", first.ID, uuid.Nil, 180_000); err != nil {
+		t.Fatalf("Ready(first): %v", err)
+	}
+
+	f.clock.Advance(180 * time.Second)
+
+	current := f.get(roomID).Current
+	if current == nil || current.Item.TrackID != second.ID {
+		t.Fatalf("the room should be preparing Second, got %+v", current)
+	}
+	if current.StartedAtMs != 0 {
+		t.Error("nothing said the second file was here; the room should still be waiting")
+	}
+}

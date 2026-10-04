@@ -2350,6 +2350,14 @@ paths:
         The duration is what this client will actually play, which may come from
         a local file. The room starts when every member is ready, or when the
         readiness timeout passes.
+
+        A member may report this for the song the room has prepared behind the
+        current one - the `next` in the room state - before it is needed. That
+        is what makes the advance cost nothing: the room already knows every
+        file is here, so it starts the song the instant the last one ends
+        instead of spending its timeout on a download that began too late.
+        Reporting for the next song is accepted and kept; it is not announced,
+        because there is nothing to show about a song the room has not started.
       operationId: reportReady
       parameters: [{ $ref: "#/components/parameters/RoomID" }]
       requestBody:
@@ -3120,6 +3128,13 @@ components:
             members in join order, one track each pass.
           items: { $ref: "#/components/schemas/QueueItem" }
         current: { $ref: "#/components/schemas/RoomPlayback" }
+        next:
+          allOf: [{ $ref: "#/components/schemas/QueueItem" }]
+          description: |
+            The song prepared behind the current one, while it is still what the
+            room would play next. Its renditions are already assigned and a
+            member may report ready for it, which is how the advance avoids
+            starting with a download. Absent when there is nothing to prepare.
         serverNowMs: { type: integer, format: int64 }
         skip: { $ref: "#/components/schemas/SkipRules" }
 
