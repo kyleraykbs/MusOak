@@ -315,7 +315,7 @@ func TestImportCreatesLocalVariantAndDedupes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Import: %v", err)
 	}
-	if variant.Provider != LocalProvider || !variant.Downloadable {
+	if variant.Provider != store.LocalProvider || !variant.Downloadable {
 		t.Errorf("variant = %+v", variant)
 	}
 	if variant.Title != "My Song" {
@@ -381,8 +381,55 @@ func TestScanDirImportsAudioFiles(t *testing.T) {
 		t.Errorf("imported = %d, want 3", len(imported))
 	}
 	for _, v := range imported {
-		if v.Provider != LocalProvider {
+		if v.Provider != store.LocalProvider {
 			t.Errorf("variant %s provider = %s", v.ID, v.Provider)
 		}
+	}
+}
+
+// seedUpload stores an upload the way the API does: a user-sourced variant whose
+// bytes sit in the media directory under the variant's own name.
+func seedUpload(t *testing.T, db *store.DB, manager *Manager, bytes int64) *store.Upload {
+	t.Helper()
+	ctx := context.Background()
+	user := &store.User{Username: "uploader", PasswordHash: "hash"}
+	if err := db.CreateUser(ctx, user); err != nil {
+		t.Fatal(err)
+	}
+	track := &store.Track{Title: "Mine"}
+	if err := db.CreateTrack(ctx, track); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(manager.Dir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	variantID := uuid.New()
+	path := filepath.Join(manager.Dir(), variantID.String()+".opus")
+	if err := os.WriteFile(path, []byte("the bytes somebody uploaded"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	upload := &store.Upload{UserID: user.ID, Filename: "mine.opus"}
+	variant := &store.Variant{ID: variantID, TrackID: track.ID, Title: "Mine", Downloadable: true}
+	file := &store.MediaFile{Path: path, SHA256: "sum", Bytes: bytes}
+	if err := db.CreateUpload(ctx, upload, variant, file); err != nil {
+		t.Fatalf("CreateUpload: %v", err)
+	}
+	return upload
+}
+
+// An upload's bytes live on this disk, so a missing file is a missing file. The
+// manager used to hand the variant to a provider named after the upload, which
+// answered "provider not enabled" - sending somebody to look for a switch that
+// does not exist.
+func TestUploadWithNoFileBlamesTheFileNotAProvider(t *testing.T) {
+	manager, db := newTestManager(t, nil)
+	variant := seedVariant(t, db, true, store.UploadProvider)
+
+	_, err := manager.Ensure(context.Background(), variant.ID)
+	if !errors.Is(err, ErrLocalFileMissing) {
+		t.Fatalf("Ensure(upload) = %v, want ErrLocalFileMissing", err)
+	}
+	if errors.Is(err, provider.ErrNotEnabled) {
+		t.Errorf("an upload is local, no provider is involved: %v", err)
 	}
 }

@@ -89,11 +89,15 @@ func (d *DB) MediaFiles(ctx context.Context) ([]MediaFile, error) {
 	return d.queryMediaFiles(ctx, `SELECT `+mediaColumns+` FROM media_files ORDER BY downloaded_at`)
 }
 
-// MediaFilesByLastUse lists every finished file, least recently served first:
-// that is the order eviction removes them in.
+// MediaFilesByLastUse lists the files an eviction may remove, least recently
+// served first: that is the order it removes them in. A rendition fetched from
+// a provider can be fetched again; one that came off this disk - an upload, a
+// file from the local library - is somebody's only copy and is never listed.
 func (d *DB) MediaFilesByLastUse(ctx context.Context) ([]MediaFile, error) {
 	return d.queryMediaFiles(ctx,
-		`SELECT `+mediaColumns+` FROM media_files ORDER BY accessed_at, downloaded_at`)
+		`SELECT `+mediaColumns+` FROM media_files
+		 WHERE variant_id IN (SELECT id FROM variants WHERE provider NOT IN (?, ?))
+		 ORDER BY accessed_at, downloaded_at`, LocalProvider, UploadProvider)
 }
 
 func (d *DB) queryMediaFiles(ctx context.Context, query string, args ...any) ([]MediaFile, error) {
@@ -127,10 +131,14 @@ func (d *DB) TouchMediaFile(ctx context.Context, variantID uuid.UUID, at time.Ti
 	return rowsAffectedOrNotFound(res)
 }
 
-// MediaBytes is the total size of every stored rendition.
+// MediaBytes is the size of the media cache: the renditions eviction may
+// remove, which is what the quota is about. A file that came off this disk is
+// not part of the cache and is not counted against it.
 func (d *DB) MediaBytes(ctx context.Context) (int64, error) {
 	var total *int64
-	if err := d.db.QueryRowContext(ctx, `SELECT SUM(bytes) FROM media_files`).Scan(&total); err != nil {
+	if err := d.db.QueryRowContext(ctx, `SELECT SUM(bytes) FROM media_files
+		WHERE variant_id IN (SELECT id FROM variants WHERE provider NOT IN (?, ?))`,
+		LocalProvider, UploadProvider).Scan(&total); err != nil {
 		return 0, mapErr(err)
 	}
 	if total == nil {

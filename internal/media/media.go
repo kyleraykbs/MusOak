@@ -28,9 +28,6 @@ import (
 	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
-// LocalProvider is the provider id for files from the local library.
-const LocalProvider = "local"
-
 // ErrNotDownloadable means the variant has no downloadable source (Spotify
 // versions are metadata only; Block 5 matches them to a playable variant).
 var ErrNotDownloadable = errors.New("variant is not downloadable")
@@ -158,9 +155,11 @@ func (m *Manager) fetch(ctx context.Context, variantID uuid.UUID) (string, error
 	if !variant.Downloadable {
 		return "", fmt.Errorf("%w: %s from %s", ErrNotDownloadable, variantID, variant.Provider)
 	}
-	if variant.Provider == LocalProvider {
-		// Local variants get their media row at import time; reaching here
-		// means the file disappeared from under us.
+	if variant.Provider == store.LocalProvider || variant.Provider == store.UploadProvider {
+		// These bytes live on this disk and nowhere else, so there is nothing to
+		// download them from: an upload or a local file gets its media row when
+		// it arrives, and reaching here means the file is gone. Asking a
+		// provider for it would only report that no such provider exists.
 		return "", fmt.Errorf("%w: %s", ErrLocalFileMissing, variantID)
 	}
 

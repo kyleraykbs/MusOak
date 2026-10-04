@@ -12,9 +12,13 @@ import (
 	"github.com/google/uuid"
 )
 
-// UploadProvider is the provider id of user-sourced variants: the songs people
-// uploaded rather than a rendition a provider served.
-const UploadProvider = "user"
+// The provider ids whose bytes live on this machine and nowhere else: the songs
+// people uploaded, and the files of the on-disk library. Nothing can fetch
+// either again, so a missing file is missing for good and neither is cache.
+const (
+	UploadProvider = "user"
+	LocalProvider  = "local"
+)
 
 // schemaV10 adds user uploads: a song somebody uploaded, stored as a
 // user-sourced variant whose bytes are a media file like any downloaded

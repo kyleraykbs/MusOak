@@ -81,7 +81,7 @@ func (m *Manager) Import(ctx context.Context, path string) (*store.Variant, erro
 	}
 	variant := &store.Variant{
 		TrackID:         track.ID,
-		Provider:        LocalProvider,
+		Provider:        store.LocalProvider,
 		ProviderTrackID: "sha256:" + sum,
 		Title:           meta.Title,
 		Artists:         meta.Artists,
@@ -92,7 +92,7 @@ func (m *Manager) Import(ctx context.Context, path string) (*store.Variant, erro
 	if err := m.db.CreateVariant(ctx, variant); err != nil {
 		_ = os.Remove(tmp)
 		if errors.Is(err, store.ErrConflict) {
-			if existing, lookupErr := m.db.VariantByProviderTrack(ctx, LocalProvider, variant.ProviderTrackID); lookupErr == nil {
+			if existing, lookupErr := m.db.VariantByProviderTrack(ctx, store.LocalProvider, variant.ProviderTrackID); lookupErr == nil {
 				return existing, nil
 			}
 		}

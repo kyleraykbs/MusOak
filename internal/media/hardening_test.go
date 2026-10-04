@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -167,4 +168,48 @@ func fileSize(t *testing.T, path string) int64 {
 		t.Fatal(err)
 	}
 	return info.Size()
+}
+
+// An upload is somebody's only copy: a provider can serve a rendition again, and
+// nothing can serve this. Eviction must skip it and the quota must not count it,
+// or a full cache deletes the uploads first - they are the oldest thing in it -
+// and stays over quota while doing so.
+func TestEvictionLeavesUploadsAlone(t *testing.T) {
+	dir := t.TempDir()
+	fixture := tone(t, dir, "fixture.opus", 0.5)
+	size := fileSize(t, fixture)
+
+	fake := &fakeProvider{name: "ytmusic", fixture: fixture}
+	db := openTestDB(t)
+	registry := newTestRegistry(t, fake)
+
+	// Room for exactly one rendition, uploads excluded.
+	manager := New(t.TempDir(), size, db, registry, discardLogger())
+	manager.SetDownloadRetry(1, time.Millisecond)
+
+	ctx := context.Background()
+	upload := seedUpload(t, db, manager, size)
+
+	first := seedVariant(t, db, true, "ytmusic")
+	if _, err := manager.Ensure(ctx, first.ID); err != nil {
+		t.Fatalf("first Ensure: %v", err)
+	}
+	second := seedVariant(t, db, true, "ytmusic")
+	if _, err := manager.Ensure(ctx, second.ID); err != nil {
+		t.Fatalf("second Ensure: %v", err)
+	}
+
+	if _, err := db.MediaFile(ctx, upload.VariantID); err != nil {
+		t.Errorf("the upload's row was evicted: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(manager.Dir(), upload.VariantID.String()+".opus")); err != nil {
+		t.Errorf("the upload's file was deleted: %v", err)
+	}
+	total, err := db.MediaBytes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total > size {
+		t.Errorf("cache is %d bytes, over the %d byte quota: uploads must not count", total, size)
+	}
 }
