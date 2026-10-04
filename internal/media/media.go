@@ -150,17 +150,17 @@ func (m *Manager) fetch(ctx context.Context, variantID uuid.UUID) (string, error
 
 	variant, err := m.db.Variant(ctx, variantID)
 	if err != nil {
-		return "", err
+		return "", m.fail(variantID, err)
 	}
 	if !variant.Downloadable {
-		return "", fmt.Errorf("%w: %s from %s", ErrNotDownloadable, variantID, variant.Provider)
+		return "", m.fail(variantID, fmt.Errorf("%w: %s from %s", ErrNotDownloadable, variantID, variant.Provider))
 	}
 	if variant.Provider == store.LocalProvider || variant.Provider == store.UploadProvider {
 		// These bytes live on this disk and nowhere else, so there is nothing to
 		// download them from: an upload or a local file gets its media row when
 		// it arrives, and reaching here means the file is gone. Asking a
 		// provider for it would only report that no such provider exists.
-		return "", fmt.Errorf("%w: %s", ErrLocalFileMissing, variantID)
+		return "", m.fail(variantID, fmt.Errorf("%w: %s", ErrLocalFileMissing, variantID))
 	}
 
 	m.setStatus(Status{VariantID: variantID, State: StateDownloading, Progress: 0.10})
@@ -373,9 +373,12 @@ func (m *Manager) lookupStatus(variantID uuid.UUID) (Status, bool) {
 	return s, ok
 }
 
-func (m *Manager) fail(variantID uuid.UUID, err error) {
+// fail records a failed download and hands the error back, so that a caller can
+// report the failure it has just recorded.
+func (m *Manager) fail(variantID uuid.UUID, err error) error {
 	m.logger.Warn("media download failed", "variant", variantID, "error", err)
 	m.setStatus(Status{VariantID: variantID, State: StateFailed, Err: err.Error()})
+	return err
 }
 
 // hashFile returns the sha256 and size of a file.

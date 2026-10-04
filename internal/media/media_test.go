@@ -239,8 +239,11 @@ func TestEnsureRefusesNonDownloadableVariant(t *testing.T) {
 	if got := fake.calls.Load(); got != 0 {
 		t.Errorf("downloads = %d, want none", got)
 	}
-	if status := m.Status(context.Background(), variant.ID); status.State != StateNone {
-		t.Errorf("status = %+v, want none", status)
+	// A refusal leaves a state behind, as every other failed fetch does: a
+	// client waiting on the file polls this, and a state that never changes is
+	// a spinner that never stops.
+	if status := m.Status(context.Background(), variant.ID); status.State != StateFailed || status.Err == "" {
+		t.Errorf("status = %+v, want failed with a message", status)
 	}
 }
 
@@ -431,5 +434,16 @@ func TestUploadWithNoFileBlamesTheFileNotAProvider(t *testing.T) {
 	}
 	if errors.Is(err, provider.ErrNotEnabled) {
 		t.Errorf("an upload is local, no provider is involved: %v", err)
+	}
+
+	// A client waiting for the file polls the status, and stops when it says
+	// failed. A state that never changes is a spinner that never stops - which
+	// is exactly how a lost upload looked from the bar.
+	status := manager.Status(context.Background(), variant.ID)
+	if status.State != StateFailed {
+		t.Errorf("status = %q, want %q so a waiting client stops", status.State, StateFailed)
+	}
+	if status.Err == "" {
+		t.Error("a failed status carries no reason to show")
 	}
 }
