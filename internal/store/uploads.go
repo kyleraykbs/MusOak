@@ -173,7 +173,7 @@ func (d *DB) CreateUpload(ctx context.Context, u *Upload, v *Variant, m *MediaFi
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO media_files (variant_id, path, sha256, duration_ms, bytes, downloaded_at, accessed_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			v.ID.String(), m.Path, m.SHA256, m.DurationMs, m.Bytes,
+			v.ID.String(), d.pathIn(m.Path), m.SHA256, m.DurationMs, m.Bytes,
 			m.DownloadedAt.UnixMilli(), m.AccessedAt.UnixMilli()); err != nil {
 			return mapErr(err)
 		}
@@ -329,7 +329,9 @@ func (d *DB) DeleteUpload(ctx context.Context, id uuid.UUID) error {
 		return mapErr(err)
 	}
 	if path != "" {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		// Stored paths are relative to the storage directory, as every media
+		// path is; removing a file needs the whole path.
+		if err := os.Remove(d.pathOut(path)); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("store: remove upload file: %w", err)
 		}
 	}

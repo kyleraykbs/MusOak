@@ -251,6 +251,11 @@ var (
 // DB is the SQLite-backed store. It implements every repository interface.
 type DB struct {
 	db *sql.DB
+	// root is the storage directory this database lives in. Media paths are
+	// stored relative to it, so that moving the directory - to another disk,
+	// to another machine - moves the library with it instead of leaving every
+	// row pointing at where it used to be.
+	root string
 }
 
 // execer is satisfied by *sql.DB and *sql.Tx.
@@ -308,7 +313,7 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("store: ping %s: %w", path, err)
 	}
 
-	d := &DB{db: sqlDB}
+	d := &DB{db: sqlDB, root: storageRoot(path, memory)}
 	if err := d.migrate(ctx); err != nil {
 		sqlDB.Close()
 		return nil, err
@@ -318,6 +323,26 @@ func Open(path string) (*DB, error) {
 
 // Close releases the database.
 func (d *DB) Close() error { return d.db.Close() }
+
+// storageRoot is the directory a database path lives in, which is what media
+// paths are stored relative to: the database sits at <storageDir>/musoak.db, so
+// its own directory is the storage directory. An in-memory database has no
+// directory, and neither has a path that names none - those keep their media
+// paths exactly as they are given.
+func storageRoot(path string, memory bool) string {
+	if memory || path == "" {
+		return ""
+	}
+	name := strings.TrimPrefix(path, "file:")
+	if at := strings.IndexByte(name, '?'); at >= 0 {
+		name = name[:at]
+	}
+	dir := filepath.Dir(name)
+	if dir == "." {
+		return ""
+	}
+	return dir
+}
 
 type migration struct {
 	version int
@@ -346,6 +371,7 @@ var migrations = []migration{
 	{version: 17, name: "icon version", sql: schemaV17},
 	{version: 18, name: "play history", sql: schemaV18},
 	{version: 19, name: "lyrics", sql: schemaV19},
+	{version: 20, name: "media paths relative to the storage directory", sql: schemaV20},
 }
 
 func (d *DB) migrate(ctx context.Context) error {
