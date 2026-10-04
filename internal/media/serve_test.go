@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"codeberg.org/kyleraykbs/musoak/internal/store"
+	"strings"
 )
 
 // runFFmpeg and strconvFormat keep the test helpers free of a direct ffmpeg
@@ -61,6 +62,11 @@ func TestServeFileRangeAndETag(t *testing.T) {
 	}
 	if got := full.Header().Get("ETag"); got != `"`+file.SHA256+`"` {
 		t.Errorf("ETag = %s, want the sha256", got)
+	}
+	// A lifetime as well as a validator: without one a browser keeps nothing, so
+	// a client that fetched a song ahead of time fetches it again when it plays.
+	if got := full.Header().Get("Cache-Control"); !strings.Contains(got, "max-age") {
+		t.Errorf("Cache-Control = %q; a rendition nobody may keep is a rendition fetched twice", got)
 	}
 	if int64(full.Body.Len()) != file.Bytes {
 		t.Errorf("body = %d bytes, want %d", full.Body.Len(), file.Bytes)
