@@ -1215,6 +1215,75 @@ func TestRoomPlaysMasterQueueInOrder(t *testing.T) {
 	}
 }
 
+// TestTransportEventsNameTheMember pins what a client needs to say "Sam
+// paused": every transport event carries the member who drove it. The room's
+// own decisions - a vote, a track running out - carry nobody.
+func TestTransportEventsNameTheMember(t *testing.T) {
+	f := newFixture(t, nil)
+	ctx := context.Background()
+	events, cancel := f.m.Subscribe()
+	defer cancel()
+
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "kyle", Name: "Kyle"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	roomID := snapshot.ID
+	if _, err := f.m.Join(roomID, Member{ID: "sam", Name: "Sam"}, "", ""); err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+	track, _ := f.trackWithVariants("Song",
+		variantSpec{provider: "local", providerTrackID: "a", durationMs: 180_000, downloadable: true},
+	)
+	if _, err := f.enqueue(ctx, roomID, "kyle", track.ID); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	for _, member := range []string{"kyle", "sam"} {
+		variantID, err := uuid.Parse(f.assigned(roomID, member))
+		if err != nil {
+			t.Fatalf("assigned(%s): %v", member, err)
+		}
+		if _, err := f.m.Ready(roomID, member, track.ID, variantID, 180_000); err != nil {
+			t.Fatalf("Ready(%s): %v", member, err)
+		}
+	}
+
+	if _, err := f.m.Pause(roomID, "sam"); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+	if _, err := f.m.Seek(roomID, "sam", 30_000); err != nil {
+		t.Fatalf("Seek: %v", err)
+	}
+	if _, err := f.m.Skip(roomID, "sam"); err != nil {
+		t.Fatalf("Skip: %v", err)
+	}
+
+	want := map[EventType]string{
+		EventPaused:       "Sam",
+		EventSeeked:       "Sam",
+		EventTrackSkipped: "Sam",
+	}
+	seen := map[EventType]bool{}
+	deadline := time.After(5 * time.Second)
+	for len(seen) < len(want) {
+		select {
+		case event := <-events:
+			name, ok := want[event.Type]
+			if !ok {
+				continue
+			}
+			data, _ := event.Data.(map[string]any)
+			by, _ := data["by"].(map[string]any)
+			if got, _ := by["name"].(string); got != name {
+				t.Errorf("%s: by.name = %q, want %q", event.Type, got, name)
+			}
+			seen[event.Type] = true
+		case <-deadline:
+			t.Fatalf("saw %v of the transport events, want %v", seen, want)
+		}
+	}
+}
+
 // TestRoomPassword gates joining. The password lives in the manager and is
 // never part of any state clients see.
 func TestRoomPassword(t *testing.T) {
@@ -1644,5 +1713,73 @@ func TestRoomWaitsTheWindowThenStartsAnyway(t *testing.T) {
 	f.clock.Advance(6 * time.Second)
 	if got := f.current(f.get(roomID)).StartedAtMs; got == 0 {
 		t.Error("the window passed; the room should have started anyway")
+	}
+}
+
+// A member with one song should not wait behind two of somebody else's: the
+// round-robin is one item per member per pass, so a short queue is placed by
+// its pass, not by its length.
+func TestMasterQueueWithASingleItemFromAMember(t *testing.T) {
+	f := newFixture(t, nil)
+	ctx := context.Background()
+
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "a"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	roomID := snapshot.ID
+	if _, err := f.m.Join(roomID, Member{ID: "b"}, "", ""); err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+	a1, a2, a3 := f.track("A1"), f.track("A2"), f.track("A3")
+	b1 := f.track("B1")
+	for _, enqueue := range []struct {
+		member string
+		track  *store.Track
+	}{{"a", a1}, {"a", a2}, {"a", a3}, {"b", b1}} {
+		if _, err := f.enqueue(ctx, roomID, enqueue.member, enqueue.track.ID); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+	}
+	got := queueTitles(f.get(roomID).MasterQueue)
+	want := []string{"A1", "B1", "A2", "A3"}
+	if !slices.Equal(got, want) {
+		t.Errorf("master queue = %v, want %v", got, want)
+	}
+}
+
+// A member who queued a single song joins the pass as soon as the playing one
+// is done - they must not wait behind the rest of another member's long queue.
+func TestSingleItemMemberJoinsTheNextPass(t *testing.T) {
+	f := newFixture(t, nil)
+	ctx := context.Background()
+
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "kube"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	roomID := snapshot.ID
+	if _, err := f.m.Join(roomID, Member{ID: "lain"}, "", ""); err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+	for _, title := range []string{"K1", "K2", "K3", "K4"} {
+		if _, err := f.enqueue(ctx, roomID, "kube", f.track(title).ID); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+	}
+	// Two of Kube's play before Lain queues anything.
+	for i := 0; i < 2; i++ {
+		if _, err := f.m.Skip(roomID, "kube"); err != nil {
+			t.Fatalf("Skip: %v", err)
+		}
+	}
+	if _, err := f.enqueue(ctx, roomID, "lain", f.track("L1").ID); err != nil {
+		t.Fatalf("Enqueue lain: %v", err)
+	}
+
+	got := queueTitles(f.get(roomID).MasterQueue)
+	want := []string{"K3", "L1", "K4"}
+	if !slices.Equal(got, want) {
+		t.Errorf("master queue = %v, want %v", got, want)
 	}
 }

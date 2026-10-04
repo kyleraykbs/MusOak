@@ -779,6 +779,7 @@ func (m *Manager) Pause(roomID, memberID string) (*Snapshot, error) {
 	m.publishLocked(room, EventPaused, map[string]any{
 		"positionMs": playback.pausedPositionMs,
 		"item":       playback.item,
+		"by":         memberRefLocked(room, memberID),
 	})
 	return m.snapshotLocked(room), nil
 }
@@ -806,6 +807,7 @@ func (m *Manager) Resume(roomID, memberID string) (*Snapshot, error) {
 		"positionMs": playback.positionMs(m.nowMsLocked()),
 		"startedAt":  playback.startedAtMs,
 		"item":       playback.item,
+		"by":         memberRefLocked(room, memberID),
 	})
 	m.scheduleAdvanceLocked(room, playback)
 	return m.snapshotLocked(room), nil
@@ -835,13 +837,14 @@ func (m *Manager) Seek(roomID, memberID string, positionMs int64) (*Snapshot, er
 	playback.pausedPositionMs = positionMs
 	playback.startedAtMs = m.nowMsLocked()
 	if playback.timelineMs > 0 && positionMs >= playback.timelineMs {
-		m.advanceLocked(context.Background(), room, "seek")
+		m.advanceLocked(context.Background(), room, "seek", memberID)
 		return m.snapshotLocked(room), nil
 	}
 	m.publishLocked(room, EventSeeked, map[string]any{
 		"positionMs": positionMs,
 		"startedAt":  playback.startedAtMs,
 		"item":       playback.item,
+		"by":         memberRefLocked(room, memberID),
 	})
 	m.scheduleAdvanceLocked(room, playback)
 	return m.snapshotLocked(room), nil
@@ -862,7 +865,7 @@ func (m *Manager) Skip(roomID, memberID string) (*Snapshot, error) {
 	if room.current == nil {
 		return nil, ErrNoPlayback
 	}
-	m.advanceLocked(context.Background(), room, "skipped")
+	m.advanceLocked(context.Background(), room, "skipped", memberID)
 	return m.snapshotLocked(room), nil
 }
 
@@ -922,7 +925,7 @@ func (m *Manager) Vote(ctx context.Context, roomID, memberID string, score int) 
 	if !ok || current.current == nil || current.current.item.TrackID != trackID {
 		return snapshot, nil
 	}
-	m.advanceLocked(ctx, current, "votes")
+	m.advanceLocked(ctx, current, "votes", "")
 	return m.snapshotLocked(current), nil
 }
 
@@ -1531,12 +1534,23 @@ func (m *Manager) scheduleAdvanceLocked(room *room, playback *playback) {
 		if !ok || current.current != playback || playback.advanceVersion != version {
 			return
 		}
-		m.advanceLocked(context.Background(), current, "completed")
+		m.advanceLocked(context.Background(), current, "completed", "")
 	})
 }
 
+// memberRefLocked names a member for an event: the id to key on and the name
+// to show. The room's own decisions - a vote, a track running out - carry no
+// member, so the reference is nil and clients read it as "the room".
+func memberRefLocked(room *room, memberID string) map[string]any {
+	member, ok := room.members[memberID]
+	if !ok {
+		return nil
+	}
+	return map[string]any{"id": member.ID, "name": member.Name}
+}
+
 // advanceLocked ends the current track and prepares the next one.
-func (m *Manager) advanceLocked(ctx context.Context, room *room, reason string) {
+func (m *Manager) advanceLocked(ctx context.Context, room *room, reason string, by string) {
 	playback := room.current
 	if playback != nil {
 		playback.advanceVersion++
@@ -1551,6 +1565,7 @@ func (m *Manager) advanceLocked(ctx context.Context, room *room, reason string) 
 				"positionMs": playback.positionMs(m.nowMsLocked()),
 				"votes":      playback.votes,
 				"mean":       meanScore(playback.votes),
+				"by":         memberRefLocked(room, by),
 			})
 		}
 		// The played item is done: it leaves its owner's queue and the play
