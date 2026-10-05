@@ -2312,6 +2312,22 @@ paths:
         whose client stopped listening without saying so.
       operationId: reportTrackEnded
       parameters: [{ $ref: "#/components/parameters/RoomID" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [trackId]
+              properties:
+                trackId:
+                  type: string
+                  format: uuid
+                  description: |
+                    The track whose file has run out. A client that has already
+                    moved on names the one it has moved on to, and the room
+                    ignores it: an end that arrives late is not the end of the
+                    song playing now.
       responses:
         "200": { $ref: "#/components/responses/RoomState" }
         "403": { $ref: "#/components/responses/Forbidden" }

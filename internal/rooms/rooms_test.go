@@ -1485,16 +1485,26 @@ func TestTheHostsEndMovesTheRoomOn(t *testing.T) {
 	}
 
 	// Somebody who is not the room's clock saying so changes nothing.
-	if _, err := f.m.Ended(roomID, "guest"); err != nil {
+	if _, err := f.m.Ended(roomID, "guest", track.ID); err != nil {
 		t.Fatal(err)
 	}
 	if got := f.current(f.get(roomID)).Item.TrackID; got != track.ID {
 		t.Fatalf("current = %s, want the same song: a guest's file ending says nothing", got)
 	}
 
-	// The host's own file ending is the end of the song, well before the length
-	// the room worked out.
-	if _, err := f.m.Ended(roomID, "host"); err != nil {
+	// An end that arrives late names the song the client has already moved on
+	// to. The room is playing something else, and a song is not over because a
+	// file that is no longer playing has stopped: this is what cut songs short.
+	if _, err := f.m.Ended(roomID, "host", next.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.current(f.get(roomID)).Item.TrackID; got != track.ID {
+		t.Fatalf("current = %s, want the same song: that end was for another one", got)
+	}
+
+	// The host's own file ending, naming the song that is playing, is the end of
+	// the song - well before the length the room worked out.
+	if _, err := f.m.Ended(roomID, "host", track.ID); err != nil {
 		t.Fatal(err)
 	}
 	after := f.get(roomID)

@@ -57,6 +57,12 @@ type roomOutRequest struct {
 	Out bool `json:"out"`
 }
 
+// endedRequest names the track whose file has run out. A client that has
+// already moved on names the one it has moved on to, and the room ignores it.
+type endedRequest struct {
+	TrackID string `json:"trackId"`
+}
+
 // callerMember builds the member identity for a room command. Authenticated
 // callers are their account; guests carry their member id in a header.
 func (s *Server) callerMember(r *http.Request, allowNew bool) (rooms.Member, bool) {
@@ -256,11 +262,33 @@ func (s *Server) handleRoomSkip(w http.ResponseWriter, r *http.Request) {
 
 // handleRoomEnded is the host saying their copy of the song has run out: the
 // room moves on from their end, rather than from a length it worked out before
-// the song started.
+// the song started. The track is named so that an end which arrives late - the
+// client having already moved on - cannot cut the song that is playing now.
 func (s *Server) handleRoomEnded(w http.ResponseWriter, r *http.Request) {
-	s.roomCommand(w, r, func(roomID, memberID string) (*rooms.Snapshot, error) {
-		return s.rooms.Ended(roomID, memberID)
-	})
+	member, ok := s.callerMember(r, false)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "member identity required")
+		return
+	}
+	var req endedRequest
+	if r.ContentLength > 0 && !decodeJSON(w, r, &req) {
+		return
+	}
+	trackID := uuid.Nil
+	if req.TrackID != "" {
+		parsed, err := uuid.Parse(req.TrackID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid trackId")
+			return
+		}
+		trackID = parsed
+	}
+	room, err := s.rooms.Ended(r.PathValue("roomId"), member.ID, trackID)
+	if err != nil {
+		writeRoomError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, room)
 }
 
 func (s *Server) handleRoomSeek(w http.ResponseWriter, r *http.Request) {

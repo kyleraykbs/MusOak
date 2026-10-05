@@ -919,15 +919,20 @@ func (m *Manager) Seek(roomID, memberID string, positionMs int64) (*Snapshot, er
 	return m.snapshotLocked(room), nil
 }
 
-// Ended records that the host's copy of the current track has run out, and moves
-// the room on.
+// Ended records that the host's copy of a track has run out, and moves the room
+// on when that track is the one it is playing.
+//
+// The track is named because a file can end late. A client that has already
+// moved on to the next song - or an element that reports the same end twice -
+// would otherwise move the room past a song that has only just started, which
+// is a song cut off in the middle for everybody.
 //
 // The host is the room's clock, so their file reaching its end is the song
 // reaching its end - and their file is the one that decides when that is, not a
 // number the room worked out in advance. Anybody else's file ending says
 // nothing: they follow the host. The room's own timer stays as the backstop, for
 // a host who has gone or whose client stopped listening without saying so.
-func (m *Manager) Ended(roomID, memberID string) (*Snapshot, error) {
+func (m *Manager) Ended(roomID, memberID string, trackID uuid.UUID) (*Snapshot, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -941,6 +946,10 @@ func (m *Manager) Ended(roomID, memberID string) (*Snapshot, error) {
 	if memberID != room.host || room.current == nil || room.current.startedAtMs == 0 {
 		// Not the room's clock, or nothing of the room's is playing: there is
 		// nothing for this to mean.
+		return m.snapshotLocked(room), nil
+	}
+	if trackID != uuid.Nil && room.current.item.TrackID != trackID {
+		// The room is past that song: this is an end that arrived late.
 		return m.snapshotLocked(room), nil
 	}
 	m.advanceLocked(context.Background(), room, "completed", memberID)
