@@ -3,6 +3,7 @@ package api
 import (
 	_ "embed"
 	"net/http"
+	"strings"
 )
 
 //go:embed openapi.yaml
@@ -158,4 +159,31 @@ var publicPaths = map[string]bool{
 	"/api/v1/auth/register": true,
 	"/api/v1/auth/login":    true,
 	"/api/v1/openapi.yaml":  true,
+	// The room channel: a guest follows the room they joined, and the socket is
+	// how they hear what it is doing.
+	"/api/v1/ws": true,
+}
+
+// publicPrefixes are the endpoints a guest may reach whatever follows them.
+//
+// A room is joined by anybody who has the link - that is what a room is for -
+// and hearing what a room is playing needs the audio, so the media path is open
+// with it. Neither one names the library: searching, browsing, playlists and
+// everything that is somebody's own still need an account.
+var publicPrefixes = []string{
+	"/api/v1/rooms",
+	"/api/v1/media/",
+}
+
+// isPublic reports whether a guest may reach this path.
+func isPublic(path string) bool {
+	if publicPaths[path] {
+		return true
+	}
+	for _, prefix := range publicPrefixes {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
 }

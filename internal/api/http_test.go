@@ -124,6 +124,82 @@ func TestRequireLoginRejectsAnonymous(t *testing.T) {
 	}
 }
 
+// doAs sends a request as a guest: no token, just the member id their browser
+// made, which is how a guest is somebody in a room.
+func (c *testClient) doAs(method, path, memberID string, body any) *httptest.ResponseRecorder {
+	c.t.Helper()
+	var reader io.Reader
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			c.t.Fatal(err)
+		}
+		reader = bytes.NewReader(raw)
+	}
+	req := httptest.NewRequest(method, path, reader)
+	req.Header.Set(memberHeader, memberID)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	rec := httptest.NewRecorder()
+	c.Server.Handler().ServeHTTP(rec, req)
+	return rec
+}
+
+// A room is joined by anybody who has the link, so requireLogin - which is
+// about the library - does not stand in front of one. A guest may join, follow
+// the room, and hear what it is playing; searching the library still needs an
+// account.
+func TestRequireLoginLeavesRoomsOpenToGuests(t *testing.T) {
+	c := newHTTPTestServer(t, func(cfg *config.Config) { cfg.RequireLogin = true })
+	host := c.register("kyle", "hunter2hunter2")
+
+	rec := c.do(http.MethodPost, "/api/v1/rooms", host, map[string]string{"name": "party"})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create = %d: %s", rec.Code, rec.Body.String())
+	}
+	var created roomResponse
+	c.decode(rec, &created)
+	roomID := created.Room.ID
+
+	rec = c.doAs(http.MethodPost, "/api/v1/rooms/"+roomID+"/join", "guest-1", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("guest join = %d: %s", rec.Code, rec.Body.String())
+	}
+	var joined roomResponse
+	c.decode(rec, &joined)
+	if joined.MemberID != "guest-1" {
+		t.Errorf("member = %q, want the guest's own id", joined.MemberID)
+	}
+	found := false
+	for _, member := range joined.Room.Members {
+		if member.ID == "guest-1" {
+			found = true
+			if member.UserID != nil {
+				t.Error("a guest member is carrying an account")
+			}
+		}
+	}
+	if !found {
+		t.Errorf("members = %+v, want the guest among them", joined.Room.Members)
+	}
+
+	// Following the room, and hearing it, is the same door.
+	for _, path := range []string{"/api/v1/rooms/" + roomID, "/api/v1/ws"} {
+		if rec := c.doAs(http.MethodGet, path, "guest-1", nil); rec.Code == http.StatusUnauthorized {
+			t.Errorf("%s = 401 for a guest, want it reachable", path)
+		}
+	}
+	if rec := c.doAs(http.MethodGet, "/api/v1/media/00000000-0000-0000-0000-000000000000", "guest-1", nil); rec.Code == http.StatusUnauthorized {
+		t.Error("media = 401 for a guest, want it reachable")
+	}
+
+	// The library is still not open: a guest cannot search it.
+	if rec := c.do(http.MethodGet, "/api/v1/search?q=x", "", nil); rec.Code != http.StatusUnauthorized {
+		t.Errorf("guest search = %d, want 401", rec.Code)
+	}
+}
+
 func TestGuestReadsButHasNoPersonalData(t *testing.T) {
 	c := newHTTPTestServer(t, nil)
 
