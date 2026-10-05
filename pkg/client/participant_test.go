@@ -338,19 +338,16 @@ func TestParticipantReportsLocalRendition(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	peer := client.New(apiClient.BaseURL())
-	room, err := peer.CreateRoom(ctx, "pair", "everyone")
+	// This client opens the room, so it is the host: the room waits for its
+	// file, and reporting ready is what starts the track.
+	self := client.New(apiClient.BaseURL())
+	room, err := self.CreateRoom(ctx, "pair", "everyone")
 	if err != nil {
 		t.Fatalf("CreateRoom: %v", err)
 	}
-	self := client.New(apiClient.BaseURL())
-	joined, err := self.JoinRoom(ctx, room.RoomID)
-	if err != nil {
-		t.Fatalf("JoinRoom: %v", err)
-	}
 
 	sink := &fakeSink{}
-	participant := client.NewParticipant(joined, cache, sink, slog.New(slog.DiscardHandler))
+	participant := client.NewParticipant(room, cache, sink, slog.New(slog.DiscardHandler))
 
 	runCtx, stop := context.WithCancel(ctx)
 	defer stop()
@@ -362,9 +359,9 @@ func TestParticipantReportsLocalRendition(t *testing.T) {
 		t.Fatalf("Queue: %v", err)
 	}
 
-	// The peer never reports ready, so the readiness timeout (not this client)
-	// decides when the track starts; our participant then plays its local copy
-	// from the room position.
+	// The host's own word starts the track, and the file it plays is the one it
+	// already had: nothing is downloaded, and the room learns the length of the
+	// copy that will really be heard.
 	waitFor(t, 10*time.Second, "the cached rendition to play", func() bool {
 		return len(sink.recorded()) > 0
 	})

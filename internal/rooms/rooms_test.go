@@ -587,9 +587,109 @@ func TestRoomLengthBeforeTheQueuerMeasures(t *testing.T) {
 	}
 }
 
-// TestTheHostsReadinessStartsTheRoom: the host is the room's clock, so the room
+// TestHostSuccessionAndReturn: the room always has a host. The member who has
+// been in it longest takes over when the host leaves, and the room's owner
+// takes it back when they come home.
+func TestHostSuccessionAndReturn(t *testing.T) {
+	f := newFixture(t, nil)
+
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "kyle", Name: "Kyle"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	roomID := snapshot.ID
+	for _, id := range []string{"second", "third"} {
+		if _, err := f.m.Join(roomID, Member{ID: id, Name: id}, "", ""); err != nil {
+			t.Fatalf("Join(%s): %v", id, err)
+		}
+	}
+
+	// The host leaves: whoever has been in the room longest takes over. second
+	// joined before third, and that is the whole of the rule.
+	after, err := f.m.Leave(roomID, "kyle")
+	if err != nil {
+		t.Fatalf("Leave: %v", err)
+	}
+	if after.Host != "second" {
+		t.Fatalf("host = %q, want the longest-standing member", after.Host)
+	}
+
+	// Somebody arriving later does not displace them.
+	if _, err := f.m.Join(roomID, Member{ID: "fourth"}, "", ""); err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+	if got := f.get(roomID).Host; got != "second" {
+		t.Fatalf("host = %q, want it to stay with the longest-standing member", got)
+	}
+
+	// The owner comes back, and the room is theirs again - without the member
+	// who held it in the meantime being dropped.
+	back, err := f.m.Join(roomID, Member{ID: "kyle", Name: "Kyle"}, "", "")
+	if err != nil {
+		t.Fatalf("rejoin: %v", err)
+	}
+	if back.Host != "kyle" {
+		t.Fatalf("host = %q, want the owner back in charge", back.Host)
+	}
+	found := false
+	for _, member := range back.Members {
+		if member.ID == "second" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("the member who led the room was dropped when the owner returned")
+	}
+}
+
+// TestHostFollowsTheAccount: a member id belongs to a browser, so a host who
+// reloads or opens another tab arrives as somebody new. The room belongs to the
+// account, and the account leads it.
+func TestHostFollowsTheAccount(t *testing.T) {
+	f := newFixture(t, nil)
+	ctx := context.Background()
+
+	kyle := &store.User{Username: "kyle", PasswordHash: "x"}
+	if err := f.db.CreateUser(ctx, kyle); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "tab-one", Name: "Kyle", UserID: &kyle.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomID := snapshot.ID
+	if _, err := f.m.Join(roomID, Member{ID: "guest"}, "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// The same account, a new tab: it replaces the old member and leads.
+	rejoined, err := f.m.Join(roomID, Member{ID: "tab-two", Name: "Kyle", UserID: &kyle.ID}, "", "tab-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rejoined.Host != "tab-two" {
+		t.Fatalf("host = %q, want the account's new tab", rejoined.Host)
+	}
+	for _, member := range rejoined.Members {
+		if member.ID == "tab-one" {
+			t.Error("the superseded tab is still a member")
+		}
+	}
+
+	// A guest in the room is not the owner, and joining does not take the room
+	// from them.
+	guest, err := f.m.Join(roomID, Member{ID: "guest"}, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if guest.Host != "tab-two" {
+		t.Fatalf("host = %q, want the account still leading", guest.Host)
+	}
+}
+
+// TestTheHostsWordStartsTheRoom: the host is the room's clock, so the room
 // begins on their word and everybody else catches up to wherever it has got to.
-func TestTheHostsReadinessStartsTheRoom(t *testing.T) {
+func TestTheHostsWordStartsTheRoom(t *testing.T) {
 	f := newFixture(t, func(cfg *config.Config) {
 		cfg.ListenTogether.ReadyTimeoutSeconds = 30
 	})
@@ -1748,10 +1848,11 @@ func TestTheHostStartsTheRoomAlone(t *testing.T) {
 	}
 }
 
-// TestRoomWaitsForTheHostThenTheWindow: the room waits for the host, so another
-// member reporting is not enough to start it. The window is still the backstop
-// for a host whose file never turns up.
-func TestRoomWaitsForTheHostThenTheWindow(t *testing.T) {
+// TestRoomWaitsForTheHostWhateverTheWindow: the room waits for the host, so
+// another member reporting is not enough to start it - and the window does not
+// start it either. The window is the backstop for a room with nobody to wait
+// for, not a way to begin a song the host cannot hear.
+func TestRoomWaitsForTheHostWhateverTheWindow(t *testing.T) {
 	f := newFixture(t, nil)
 	ctx := context.Background()
 
@@ -1776,10 +1877,19 @@ func TestRoomWaitsForTheHostThenTheWindow(t *testing.T) {
 		t.Fatal("the room started without the host")
 	}
 
-	// The window passes, and the room starts with whoever is here.
+	// The window passes and the room is still waiting: the host's file is what
+	// starts the song.
 	f.clock.Advance(6 * time.Second)
+	if got := f.current(f.get(roomID)).StartedAtMs; got != 0 {
+		t.Fatal("the window started the song without the host")
+	}
+
+	// The host's word is what starts it.
+	if _, err := f.m.Ready(roomID, "a", track.ID, uuid.Nil, 180_000); err != nil {
+		t.Fatalf("Ready(host): %v", err)
+	}
 	if got := f.current(f.get(roomID)).StartedAtMs; got == 0 {
-		t.Error("the window passed; the room should have started anyway")
+		t.Error("the host's readiness did not start the room")
 	}
 }
 

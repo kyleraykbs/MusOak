@@ -12,6 +12,7 @@ type EventType string
 const (
 	EventMemberJoined  EventType = "member_joined"
 	EventMemberLeft    EventType = "member_left"
+	EventHostChanged   EventType = "host_changed"
 	EventQueueUpdated  EventType = "queue_updated"
 	EventTrackPrepared EventType = "track_prepared"
 	EventTrackStarted  EventType = "track_started"

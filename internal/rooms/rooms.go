@@ -106,8 +106,8 @@ type playback struct {
 
 	// startedAtMs is zero until the track actually starts.
 	startedAtMs int64
-	// timelineMs is the room-wide length: the file the member who queued the
-	// song is playing.
+	// timelineMs is the room-wide length: as long as the host's copy of the
+	// track, since the host is the room's clock.
 	timelineMs int64
 	// durations is what each assigned rendition says it is long, known from the
 	// store before anyone has measured the file they actually play.
@@ -151,11 +151,70 @@ func clamp(position, timeline int64) int64 {
 	return position
 }
 
+// ownerIdentity is what a member is known by across sessions: their account
+// when they have one, else the browser's own member id. Two tabs of one account
+// are one owner, and a guest keeps the id their browser remembered, so the host
+// who steps out and comes back is still the host rather than a stranger in
+// their own room.
+func ownerIdentity(member Member) string {
+	if member.UserID != nil {
+		return "user:" + member.UserID.String()
+	}
+	return "member:" + member.ID
+}
+
+// promoteHostLocked gives the room a new leader: the owner when they are still
+// here, and otherwise whoever has been in the room longest. The host was the
+// first one in, so the next-longest-standing member is the one who has waited
+// longest for the room.
+func (m *Manager) promoteHostLocked(room *room) {
+	next := ""
+	for _, memberID := range room.order {
+		member, ok := room.members[memberID]
+		if !ok {
+			continue
+		}
+		if next == "" {
+			next = memberID // room.order is join order: the first is the longest here
+		}
+		if room.owner != "" && ownerIdentity(*member) == room.owner {
+			next = memberID
+			break
+		}
+	}
+	if next == "" || next == room.host {
+		return
+	}
+	previous := room.host
+	room.host = next
+	m.logger.Info("room host promoted", "room", room.id, "host", next, "was", previous)
+	m.publishLocked(room, EventHostChanged, map[string]any{"host": next, "was": previous})
+}
+
+// takeHostLocked makes a returning owner the host again. The room is theirs;
+// whoever has been leading it steps aside without leaving it.
+func (m *Manager) takeHostLocked(room *room, member Member) bool {
+	if room.owner == "" || ownerIdentity(member) != room.owner || room.host == member.ID {
+		return false
+	}
+	previous := room.host
+	room.host = member.ID
+	m.logger.Info("room host returned", "room", room.id, "host", member.ID, "was", previous)
+	m.publishLocked(room, EventHostChanged, map[string]any{"host": member.ID, "was": previous})
+	return true
+}
+
 // room is the mutable room state; every access happens under Manager.mu.
 type room struct {
-	id          string
-	name        string
-	host        string
+	id   string
+	name string
+	host string
+	// owner is who the room belongs to, in a form that outlives a session: the
+	// account's id when they have one, else the browser's member id. The host
+	// is whoever is leading right now; the owner is who leads again when they
+	// come back.
+	owner       string
+	ownerName   string
 	controls    Controls
 	password    string // join password, empty for none; never leaves the manager
 	createdAtMs int64
@@ -172,10 +231,10 @@ type room struct {
 	// renditions are assigned and members may report ready for it, so that the
 	// advance does not begin with a download nobody has started yet.
 	next *playback
-	// out is who is sitting the room out. Their file is not what the room's
-	// song is measured by and the room does not wait for them: with the
-	// shortest copy in the room ending the song, a member holding a short or
-	// broken one needs a way to say so rather than cut everybody else off.
+	// out is who is sitting the room out. They are not waited for and their
+	// file is not what the room's song is measured by: a member holding a short
+	// or broken copy needs a way to say so rather than hold the room up, and a
+	// host who cannot play the song hands the room back to the room.
 	out map[string]bool
 }
 
@@ -418,6 +477,8 @@ func (m *Manager) Create(name string, controls Controls, password string, host M
 		id:          id,
 		name:        name,
 		host:        host.ID,
+		owner:       ownerIdentity(host),
+		ownerName:   host.Name,
 		controls:    controls,
 		password:    password,
 		createdAtMs: m.nowMsLocked(),
@@ -505,10 +566,17 @@ func (m *Manager) Join(roomID string, member Member, password, supersedes string
 			if len(room.queues[member.ID]) == 0 {
 				room.queues[member.ID] = append([]QueueItem(nil), room.queues[supersedes]...)
 			}
+			// The member being replaced is the same person: if they were leading
+			// the room, the id taking their place leads it now, rather than the
+			// room being left pointing at somebody who is gone.
+			wasHost := room.host == supersedes
 			delete(room.members, supersedes)
 			delete(room.queues, supersedes)
 			room.order = withoutMember(room.order, supersedes)
 			recomputeMasterLocked(room)
+			if wasHost {
+				room.host = member.ID
+			}
 			m.publishLocked(room, EventMemberLeft, map[string]any{
 				"memberId": supersedes, "memberCount": len(room.members),
 			})
@@ -516,6 +584,9 @@ func (m *Manager) Join(roomID string, member Member, password, supersedes string
 	}
 	member.JoinedAtMs = m.nowMsLocked()
 	room.members[member.ID] = &member
+	// The room belongs to its owner, so a host who stepped out and came back
+	// leads it again rather than sitting in their own room as a guest.
+	m.takeHostLocked(room, member)
 
 	m.publishLocked(room, EventMemberJoined, map[string]any{"member": member, "memberCount": len(room.members)})
 	if !known {
@@ -579,9 +650,7 @@ func (m *Manager) leaveLocked(room *room, memberID string) *Snapshot {
 		return nil
 	}
 	if room.host == memberID {
-		room.host = room.order[0]
-		m.logger.Info("room host promoted", "room", room.id, "host", room.host)
-		m.publishLocked(room, EventMemberJoined, map[string]any{"host": room.host, "memberCount": len(room.members)})
+		m.promoteHostLocked(room)
 	}
 	m.maybeStartLocked(room)
 	return m.snapshotLocked(room)
@@ -1424,13 +1493,13 @@ func (m *Manager) retimeLocked(room *room, playback *playback) {
 	})
 }
 
-// maybeStartLocked starts the current track when every member is ready.
+// maybeStartLocked starts the current track as soon as the room can begin.
 func (m *Manager) maybeStartLocked(room *room) {
 	playback := room.current
 	if playback == nil || playback.startedAtMs != 0 || !playback.prepared {
 		return
 	}
-	if !playback.timedOut && !m.quorumReadyLocked(room, playback) {
+	if !m.quorumReadyLocked(room, playback) {
 		return
 	}
 	m.startLocked(room, playback)
@@ -1456,11 +1525,19 @@ func (m *Manager) hostLeadsLocked(room *room) bool {
 // to, which is what the timeline is for.
 //
 // With the host gone, or sitting this one out, there is nobody to wait for and
-// the room as a whole decides again.
+// the room as a whole decides again - and there the window is the backstop, for
+// a room that would otherwise wait on somebody who may never arrive.
 func (m *Manager) quorumReadyLocked(room *room, playback *playback) bool {
 	if m.hostLeadsLocked(room) {
+		// No window while the host leads: their file is what starts the song,
+		// and starting without them would be the room playing to somebody who
+		// cannot hear it yet. A host who cannot fetch it sits the song out,
+		// which is what hands the room back to the room.
 		_, ready := playback.ready[room.host]
 		return ready
+	}
+	if playback.timedOut {
+		return true
 	}
 	playing, ready := 0, 0
 	for memberID := range room.members {
