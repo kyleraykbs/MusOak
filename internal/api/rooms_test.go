@@ -90,6 +90,54 @@ func TestRoomPasswordOverHTTP(t *testing.T) {
 	}
 }
 
+// TestQueueAddIsCapped: the room lock is held across an add, so the handler
+// refuses more than it will carry in one go - and a refused batch queues
+// nothing. The SDK splits longer runs at the same number, so the two must
+// agree.
+func TestQueueAddIsCapped(t *testing.T) {
+	c := newHTTPTestServer(t, nil)
+	alice := c.register("alice", "hunter2hunter2")
+	rec := c.do(http.MethodPost, "/api/v1/rooms", alice, map[string]string{"name": "party", "controls": "everyone"})
+	var created roomResponse
+	c.decode(rec, &created)
+	roomID := created.Room.ID
+
+	ids := make([]string, 0, maxEnqueueBatch+1)
+	for range maxEnqueueBatch + 1 {
+		track := &store.Track{Title: "Song", DurationMs: 180_000}
+		if err := c.store.CreateTrack(context.Background(), track); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, track.ID.String())
+	}
+
+	over := c.do(http.MethodPost, "/api/v1/rooms/"+roomID+"/queue", alice, map[string][]string{"trackIds": ids})
+	if over.Code != http.StatusBadRequest {
+		t.Fatalf("adding %d tracks: %d %s, want 400", len(ids), over.Code, over.Body.String())
+	}
+	get := func() rooms.Snapshot {
+		c.t.Helper()
+		rec := c.do(http.MethodGet, "/api/v1/rooms/"+roomID, "", nil)
+		if rec.Code != http.StatusOK {
+			c.t.Fatalf("get: %d %s", rec.Code, rec.Body.String())
+		}
+		var snapshot rooms.Snapshot
+		c.decode(rec, &snapshot)
+		return snapshot
+	}
+	if got := len(get().MasterQueue); got != 0 {
+		t.Errorf("a refused batch queued %d tracks, want none", got)
+	}
+
+	at := c.do(http.MethodPost, "/api/v1/rooms/"+roomID+"/queue", alice, map[string][]string{"trackIds": ids[:maxEnqueueBatch]})
+	if at.Code != http.StatusOK {
+		t.Fatalf("adding %d tracks: %d %s, want 200", maxEnqueueBatch, at.Code, at.Body.String())
+	}
+	if got := len(get().Queues[created.MemberID]); got != maxEnqueueBatch {
+		t.Errorf("queued %d tracks, want %d", got, maxEnqueueBatch)
+	}
+}
+
 // TestRoomQueuesOverHTTP walks the queue endpoints: each member enqueues into
 // their own queue, the master queue interleaves the two fairly (A1 B1 A2 B2),
 // and remove/reorder/clear only ever act on the caller's queue — with the host

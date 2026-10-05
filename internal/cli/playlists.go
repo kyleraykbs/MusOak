@@ -313,10 +313,8 @@ func (a *App) roomQueuePlaylist(ctx context.Context, argument string) error {
 	if err != nil {
 		return err
 	}
-	for _, id := range ids {
-		if _, err := room.Queue(ctx, id); err != nil {
-			return err
-		}
+	if _, err := room.QueueMany(ctx, ids); err != nil {
+		return err
 	}
 	a.printf("queued %d track(s) from %q into %s\n", len(ids), name, room.RoomID)
 	return nil

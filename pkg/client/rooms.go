@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 )
 
@@ -145,12 +146,30 @@ func (r *RoomClient) Snapshot(ctx context.Context) (*Room, error) {
 
 // Queue appends a track.
 func (r *RoomClient) Queue(ctx context.Context, trackID string) (*Room, error) {
-	var out Room
-	body := map[string]string{"trackId": trackID}
-	if err := r.client.do(ctx, http.MethodPost, r.path("/queue"), body, &out); err != nil {
-		return nil, err
+	return r.QueueMany(ctx, []string{trackID})
+}
+
+// MaxQueueBatch is how many tracks one add may carry. The server holds the room
+// lock across a batch, so it refuses more; QueueMany splits longer runs.
+const MaxQueueBatch = 500
+
+// QueueMany appends a run of tracks as one edit: a playlist added to a room is
+// one change, not one per song. Each song on its own is a round trip that
+// answers with the whole room, so a run of them is a run of whole rooms.
+func (r *RoomClient) QueueMany(ctx context.Context, trackIDs []string) (*Room, error) {
+	if len(trackIDs) == 0 {
+		return nil, errors.New("musoak: no tracks to queue")
 	}
-	return &out, nil
+	var room *Room
+	for start := 0; start < len(trackIDs); start += MaxQueueBatch {
+		var out Room
+		body := map[string][]string{"trackIds": trackIDs[start:min(start+MaxQueueBatch, len(trackIDs))]}
+		if err := r.client.do(ctx, http.MethodPost, r.path("/queue"), body, &out); err != nil {
+			return nil, err
+		}
+		room = &out
+	}
+	return room, nil
 }
 
 // Remove drops a queued item.
