@@ -262,11 +262,10 @@ func TestParticipantsFollowTheRoom(t *testing.T) {
 		}
 	}
 
-	// The room's timeline is the shortest rendition in it: everybody's song ends
-	// when the first of them ends, and a longer file is cut there. No member is
-	// left padding out the end of somebody else's copy.
-	if timeline != shortest {
-		t.Errorf("timeline = %d, want the shortest rendition %d", timeline, shortest)
+	// The room's timeline is the host's rendition: the host is the room's clock,
+	// so their copy is what the room runs for, and everybody else follows them.
+	if timeline != slots[0].DurationMs {
+		t.Errorf("timeline = %d, want the host's rendition %d", timeline, slots[0].DurationMs)
 	}
 	if shortest >= longest {
 		t.Fatalf("expected renditions of different lengths: %d vs %d", shortest, longest)

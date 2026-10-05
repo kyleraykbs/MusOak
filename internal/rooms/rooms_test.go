@@ -257,8 +257,8 @@ func queueTitles(items []QueueItem) []string {
 }
 
 // TestThreeClientsStaySynchronizedAndSkipOnVotes is the Block 9 acceptance
-// test: three clients with renditions of 180s, 179s and 182s start together,
-// the shortest one runs out early and pads with silence, a vote-driven skip
+// test: three clients with renditions of 180s, 179s and 182s start together on
+// the host's word, the room runs as long as the host's copy, a vote-driven skip
 // advances the room, and the next track plays to its end.
 func TestThreeClientsStaySynchronizedAndSkipOnVotes(t *testing.T) {
 	f := newFixture(t, func(cfg *config.Config) {
@@ -309,19 +309,19 @@ func TestThreeClientsStaySynchronizedAndSkipOnVotes(t *testing.T) {
 		t.Fatalf("Enqueue: %v", err)
 	}
 
-	// Nothing starts until everyone has downloaded and reported.
+	// Nothing starts until the host's file is here: the host is the room's
+	// clock, and the room waits for them rather than for everybody.
 	pending := f.get(roomID)
 	if f.current(pending).StartedAtMs != 0 {
-		t.Fatal("track started before everyone was ready")
+		t.Fatal("track started before the host was ready")
 	}
-	if len(f.current(pending).Awaiting) != 3 {
-		t.Fatalf("awaiting = %v, want all three members", f.current(pending).Awaiting)
+	if len(f.current(pending).Awaiting) != 1 || f.current(pending).Awaiting[0] != host.ID {
+		t.Fatalf("awaiting = %v, want the host alone", f.current(pending).Awaiting)
 	}
 
-	for _, client := range clients {
-		if _, err := f.m.Ready(roomID, client.id, track1.ID, client.variantID, client.durationMs); err != nil {
-			t.Fatalf("Ready(%s): %v", client.id, err)
-		}
+	// The other two have not reported at all; the host's word is enough.
+	if _, err := f.m.Ready(roomID, host.ID, track1.ID, variants[0].ID, 180_000); err != nil {
+		t.Fatalf("Ready(host): %v", err)
 	}
 
 	started := f.get(roomID)
@@ -330,31 +330,34 @@ func TestThreeClientsStaySynchronizedAndSkipOnVotes(t *testing.T) {
 		t.Fatalf("current item = %s, want track one", current.Item.TrackID)
 	}
 	if current.StartedAtMs == 0 {
-		t.Fatal("track did not start once everyone was ready")
+		t.Fatal("track did not start once the host was ready")
 	}
 	if want := f.clock.Now().UnixMilli(); current.StartedAtMs != want {
 		t.Errorf("startedAt = %d, want %d", current.StartedAtMs, want)
 	}
-	// The shortest file in the room ends the song: the 179s rendition, so the
-	// member holding it never sits in silence at the end of their own copy.
-	if current.TimelineMs != 179_000 {
-		t.Errorf("timeline = %d, want the shortest rendition (179000)", current.TimelineMs)
+	// The host's copy sets the length: 180s, whatever the others hold.
+	if current.TimelineMs != 180_000 {
+		t.Errorf("timeline = %d, want the host's rendition (180000)", current.TimelineMs)
 	}
 	if current.PositionMs != 0 {
 		t.Errorf("position = %d, want 0 at start", current.PositionMs)
 	}
-	if len(current.Awaiting) != 0 || len(current.CatchingUp) != 0 {
-		t.Errorf("awaiting = %v, catchingUp = %v; want nobody", current.Awaiting, current.CatchingUp)
+	// The two who have not reported are catching up, not being waited for.
+	if len(current.Awaiting) != 0 {
+		t.Errorf("awaiting = %v, want nobody", current.Awaiting)
+	}
+	if len(current.CatchingUp) != 2 {
+		t.Errorf("catchingUp = %v, want the two who have not reported", current.CatchingUp)
 	}
 
-	// The 182s rendition is the one that gets cut, at the room's end.
-	shortEndsAt := current.StartedAtMs + 179_000
+	// Everybody's song ends when the host's does.
+	hostEndsAt := current.StartedAtMs + 180_000
 	roomEndsAt := current.StartedAtMs + current.TimelineMs
-	if shortEndsAt != roomEndsAt {
-		t.Fatalf("the room's end should be the shortest file: %d vs %d", shortEndsAt, roomEndsAt)
+	if hostEndsAt != roomEndsAt {
+		t.Fatalf("the room's end should be the host's file: %d vs %d", hostEndsAt, roomEndsAt)
 	}
 
-	// Midway, and before the shortest file runs out, so what advances the room
+	// Midway, and before the host's file runs out, so what advances the room
 	// next is the vote and not the end of the track.
 	f.clock.Advance(100 * time.Second)
 	midway := f.get(roomID)
@@ -448,11 +451,10 @@ func TestThreeClientsStaySynchronizedAndSkipOnVotes(t *testing.T) {
 	}
 }
 
-// TestRoomLengthIsTheShortestFile is the room's length: the shortest file any
-// member holds. Everybody's song ends when the first of them ends, so nobody
-// sits in silence while the room plays on past the end of their own copy. A
-// longer file is cut at that point, as it always has been.
-func TestRoomLengthIsTheShortestFile(t *testing.T) {
+// TestRoomLengthIsTheHostsFile is the room's length: as long as the host's copy
+// of the track. The host is the room's clock, so a member holding a shorter or
+// longer copy follows them rather than moving the room.
+func TestRoomLengthIsTheHostsFile(t *testing.T) {
 	f := newFixture(t, nil)
 	ctx := context.Background()
 
@@ -461,8 +463,8 @@ func TestRoomLengthIsTheShortestFile(t *testing.T) {
 		variantSpec{provider: "ytmusic", providerTrackID: "b", durationMs: 431_000, downloadable: true},
 	)
 
-	// The member who queued the song holds the longer copy, so nothing here can
-	// be satisfied by following the queuer.
+	// The host holds the longer copy and the other member the shorter one: the
+	// room runs on the host's 431s, not the shorter 254s.
 	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "host", Name: "Host"})
 	if err != nil {
 		t.Fatal(err)
@@ -485,11 +487,11 @@ func TestRoomLengthIsTheShortestFile(t *testing.T) {
 	if current.StartedAtMs == 0 {
 		t.Fatal("the track did not start")
 	}
-	if current.TimelineMs != 254_000 {
-		t.Fatalf("timeline = %d, want the shortest file (254000), not the queuer's 431000", current.TimelineMs)
+	if current.TimelineMs != 431_000 {
+		t.Fatalf("timeline = %d, want the host's file (431000), not the other member's 254000", current.TimelineMs)
 	}
 
-	// A member switching to a shorter copy moves the end of the track, and the
+	// The host switching to a shorter copy moves the end of the track, and the
 	// room says so, so every client's clock follows.
 	events, cancel := f.m.Subscribe()
 	defer cancel()
@@ -519,8 +521,7 @@ func TestRoomLengthIsTheShortestFile(t *testing.T) {
 		}
 	}
 
-	// The member holding the shortest file leaves: the room has only the longer
-	// copy left, and its end moves out with them.
+	// Another member leaving does not move the host's end.
 	if _, err := f.m.Leave(roomID, "second"); err != nil {
 		t.Fatal(err)
 	}
@@ -571,7 +572,7 @@ func TestRoomLengthBeforeTheQueuerMeasures(t *testing.T) {
 		t.Fatal("the track did not start")
 	}
 	if current.TimelineMs != 254_000 {
-		t.Fatalf("timeline = %d, want the unmeasured member's rendition (254000), not the longest file", current.TimelineMs)
+		t.Fatalf("timeline = %d, want the host's rendition (254000), not the other member's 431000", current.TimelineMs)
 	}
 	// A member who has reported is carried by the report, not by the variants
 	// map: that is what the view is telling clients.
@@ -586,7 +587,9 @@ func TestRoomLengthBeforeTheQueuerMeasures(t *testing.T) {
 	}
 }
 
-func TestReadinessTimeoutStartsWithoutLaggards(t *testing.T) {
+// TestTheHostsReadinessStartsTheRoom: the host is the room's clock, so the room
+// begins on their word and everybody else catches up to wherever it has got to.
+func TestTheHostsReadinessStartsTheRoom(t *testing.T) {
 	f := newFixture(t, func(cfg *config.Config) {
 		cfg.ListenTogether.ReadyTimeoutSeconds = 30
 	})
@@ -606,7 +609,70 @@ func TestReadinessTimeoutStartsWithoutLaggards(t *testing.T) {
 	if _, err := f.enqueue(ctx, snapshot.ID, "host", track.ID); err != nil {
 		t.Fatal(err)
 	}
+
+	// The host's file is the one the room waits for, and nobody else's.
+	before := f.current(f.get(snapshot.ID))
+	if len(before.Awaiting) != 1 || before.Awaiting[0] != "host" {
+		t.Fatalf("awaiting = %v, want the host alone", before.Awaiting)
+	}
+
 	if _, err := f.m.Ready(snapshot.ID, "host", track.ID, variants[0].ID, 200_000); err != nil {
+		t.Fatal(err)
+	}
+
+	current := f.current(f.get(snapshot.ID))
+	if current.StartedAtMs == 0 {
+		t.Fatal("the host's readiness did not start the track")
+	}
+	if current.TimelineMs != 200_000 {
+		t.Errorf("timeline = %d, want the host's rendition", current.TimelineMs)
+	}
+	// The laggard is not being waited for: they join wherever the song is.
+	if len(current.CatchingUp) != 1 || current.CatchingUp[0] != "laggard" {
+		t.Errorf("catchingUp = %v, want [laggard]", current.CatchingUp)
+	}
+
+	// A late report turns a laggard into a normal member.
+	if _, err := f.m.Ready(snapshot.ID, "laggard", track.ID, variants[0].ID, 200_000); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.current(f.get(snapshot.ID)).CatchingUp) != 0 {
+		t.Error("catching up member still listed as lagging")
+	}
+}
+
+// TestReadinessTimeoutStartsWithoutLaggards: with the host sitting the song out
+// there is nobody leading it, so the room is the room again, and the window is
+// what ends the wait for the members who have not reported.
+func TestReadinessTimeoutStartsWithoutLaggards(t *testing.T) {
+	f := newFixture(t, func(cfg *config.Config) {
+		cfg.ListenTogether.ReadyTimeoutSeconds = 30
+	})
+	ctx := context.Background()
+
+	track, variants := f.trackWithVariants("Song",
+		variantSpec{provider: "local", providerTrackID: "a", durationMs: 200_000, downloadable: true},
+	)
+
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.m.Join(snapshot.ID, Member{ID: "second"}, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.m.Join(snapshot.ID, Member{ID: "third"}, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.enqueue(ctx, snapshot.ID, "host", track.ID); err != nil {
+		t.Fatal(err)
+	}
+	// The host is not playing this one, so nothing leads the room - and one of
+	// the two left is not a quorum either.
+	if _, err := f.m.SetOut(snapshot.ID, "host", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.m.Ready(snapshot.ID, "second", track.ID, variants[0].ID, 200_000); err != nil {
 		t.Fatal(err)
 	}
 
@@ -614,8 +680,8 @@ func TestReadinessTimeoutStartsWithoutLaggards(t *testing.T) {
 	if f.current(before).StartedAtMs != 0 {
 		t.Fatal("track started before the readiness timeout")
 	}
-	if len(f.current(before).Awaiting) != 1 {
-		t.Fatalf("awaiting = %v, want the laggard", f.current(before).Awaiting)
+	if len(f.current(before).Awaiting) != 1 || f.current(before).Awaiting[0] != "third" {
+		t.Fatalf("awaiting = %v, want the member who has not reported", f.current(before).Awaiting)
 	}
 
 	f.clock.Advance(30 * time.Second)
@@ -627,17 +693,6 @@ func TestReadinessTimeoutStartsWithoutLaggards(t *testing.T) {
 	}
 	if current.TimelineMs != 200_000 {
 		t.Errorf("timeline = %d, want the one reported rendition", current.TimelineMs)
-	}
-	if len(current.CatchingUp) != 1 || current.CatchingUp[0] != "laggard" {
-		t.Errorf("catchingUp = %v, want [laggard]", current.CatchingUp)
-	}
-
-	// A late report turns a laggard into a normal member.
-	if _, err := f.m.Ready(snapshot.ID, "laggard", track.ID, variants[0].ID, 200_000); err != nil {
-		t.Fatal(err)
-	}
-	if len(f.current(f.get(snapshot.ID)).CatchingUp) != 0 {
-		t.Error("catching up member still listed as lagging")
 	}
 }
 
@@ -901,10 +956,11 @@ func TestRoomAssignsTheMembersOwnUpload(t *testing.T) {
 	}
 }
 
-// TestSittingOutTakesAMemberOutOfTheRoomsLength: the room plays for as long as
-// the shortest file in it, so a member holding a short or broken copy can step
-// out. Their file stops being what the song is measured by, and the room stops
-// waiting on them, without them leaving.
+// TestSittingOutTakesAMemberOutOfTheRoomsLength: the room runs on the host's
+// copy, so another member sitting the song out changes nothing about its length
+// - what it changes is who the room waits for. A host who sits one out is the
+// case that still moves the end of the track, because the room then falls back
+// to the room as a whole.
 func TestSittingOutTakesAMemberOutOfTheRoomsLength(t *testing.T) {
 	f := newFixture(t, nil)
 	ctx := context.Background()
@@ -945,22 +1001,30 @@ func TestSittingOutTakesAMemberOutOfTheRoomsLength(t *testing.T) {
 		t.Fatal("the room waited for a member who is sitting it out")
 	}
 	if current.TimelineMs != 431_000 {
-		t.Fatalf("timeline = %d, want the long file alone (431000)", current.TimelineMs)
+		t.Fatalf("timeline = %d, want the host's file (431000)", current.TimelineMs)
 	}
 	if len(current.Awaiting) != 0 {
 		t.Errorf("awaiting = %v, want nobody", current.Awaiting)
 	}
 
-	// Coming back in puts their file back into the reckoning, and the room's end
-	// moves to it.
+	// Back in, with a shorter copy: the host's end is still the host's.
 	if _, err := f.m.SetOut(roomID, "second", false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.m.Ready(roomID, "second", track.ID, variants[0].ID, 254_000); err != nil {
 		t.Fatal(err)
 	}
+	if got := f.current(f.get(roomID)).TimelineMs; got != 431_000 {
+		t.Fatalf("timeline = %d, want the host's file still (431000)", got)
+	}
+
+	// The host sits this one out: nobody leads it now, so the room falls back to
+	// the shortest file it has left.
+	if _, err := f.m.SetOut(roomID, "host", true); err != nil {
+		t.Fatal(err)
+	}
 	if got := f.current(f.get(roomID)).TimelineMs; got != 254_000 {
-		t.Fatalf("timeline = %d, want the shortest file again (254000)", got)
+		t.Fatalf("timeline = %d, want the shortest file left (254000)", got)
 	}
 }
 
@@ -1650,9 +1714,9 @@ func TestRoomWarmsWhatItIsAboutToPlay(t *testing.T) {
 	t.Error("the room never asked for the prepared song's rendition")
 }
 
-// A room starts on a quorum of its members, not on all of them: waiting for the
-// last one is waiting for the slowest connection in the room.
-func TestRoomStartsOnAQuorumOfMembers(t *testing.T) {
+// The host's readiness is what starts the room. Nobody else's is needed, which
+// is what waiting for the slowest connection in the room used to cost.
+func TestTheHostStartsTheRoomAlone(t *testing.T) {
 	f := newFixture(t, nil)
 	ctx := context.Background()
 
@@ -1671,21 +1735,23 @@ func TestRoomStartsOnAQuorumOfMembers(t *testing.T) {
 		t.Fatalf("Enqueue: %v", err)
 	}
 
-	// Three of four is the fraction. The fourth has not reported and is not
-	// waited for.
-	for _, id := range []string{"a", "b", "c"} {
-		if _, err := f.m.Ready(roomID, id, track.ID, uuid.Nil, 180_000); err != nil {
-			t.Fatalf("Ready(%s): %v", id, err)
-		}
+	// The host alone. b, c and d have not reported, and are not waited for.
+	if _, err := f.m.Ready(roomID, "a", track.ID, uuid.Nil, 180_000); err != nil {
+		t.Fatalf("Ready(host): %v", err)
 	}
-	if got := f.current(f.get(roomID)).StartedAtMs; got == 0 {
-		t.Error("three of four members is the quorum; the room should have started")
+	current := f.current(f.get(roomID))
+	if current.StartedAtMs == 0 {
+		t.Error("the host's readiness did not start the room")
+	}
+	if len(current.CatchingUp) != 3 {
+		t.Errorf("catchingUp = %v, want the three who have not reported", current.CatchingUp)
 	}
 }
 
-// Half a room is not a quorum, so the room waits - and the window in the rules
-// is what ends that wait, rather than a member who may never arrive.
-func TestRoomWaitsTheWindowThenStartsAnyway(t *testing.T) {
+// TestRoomWaitsForTheHostThenTheWindow: the room waits for the host, so another
+// member reporting is not enough to start it. The window is still the backstop
+// for a host whose file never turns up.
+func TestRoomWaitsForTheHostThenTheWindow(t *testing.T) {
 	f := newFixture(t, nil)
 	ctx := context.Background()
 
@@ -1702,11 +1768,12 @@ func TestRoomWaitsTheWindowThenStartsAnyway(t *testing.T) {
 		t.Fatalf("Enqueue: %v", err)
 	}
 
-	if _, err := f.m.Ready(roomID, "a", track.ID, uuid.Nil, 180_000); err != nil {
+	// b's file is here. The room is waiting on a, who leads it.
+	if _, err := f.m.Ready(roomID, "b", track.ID, uuid.Nil, 180_000); err != nil {
 		t.Fatalf("Ready: %v", err)
 	}
 	if got := f.current(f.get(roomID)).StartedAtMs; got != 0 {
-		t.Fatal("one of two members is not a quorum; the room should still be waiting")
+		t.Fatal("the room started without the host")
 	}
 
 	// The window passes, and the room starts with whoever is here.

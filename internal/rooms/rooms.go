@@ -961,7 +961,7 @@ func (m *Manager) Ready(roomID, memberID string, trackID, variantID uuid.UUID, d
 	}
 
 	// A member may change which file they play, and a member may arrive: either
-	// can change the shortest file in the room, and so the end of the track.
+	// can change the host's copy, and so the end of the track.
 	// Readiness for the song prepared behind this one is kept, not announced:
 	// there is nothing for the room to show about a song it has not started.
 	if playback != room.current {
@@ -1361,31 +1361,25 @@ func (m *Manager) pickVariant(ctx context.Context, member Member, variants []sto
 	return ranking.Pick(order, variants)
 }
 
-// timelineFor is how long the room plays the current track: the shortest file
-// any member holds. Everybody's song ends when the first of them ends. A member
-// sitting in silence while the room plays on is what this avoids, and a longer
-// file is cut at that point, exactly as it always has been.
+// timelineFor is how long the room plays the current track: as long as the
+// host's copy of it. The host is the room's clock - the song starts when their
+// file is here and runs as long as their file lasts - so everyone else follows
+// them, and a member holding a longer copy is cut or a shorter one sits quiet
+// rather than either of them moving the room.
 //
-// A member who has not measured their file yet still counts: the rendition the
-// room handed them says how long their copy is, and that is a better answer
-// than leaving them out of the reckoning. Their measured report replaces it the
-// moment it arrives.
+// A host whose length is not known yet falls back to the shortest file in the
+// room, which is what the whole room used to run on. A member sitting the song
+// out is not counted either way.
 func timelineFor(room *room, playback *playback) int64 {
-	shortest := int64(0)
-	keep := func(durationMs int64) {
-		if durationMs > 0 && (shortest == 0 || durationMs < shortest) {
-			shortest = durationMs
-		}
+	if duration := durationFor(room, playback, room.host); duration > 0 {
+		return duration
 	}
+	shortest := int64(0)
 	for memberID := range room.members {
-		if room.out[memberID] {
-			continue
+		duration := durationFor(room, playback, memberID)
+		if duration > 0 && (shortest == 0 || duration < shortest) {
+			shortest = duration
 		}
-		if report, ok := playback.ready[memberID]; ok && report.DurationMs > 0 {
-			keep(report.DurationMs)
-			continue
-		}
-		keep(playback.durations[playback.variants[memberID]])
 	}
 	if shortest > 0 {
 		return shortest
@@ -1396,9 +1390,22 @@ func timelineFor(room *room, playback *playback) int64 {
 	return defaultTimelineMs
 }
 
-// retimeLocked moves the end of the current track if the shortest file in the
-// room has changed, and tells everyone. The timer that advances the room moves
-// with it: an end that is only written down is an end nobody acts on.
+// durationFor is how long one member's copy of the current track is: what they
+// reported, else what the rendition the room handed them says. Zero for a
+// member who is sitting this one out, or one the room knows nothing about.
+func durationFor(room *room, playback *playback, memberID string) int64 {
+	if memberID == "" || room.out[memberID] {
+		return 0
+	}
+	if report, ok := playback.ready[memberID]; ok && report.DurationMs > 0 {
+		return report.DurationMs
+	}
+	return playback.durations[playback.variants[memberID]]
+}
+
+// retimeLocked moves the end of the current track if the host's copy of it has
+// changed, and tells everyone. The timer that advances the room moves with it:
+// an end that is only written down is an end nobody acts on.
 func (m *Manager) retimeLocked(room *room, playback *playback) {
 	if playback == nil || playback.startedAtMs == 0 {
 		return
@@ -1429,13 +1436,32 @@ func (m *Manager) maybeStartLocked(room *room) {
 	m.startLocked(room, playback)
 }
 
-// quorumReadyLocked reports whether enough of the room has the song to begin.
+// hostLeadsLocked reports whether the host is the one the room waits for: they
+// are still here, and they are not sitting this song out.
+func (m *Manager) hostLeadsLocked(room *room) bool {
+	host := room.host
+	if host == "" || room.out[host] {
+		return false
+	}
+	_, ok := room.members[host]
+	return ok
+}
+
+// quorumReadyLocked reports whether the room can begin.
 //
-// Waiting for every last member is what a room's slowest connection used to
-// cost everybody. The window in the rules is the backstop; this is what usually
-// ends the wait first. A member sitting the song out, or one who is not here,
-// is not somebody to wait for.
+// The host's file is what the room is waiting for. They are the room's clock -
+// the song starts when their copy is here and runs as long as it lasts - so
+// waiting for anybody else would hold the host up for a member who is going to
+// follow them anyway. A member still fetching joins wherever the song has got
+// to, which is what the timeline is for.
+//
+// With the host gone, or sitting this one out, there is nobody to wait for and
+// the room as a whole decides again.
 func (m *Manager) quorumReadyLocked(room *room, playback *playback) bool {
+	if m.hostLeadsLocked(room) {
+		_, ready := playback.ready[room.host]
+		return ready
+	}
 	playing, ready := 0, 0
 	for memberID := range room.members {
 		if room.out[memberID] {
@@ -1450,6 +1476,17 @@ func (m *Manager) quorumReadyLocked(room *room, playback *playback) bool {
 		return true
 	}
 	return float64(ready) >= float64(playing)*m.cfg.ListenTogether.ReadyFraction
+}
+
+// waitedForLocked reports whether the room's start is still waiting on this
+// member: the host alone while the host is here, and the room as a whole when
+// there is no host to lead it. What the room says it is waiting for is what it
+// is really waiting for.
+func (m *Manager) waitedForLocked(room *room, memberID string) bool {
+	if !m.hostLeadsLocked(room) {
+		return true
+	}
+	return memberID == room.host
 }
 
 // startLocked fixes the timeline and the start instant, then announces
@@ -1698,8 +1735,15 @@ func (m *Manager) snapshotLocked(room *room) *Snapshot {
 		if _, ok := playback.ready[memberID]; ok {
 			continue
 		}
+		// A member sitting the song out is not waiting for anything, and is not
+		// catching up to anything either.
+		if room.out[memberID] {
+			continue
+		}
 		if playback.startedAtMs == 0 {
-			view.Awaiting = append(view.Awaiting, memberID)
+			if m.waitedForLocked(room, memberID) {
+				view.Awaiting = append(view.Awaiting, memberID)
+			}
 		} else {
 			view.CatchingUp = append(view.CatchingUp, memberID)
 		}
