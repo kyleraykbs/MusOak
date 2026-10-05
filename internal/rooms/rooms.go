@@ -686,6 +686,29 @@ func (m *Manager) queueItemLocked(ctx context.Context, memberID string, track *s
 	}
 }
 
+// prepareNextAfterEditLocked re-announces the song behind the current one.
+//
+// The queue can change while a song plays - a playlist arriving, an item
+// removed, a queue emptied - and the prepared song is the room's promise that
+// the next one starts on the instant the last one ends. Without this the room
+// only ever prepared a song at the moment the previous one began, so a queue
+// filled while a song was playing had nothing fetched ahead for it, and the
+// advance waited on a download that began at the gap.
+func (m *Manager) prepareNextAfterEditLocked(room *room) {
+	if room.current == nil || room.current.startedAtMs == 0 {
+		return
+	}
+	if len(room.master) < 2 {
+		// Nothing left to prepare: the room will be idle when this song ends.
+		if room.next != nil {
+			room.next = nil
+			m.publishLocked(room, EventQueueUpdated, queueDataLocked(room, ""))
+		}
+		return
+	}
+	m.prepareNextLocked(room)
+}
+
 // Enqueue appends a track to the member's own queue, starting it right away
 // when the room is idle.
 func (m *Manager) Enqueue(ctx context.Context, roomID, memberID string, trackID uuid.UUID) (*Snapshot, error) {
@@ -722,6 +745,7 @@ func (m *Manager) EnqueueMany(ctx context.Context, roomID, memberID string, trac
 	}
 	room.queues[memberID] = append(room.queues[memberID], items...)
 	recomputeMasterLocked(room)
+	m.prepareNextAfterEditLocked(room)
 	m.publishLocked(room, EventQueueUpdated, queueDataLocked(room, memberID))
 	if room.current == nil {
 		m.beginNextLocked(room)
@@ -751,6 +775,7 @@ func (m *Manager) Remove(roomID, memberID, itemID string) (*Snapshot, error) {
 			}
 			room.queues[owner] = append(items[:i], items[i+1:]...)
 			recomputeMasterLocked(room)
+			m.prepareNextAfterEditLocked(room)
 			m.publishLocked(room, EventQueueUpdated, queueDataLocked(room, owner))
 			return m.snapshotLocked(room), nil
 		}
@@ -809,6 +834,7 @@ func (m *Manager) Reorder(roomID, memberID string, itemIDs []string) (*Snapshot,
 
 	room.queues[owner] = reordered
 	recomputeMasterLocked(room)
+	m.prepareNextAfterEditLocked(room)
 	m.publishLocked(room, EventQueueUpdated, queueDataLocked(room, owner))
 	return m.snapshotLocked(room), nil
 }
@@ -838,6 +864,7 @@ func (m *Manager) Clear(roomID, memberID, targetMemberID string) (*Snapshot, err
 
 	room.queues[targetMemberID] = []QueueItem{}
 	recomputeMasterLocked(room)
+	m.prepareNextAfterEditLocked(room)
 	m.publishLocked(room, EventQueueUpdated, queueDataLocked(room, targetMemberID))
 	return m.snapshotLocked(room), nil
 }
@@ -1634,23 +1661,18 @@ func (m *Manager) hostLeadsLocked(room *room, playback *playback) bool {
 
 // quorumReadyLocked reports whether the room can begin.
 //
-// The host's file is what the room is waiting for. They are the room's clock -
-// the song starts when their copy is here and runs as long as it lasts - so
-// waiting for anybody else would hold the host up for a member who is going to
-// follow them anyway. A member still fetching joins wherever the song has got
-// to, which is what the timeline is for.
+// The host is the room's clock, so the room does not wait for them at all: they
+// play when their own player is ready, and the room's clock is put where their
+// file is by their own report. Waiting here is what made one slow fetch the
+// whole room's problem - the host sat on a play button while the room held a
+// song that nobody could hear.
 //
-// With the host gone, or sitting this one out, there is nobody to wait for and
-// the room as a whole decides again - and there the window is the backstop, for
-// a room that would otherwise wait on somebody who may never arrive.
+// Everybody else is a listen-along: they follow the host's timeline, and the
+// window is the backstop for a member who may never arrive. With the host gone,
+// or sitting this one out, the room as a whole decides again.
 func (m *Manager) quorumReadyLocked(room *room, playback *playback) bool {
 	if m.hostLeadsLocked(room, playback) {
-		// No window while the host leads: their file is what starts the song,
-		// and starting without them would be the room playing to somebody who
-		// cannot hear it yet. A host who cannot fetch it sits the song out,
-		// which is what hands the room back to the room.
-		_, ready := playback.ready[room.host]
-		return ready
+		return true
 	}
 	if playback.timedOut {
 		return true

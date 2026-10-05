@@ -310,14 +310,15 @@ func TestThreeClientsStaySynchronizedAndSkipOnVotes(t *testing.T) {
 		t.Fatalf("Enqueue: %v", err)
 	}
 
-	// Nothing starts until the host's file is here: the host is the room's
-	// clock, and the room waits for them rather than for everybody.
+	// The host is the room's clock, so the room does not wait for them: the song
+	// is prepared and running at once, and the host's own report is what puts
+	// the room's clock where their file is.
 	pending := f.get(roomID)
-	if f.current(pending).StartedAtMs != 0 {
-		t.Fatal("track started before the host was ready")
+	if f.current(pending).StartedAtMs == 0 {
+		t.Fatal("the room waited for the host instead of starting")
 	}
-	if len(f.current(pending).Awaiting) != 1 || f.current(pending).Awaiting[0] != host.ID {
-		t.Fatalf("awaiting = %v, want the host alone", f.current(pending).Awaiting)
+	if len(f.current(pending).Awaiting) != 0 {
+		t.Fatalf("awaiting = %v, want nobody: the host is not waited for", f.current(pending).Awaiting)
 	}
 
 	// The other two have not reported at all; the host's word is enough.
@@ -688,9 +689,13 @@ func TestHostFollowsTheAccount(t *testing.T) {
 	}
 }
 
-// TestTheHostsWordStartsTheRoom: the host is the room's clock, so the room
-// begins on their word and everybody else catches up to wherever it has got to.
-func TestTheHostsWordStartsTheRoom(t *testing.T) {
+// TestTheRoomDoesNotWaitForTheHost: the host is the room's clock, so the room
+// starts the song as soon as it is prepared. It does not wait for the host's
+// file - waiting is what made one slow fetch the whole room's problem, with the
+// host sitting on a play button while the room held a song nobody could hear.
+// The host's own report is what puts the room's clock where their file is, and
+// everybody else is a listen-along who joins wherever the song has got to.
+func TestTheRoomDoesNotWaitForTheHost(t *testing.T) {
 	f := newFixture(t, func(cfg *config.Config) {
 		cfg.ListenTogether.ReadyTimeoutSeconds = 30
 	})
@@ -711,20 +716,27 @@ func TestTheHostsWordStartsTheRoom(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The host's file is the one the room waits for, and nobody else's.
-	before := f.current(f.get(snapshot.ID))
-	if len(before.Awaiting) != 1 || before.Awaiting[0] != "host" {
-		t.Fatalf("awaiting = %v, want the host alone", before.Awaiting)
+	// Nothing is waited for. The song is running, and the member who has not
+	// reported is catching up rather than holding the room up.
+	started := f.current(f.get(snapshot.ID))
+	if started.StartedAtMs == 0 {
+		t.Fatal("the room waited for the host instead of starting")
+	}
+	if len(started.Awaiting) != 0 {
+		t.Fatalf("awaiting = %v, want nobody", started.Awaiting)
+	}
+	// Nobody has reported yet, so both are listed as behind: the host is not
+	// waited for, and the member who follows them is not either.
+	if len(started.CatchingUp) != 2 {
+		t.Errorf("catchingUp = %v, want both members", started.CatchingUp)
 	}
 
+	// The host's file is the length the room runs on, and it arrives as a report
+	// rather than as a gate.
 	if _, err := f.m.Ready(snapshot.ID, "host", track.ID, variants[0].ID, 200_000); err != nil {
 		t.Fatal(err)
 	}
-
 	current := f.current(f.get(snapshot.ID))
-	if current.StartedAtMs == 0 {
-		t.Fatal("the host's readiness did not start the track")
-	}
 	if current.TimelineMs != 200_000 {
 		t.Errorf("timeline = %d, want the host's rendition", current.TimelineMs)
 	}
@@ -765,12 +777,14 @@ func TestReadinessTimeoutStartsWithoutLaggards(t *testing.T) {
 	if _, err := f.m.Join(snapshot.ID, Member{ID: "third"}, "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.enqueue(ctx, snapshot.ID, "host", track.ID); err != nil {
+	// The host is not playing this one, so nothing leads the room - and one of
+	// the two left is not a quorum either. They sit it out before anything is
+	// queued: with the host leading, the room starts the song at once and there
+	// would be nothing left to wait for.
+	if _, err := f.m.SetOut(snapshot.ID, "host", true); err != nil {
 		t.Fatal(err)
 	}
-	// The host is not playing this one, so nothing leads the room - and one of
-	// the two left is not a quorum either.
-	if _, err := f.m.SetOut(snapshot.ID, "host", true); err != nil {
+	if _, err := f.enqueue(ctx, snapshot.ID, "host", track.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.m.Ready(snapshot.ID, "second", track.ID, variants[0].ID, 200_000); err != nil {
@@ -1401,8 +1415,11 @@ func TestEnqueueManyIsOneEdit(t *testing.T) {
 		}
 		break
 	}
-	if updates != 1 {
-		t.Errorf("queue_updated published %d times for one add, want once", updates)
+	// One edit, not one per song: the add itself, plus the song the room
+	// prepared behind the one playing. Fifty songs would otherwise be fifty
+	// recomputes, fifty events and fifty room snapshots back.
+	if updates > 2 {
+		t.Errorf("queue_updated published %d times for one add, want at most two", updates)
 	}
 
 	// An unknown track leaves the queue as it was: the batch is all or nothing.
@@ -2053,50 +2070,9 @@ func TestTheHostStartsTheRoomAlone(t *testing.T) {
 	}
 }
 
-// TestRoomWaitsForTheHostWhateverTheWindow: the room waits for the host, so
-// another member reporting is not enough to start it - and the window does not
-// start it either. The window is the backstop for a room with nobody to wait
-// for, not a way to begin a song the host cannot hear.
-func TestRoomWaitsForTheHostWhateverTheWindow(t *testing.T) {
-	f := newFixture(t, nil)
-	ctx := context.Background()
-
-	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "a"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	roomID := snapshot.ID
-	if _, err := f.m.Join(roomID, Member{ID: "b"}, "", ""); err != nil {
-		t.Fatalf("Join: %v", err)
-	}
-	track := f.track("Song")
-	if _, err := f.enqueue(ctx, roomID, "a", track.ID); err != nil {
-		t.Fatalf("Enqueue: %v", err)
-	}
-
-	// b's file is here. The room is waiting on a, who leads it.
-	if _, err := f.m.Ready(roomID, "b", track.ID, uuid.Nil, 180_000); err != nil {
-		t.Fatalf("Ready: %v", err)
-	}
-	if got := f.current(f.get(roomID)).StartedAtMs; got != 0 {
-		t.Fatal("the room started without the host")
-	}
-
-	// The window passes and the room is still waiting: the host's file is what
-	// starts the song.
-	f.clock.Advance(6 * time.Second)
-	if got := f.current(f.get(roomID)).StartedAtMs; got != 0 {
-		t.Fatal("the window started the song without the host")
-	}
-
-	// The host's word is what starts it.
-	if _, err := f.m.Ready(roomID, "a", track.ID, uuid.Nil, 180_000); err != nil {
-		t.Fatalf("Ready(host): %v", err)
-	}
-	if got := f.current(f.get(roomID)).StartedAtMs; got == 0 {
-		t.Error("the host's readiness did not start the room")
-	}
-}
+// The room no longer waits for the host's file at all - see
+// TestTheRoomDoesNotWaitForTheHost - so the test that pinned the opposite is
+// gone rather than re-pinned.
 
 // A member with one song should not wait behind two of somebody else's: the
 // round-robin is one item per member per pass, so a short queue is placed by

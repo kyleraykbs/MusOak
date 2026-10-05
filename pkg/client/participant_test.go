@@ -264,8 +264,21 @@ func TestParticipantsFollowTheRoom(t *testing.T) {
 
 	// The room's timeline is the host's rendition: the host is the room's clock,
 	// so their copy is what the room runs for, and everybody else follows them.
-	if timeline != slots[0].DurationMs {
-		t.Errorf("timeline = %d, want the host's rendition %d", timeline, slots[0].DurationMs)
+	// The room no longer waits for the host's report before starting, so the
+	// timeline settles onto their copy when that report lands rather than being
+	// right at the start - the clients that began on the room's fallback length
+	// are told the new one and follow it.
+	var settled int64
+	waitFor(t, 5*time.Second, "the timeline to settle on the host's copy", func() bool {
+		room, err := clients[0].room.Snapshot(ctx)
+		if err != nil || room.Current == nil {
+			return false
+		}
+		settled = room.Current.TimelineMs
+		return settled == slots[0].DurationMs
+	})
+	if settled != slots[0].DurationMs {
+		t.Errorf("timeline = %d, want the host's rendition %d", settled, slots[0].DurationMs)
 	}
 	if shortest >= longest {
 		t.Fatalf("expected renditions of different lengths: %d vs %d", shortest, longest)
