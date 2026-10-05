@@ -2158,12 +2158,17 @@ paths:
   /api/v1/rooms/{roomId}/queue:
     post:
       tags: [rooms]
-      summary: Add a track to your queue
+      summary: Add tracks to your queue
       description: |
-        The track goes on the caller's own queue. The fair master queue — what
-        the room actually plays — recomputes and reaches everyone on the room
-        channel; an idle room starts playing as soon as there is anything to
-        play.
+        The tracks go on the caller's own queue, in the order given. The fair
+        master queue — what the room actually plays — recomputes and reaches
+        everyone on the room channel; an idle room starts playing as soon as
+        there is anything to play.
+
+        A run of tracks is one edit, not one per song: a playlist added to a
+        room is a single recompute and a single event, and the room hears about
+        it once. The batch is all or nothing — an unknown track leaves the queue
+        untouched — and is capped at 500.
       operationId: queueTrack
       parameters: [{ $ref: "#/components/parameters/RoomID" }]
       requestBody:
@@ -2172,9 +2177,14 @@ paths:
           application/json:
             schema:
               type: object
-              required: [trackId]
+              minProperties: 1
               properties:
                 trackId: { type: string, format: uuid }
+                trackIds:
+                  type: array
+                  maxItems: 500
+                  items: { type: string, format: uuid }
+              example: { trackIds: ["6f1c2a5e-9d3b-4f8a-8c21-2b7e0d4a91cc"] }
       responses:
         "200":
           description: The room after the change.

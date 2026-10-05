@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
@@ -1298,7 +1299,11 @@ func TestMasterQueueInterleavesMemberQueues(t *testing.T) {
 		t.Errorf("b clearing a's queue: err = %v, want ErrForbidden", err)
 	}
 
-	// queue_updated tells everyone both queues and the fair master mix.
+	// queue_updated names the member whose queue moved and carries only theirs.
+	// The master mix and the pending list are functions of the queues and the
+	// join order, which every client already has: sending them made every edit
+	// cost the whole room, and a room of three hundred songs a third of a
+	// megabyte on the wire.
 	var last map[string]any
 	for {
 		select {
@@ -1314,25 +1319,150 @@ func TestMasterQueueInterleavesMemberQueues(t *testing.T) {
 	if last == nil {
 		t.Fatal("no queue_updated event was published")
 	}
-	queues, ok := last["queues"].(map[string][]QueueItem)
+	if got, want := last["memberId"], "b"; got != want {
+		t.Errorf("queue_updated memberId = %v, want %q: the host edited b's queue", got, want)
+	}
+	queue, ok := last["memberQueue"].([]QueueItem)
 	if !ok {
-		t.Fatalf("queue_updated carries %T for queues, want map[string][]QueueItem", last["queues"])
+		t.Fatalf("queue_updated carries %T for memberQueue, want []QueueItem", last["memberQueue"])
 	}
-	master, ok := last["masterQueue"].([]QueueItem)
-	if !ok {
-		t.Fatalf("queue_updated carries %T for masterQueue, want []QueueItem", last["masterQueue"])
+	if len(queue) != 0 {
+		t.Errorf("event memberQueue = %v, want empty", queueTitles(queue))
 	}
-	if _, ok := last["queue"]; !ok {
-		t.Error("queue_updated lost the queue key existing clients follow")
+	for _, whole := range []string{"queues", "masterQueue", "queue"} {
+		if _, present := last[whole]; present {
+			t.Errorf("queue_updated still carries %s: the whole room on every edit", whole)
+		}
 	}
-	if got, want := queueTitles(queues["a"]), []string{"A1", "A2"}; !slices.Equal(got, want) {
-		t.Errorf("event queues[a] = %v, want %v", got, want)
+	if _, ok := last["next"]; !ok {
+		t.Error("queue_updated lost the next key clients follow")
 	}
-	if len(queues["b"]) != 0 {
-		t.Errorf("event queues[b] = %v, want empty", queueTitles(queues["b"]))
+}
+
+// TestEnqueueManyIsOneEdit: a run of tracks is one change. Each song on its
+// own costs a lock, a recompute, an event and a room snapshot back, and a
+// client adding a playlist pays for every one of them.
+func TestEnqueueManyIsOneEdit(t *testing.T) {
+	f := newFixture(t, nil)
+	ctx := context.Background()
+	events, cancel := f.m.Subscribe()
+	defer cancel()
+
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "a"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
 	}
-	if got, want := queueTitles(master), []string{"A1", "A2"}; !slices.Equal(got, want) {
-		t.Errorf("event masterQueue = %v, want %v", got, want)
+	roomID := snapshot.ID
+
+	// One track first, so the room is playing and the batch is the only change
+	// left to announce: starting an idle room is an edit of its own.
+	if _, err := f.m.Enqueue(ctx, roomID, "a", f.track("First").ID); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	for {
+		select {
+		case <-events:
+			continue
+		default:
+		}
+		break
+	}
+
+	ids := make([]uuid.UUID, 0, 50)
+	for i := range 50 {
+		ids = append(ids, f.track(fmt.Sprintf("Song %d", i)).ID)
+	}
+	after, err := f.m.EnqueueMany(ctx, roomID, "a", ids)
+	if err != nil {
+		t.Fatalf("EnqueueMany: %v", err)
+	}
+	if got, want := len(after.Queues["a"]), len(ids)+1; got != want {
+		t.Fatalf("queued %d tracks, want %d", got, want)
+	}
+	if got, want := len(after.MasterQueue), len(ids)+1; got != want {
+		t.Errorf("master queue = %d, want %d", got, want)
+	}
+	// The order given is the order kept, behind the song already playing.
+	for i, item := range after.Queues["a"][1:] {
+		if want := fmt.Sprintf("Song %d", i); item.Title != want {
+			t.Errorf("queue[%d] = %q, want %q", i+1, item.Title, want)
+		}
+	}
+
+	updates := 0
+	for {
+		select {
+		case event := <-events:
+			if event.Type == EventQueueUpdated {
+				updates++
+			}
+			continue
+		default:
+		}
+		break
+	}
+	if updates != 1 {
+		t.Errorf("queue_updated published %d times for one add, want once", updates)
+	}
+
+	// An unknown track leaves the queue as it was: the batch is all or nothing.
+	before := len(f.get(roomID).Queues["a"])
+	if _, err := f.m.EnqueueMany(ctx, roomID, "a", []uuid.UUID{ids[0], uuid.New()}); err == nil {
+		t.Fatal("EnqueueMany with an unknown track: want an error")
+	}
+	if got := len(f.get(roomID).Queues["a"]); got != before {
+		t.Errorf("queue = %d after a failed batch, want %d", got, before)
+	}
+}
+
+// TestQueueEventDropsADepartedMember: a member who leaves has their queue
+// dropped, not replaced. A client that could not tell the difference would keep
+// the songs of somebody who is gone in the room's mix.
+func TestQueueEventDropsADepartedMember(t *testing.T) {
+	f := newFixture(t, nil)
+	ctx := context.Background()
+	events, cancel := f.m.Subscribe()
+	defer cancel()
+
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "a"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	roomID := snapshot.ID
+	if _, err := f.m.Join(roomID, Member{ID: "b"}, "", ""); err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+	track := f.track("Song")
+	if _, err := f.enqueue(ctx, roomID, "b", track.ID); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := f.m.Leave(roomID, "b"); err != nil {
+		t.Fatalf("Leave: %v", err)
+	}
+
+	var last map[string]any
+	for {
+		select {
+		case event := <-events:
+			if event.Type == EventQueueUpdated {
+				last, _ = event.Data.(map[string]any)
+			}
+			continue
+		default:
+		}
+		break
+	}
+	if last == nil {
+		t.Fatal("no queue_updated event was published")
+	}
+	if got, want := last["memberId"], "b"; got != want {
+		t.Errorf("queue_updated memberId = %v, want %q", got, want)
+	}
+	if gone, _ := last["gone"].(bool); !gone {
+		t.Error("a departed member's queue must be dropped, not replaced")
+	}
+	if _, present := last["memberQueue"]; present {
+		t.Error("a departed member's queue must not be sent")
 	}
 }
 

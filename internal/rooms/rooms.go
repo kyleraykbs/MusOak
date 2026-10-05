@@ -590,7 +590,7 @@ func (m *Manager) Join(roomID string, member Member, password, supersedes string
 
 	m.publishLocked(room, EventMemberJoined, map[string]any{"member": member, "memberCount": len(room.members)})
 	if !known {
-		m.publishLocked(room, EventQueueUpdated, queueDataLocked(room))
+		m.publishLocked(room, EventQueueUpdated, queueDataLocked(room, member.ID))
 	}
 
 	var prepareItem string
@@ -641,7 +641,7 @@ func (m *Manager) leaveLocked(room *room, memberID string) *Snapshot {
 	// moves the end of the track they were holding down.
 	m.retimeLocked(room, room.current)
 	m.publishLocked(room, EventMemberLeft, map[string]any{"memberId": memberID, "memberCount": len(room.members)})
-	m.publishLocked(room, EventQueueUpdated, queueDataLocked(room))
+	m.publishLocked(room, EventQueueUpdated, queueDataLocked(room, memberID))
 
 	if len(room.members) == 0 {
 		// The last member leaving closes the room; that is still a successful
@@ -656,9 +656,49 @@ func (m *Manager) leaveLocked(room *room, memberID string) *Snapshot {
 	return m.snapshotLocked(room)
 }
 
+// queueItemLocked builds the row a track takes in a member's queue: the title
+// and artwork the list shows, and the artist ids its menu opens.
+func (m *Manager) queueItemLocked(ctx context.Context, memberID string, track *store.Track) QueueItem {
+	// The header may predate the cover, so fall back to a lookup: the queue rows
+	// show the artwork, and a blank one is the whole row's look.
+	artwork := track.ArtworkURL
+	if artwork == "" {
+		if url, err := m.store.TrackArtwork(ctx, track.ID); err == nil {
+			artwork = url
+		}
+	}
+	// The row's menu opens the artist's page, so the ids travel with the item.
+	var artistIDs []string
+	if artists, err := m.store.TrackArtists(ctx, track.ID); err == nil {
+		artistIDs = make([]string, 0, len(artists))
+		for _, artist := range artists {
+			artistIDs = append(artistIDs, artist.ID.String())
+		}
+	}
+	return QueueItem{
+		ID:         uuid.NewString(),
+		TrackID:    track.ID,
+		Title:      track.Title,
+		AddedBy:    memberID,
+		AddedAtMs:  m.nowMsLocked(),
+		ArtworkURL: artwork,
+		ArtistIDs:  artistIDs,
+	}
+}
+
 // Enqueue appends a track to the member's own queue, starting it right away
 // when the room is idle.
 func (m *Manager) Enqueue(ctx context.Context, roomID, memberID string, trackID uuid.UUID) (*Snapshot, error) {
+	return m.EnqueueMany(ctx, roomID, memberID, []uuid.UUID{trackID})
+}
+
+// EnqueueMany appends a run of tracks to the member's own queue as one edit.
+// A playlist added to a room is one change, not one per song: each song on its
+// own costs a lock, a recompute of the mix, a queue event and a room snapshot
+// back, and a client adding three hundred of them pays for all three hundred
+// before the room has heard of any of it. The batch is all or nothing - an
+// unknown track leaves the queue untouched.
+func (m *Manager) EnqueueMany(ctx context.Context, roomID, memberID string, trackIDs []uuid.UUID) (*Snapshot, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -669,39 +709,20 @@ func (m *Manager) Enqueue(ctx context.Context, roomID, memberID string, trackID 
 	if _, ok := room.members[memberID]; !ok {
 		return nil, ErrMemberNotFound
 	}
-	track, err := m.store.Track(ctx, trackID)
-	if err != nil {
-		return nil, err
+	if len(trackIDs) == 0 {
+		return m.snapshotLocked(room), nil
 	}
-	// The header may predate the cover, so fall back to a lookup: the queue rows
-	// show the artwork, and a blank one is the whole row's look.
-	artwork := track.ArtworkURL
-	if artwork == "" {
-		if url, err := m.store.TrackArtwork(ctx, trackID); err == nil {
-			artwork = url
+	items := make([]QueueItem, 0, len(trackIDs))
+	for _, trackID := range trackIDs {
+		track, err := m.store.Track(ctx, trackID)
+		if err != nil {
+			return nil, err
 		}
+		items = append(items, m.queueItemLocked(ctx, memberID, track))
 	}
-
-	// The row's menu opens the artist's page, so the ids travel with the item.
-	var artistIDs []string
-	if artists, err := m.store.TrackArtists(ctx, trackID); err == nil {
-		artistIDs = make([]string, 0, len(artists))
-		for _, artist := range artists {
-			artistIDs = append(artistIDs, artist.ID.String())
-		}
-	}
-
-	room.queues[memberID] = append(room.queues[memberID], QueueItem{
-		ID:         uuid.NewString(),
-		TrackID:    track.ID,
-		Title:      track.Title,
-		AddedBy:    memberID,
-		AddedAtMs:  m.nowMsLocked(),
-		ArtworkURL: artwork,
-		ArtistIDs:  artistIDs,
-	})
+	room.queues[memberID] = append(room.queues[memberID], items...)
 	recomputeMasterLocked(room)
-	m.publishLocked(room, EventQueueUpdated, queueDataLocked(room))
+	m.publishLocked(room, EventQueueUpdated, queueDataLocked(room, memberID))
 	if room.current == nil {
 		m.beginNextLocked(room)
 	}
@@ -730,7 +751,7 @@ func (m *Manager) Remove(roomID, memberID, itemID string) (*Snapshot, error) {
 			}
 			room.queues[owner] = append(items[:i], items[i+1:]...)
 			recomputeMasterLocked(room)
-			m.publishLocked(room, EventQueueUpdated, queueDataLocked(room))
+			m.publishLocked(room, EventQueueUpdated, queueDataLocked(room, owner))
 			return m.snapshotLocked(room), nil
 		}
 	}
@@ -788,7 +809,7 @@ func (m *Manager) Reorder(roomID, memberID string, itemIDs []string) (*Snapshot,
 
 	room.queues[owner] = reordered
 	recomputeMasterLocked(room)
-	m.publishLocked(room, EventQueueUpdated, queueDataLocked(room))
+	m.publishLocked(room, EventQueueUpdated, queueDataLocked(room, owner))
 	return m.snapshotLocked(room), nil
 }
 
@@ -817,7 +838,7 @@ func (m *Manager) Clear(roomID, memberID, targetMemberID string) (*Snapshot, err
 
 	room.queues[targetMemberID] = []QueueItem{}
 	recomputeMasterLocked(room)
-	m.publishLocked(room, EventQueueUpdated, queueDataLocked(room))
+	m.publishLocked(room, EventQueueUpdated, queueDataLocked(room, targetMemberID))
 	return m.snapshotLocked(room), nil
 }
 
@@ -1255,19 +1276,28 @@ func pendingLocked(room *room) []QueueItem {
 	return pending
 }
 
-// queueDataLocked renders the queue state for queue_updated: every member's
-// own queue and the fair master mix, for everyone.
-func queueDataLocked(room *room) map[string]any {
-	queues := make(map[string][]QueueItem, len(room.queues))
-	for memberID, items := range room.queues {
-		queues[memberID] = append([]QueueItem(nil), items...)
+// queueDataLocked renders what a queue edit changed: the edited member's own
+// queue, and the small things that are not derived from it.
+//
+// The master mix and the pending list are deliberately not sent. Both are
+// functions of the member queues and the join order, which every client already
+// has, and sending them made every edit cost the whole room: a room holding
+// three hundred songs was a third of a megabyte on the wire on every enqueue,
+// every advance and every member arriving. `changed` names the member whose
+// queue moved, or is empty when only the prepared song did.
+func queueDataLocked(room *room, changed string) map[string]any {
+	data := map[string]any{"next": nextItemLocked(room)}
+	if changed == "" {
+		return data
 	}
-	return map[string]any{
-		"queues":      queues,
-		"masterQueue": append([]QueueItem(nil), room.master...),
-		"queue":       pendingLocked(room),
-		"next":        nextItemLocked(room),
+	data["memberId"] = changed
+	if _, present := room.members[changed]; !present {
+		// They left: the client drops the queue rather than replacing it.
+		data["gone"] = true
+		return data
 	}
+	data["memberQueue"] = append([]QueueItem(nil), room.queues[changed]...)
+	return data
 }
 
 // nextItemLocked is the song prepared behind the current one, reported so that
@@ -1313,7 +1343,7 @@ func (m *Manager) beginNextLocked(room *room) {
 
 	if len(room.master) == 0 {
 		room.current = nil
-		m.publishLocked(room, EventQueueUpdated, queueDataLocked(room))
+		m.publishLocked(room, EventQueueUpdated, queueDataLocked(room, ""))
 		return
 	}
 
@@ -1330,7 +1360,7 @@ func (m *Manager) beginNextLocked(room *room) {
 	room.next = nil
 	room.current = playback
 
-	data := queueDataLocked(room)
+	data := queueDataLocked(room, playback.item.AddedBy)
 	data["preparing"] = item
 	m.publishLocked(room, EventQueueUpdated, data)
 
@@ -1705,7 +1735,7 @@ func (m *Manager) prepareNextLocked(room *room) {
 	}
 	room.next = m.newPlayback(item)
 	go m.prepare(room.id, item.ID)
-	m.publishLocked(room, EventQueueUpdated, queueDataLocked(room))
+	m.publishLocked(room, EventQueueUpdated, queueDataLocked(room, ""))
 }
 
 // scheduleAdvanceLocked (re)schedules the end of the current track.

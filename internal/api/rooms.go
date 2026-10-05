@@ -31,8 +31,13 @@ type roomResponse struct {
 }
 
 type queueRequest struct {
-	TrackID string `json:"trackId"`
+	TrackID  string   `json:"trackId"`
+	TrackIDs []string `json:"trackIds"`
 }
+
+// maxEnqueueBatch bounds one add. The room lock is held while the tracks are
+// read, so a runaway batch would stall every member of the room.
+const maxEnqueueBatch = 500
 
 type reorderRequest struct {
 	ItemIDs []string `json:"itemIds"`
@@ -184,12 +189,11 @@ func (s *Server) handleRoomEnqueue(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	trackID, err := uuid.Parse(req.TrackID)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid trackId")
+	trackIDs, ok := parseTrackIDs(w, req)
+	if !ok {
 		return
 	}
-	room, err := s.rooms.Enqueue(r.Context(), r.PathValue("roomId"), member.ID, trackID)
+	room, err := s.rooms.EnqueueMany(r.Context(), r.PathValue("roomId"), member.ID, trackIDs)
 	if err != nil {
 		writeRoomError(w, err)
 		return
@@ -197,6 +201,35 @@ func (s *Server) handleRoomEnqueue(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, room)
 }
 
+// parseTrackIDs reads the tracks of an add: one, or a run of them. It answers
+// the request itself when the ids are missing or malformed.
+func parseTrackIDs(w http.ResponseWriter, req queueRequest) ([]uuid.UUID, bool) {
+	raw := req.TrackIDs
+	if req.TrackID != "" {
+		raw = append([]string{req.TrackID}, raw...)
+	}
+	if len(raw) == 0 {
+		writeError(w, http.StatusBadRequest, "a trackId or trackIds is required")
+		return nil, false
+	}
+	if len(raw) > maxEnqueueBatch {
+		writeError(w, http.StatusBadRequest, "too many tracks in one add")
+		return nil, false
+	}
+	ids := make([]uuid.UUID, 0, len(raw))
+	for _, value := range raw {
+		id, err := uuid.Parse(value)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid trackId")
+			return nil, false
+		}
+		ids = append(ids, id)
+	}
+	return ids, true
+}
+
+// handleRoomRemove drops one entry from a queue. A member edits their own; the
+// host may edit anyone's.
 func (s *Server) handleRoomRemove(w http.ResponseWriter, r *http.Request) {
 	member, ok := s.callerMember(r, false)
 	if !ok {
