@@ -1661,16 +1661,23 @@ func (m *Manager) hostLeadsLocked(room *room, playback *playback) bool {
 
 // quorumReadyLocked reports whether the room can begin.
 //
-// The host is the room's clock, so the room does not wait for them at all: they
-// play when their own player is ready, and the room's clock is put where their
-// file is by their own report. Waiting here is what made one slow fetch the
-// whole room's problem - the host sat on a play button while the room held a
-// song that nobody could hear.
+// The host is the room's clock, so the room does not wait for *them*: they play
+// when their own player is ready, and the room's clock is put where their file
+// is by their own report. Waiting for the host is what made one slow fetch the
+// whole room's problem.
 //
-// Everybody else is a listen-along: they follow the host's timeline, and the
-// window is the backstop for a member who may never arrive. With the host gone,
-// or sitting this one out, the room as a whole decides again.
+// But somebody has to have the file before the song runs. A room whose clock
+// starts with nobody listening plays its first seconds to an empty room, and
+// every client that arrives afterwards joins a song already under way - which is
+// what "it starts a little in" is. One client is enough: the song runs from
+// their file, and the rest are listen-alongs who join wherever it has got to.
+//
+// The window is the backstop for the case where nobody ever has it, so a room of
+// files that never arrive is not a room that waits for ever.
 func (m *Manager) quorumReadyLocked(room *room, playback *playback) bool {
+	if len(playback.ready) == 0 {
+		return playback.timedOut
+	}
 	if m.hostLeadsLocked(room, playback) {
 		return true
 	}
@@ -1694,14 +1701,38 @@ func (m *Manager) quorumReadyLocked(room *room, playback *playback) bool {
 }
 
 // waitedForLocked reports whether the room's start is still waiting on this
-// member: the host alone while the host is here, and the room as a whole when
-// there is no host to lead it. What the room says it is waiting for is what it
-// is really waiting for.
+// member.
+//
+// The song begins as soon as one member has the file, so until then the room is
+// waiting on all of them - the host included: nothing about being the host makes
+// a file arrive sooner, and whoever gets there first starts the song. Once
+// somebody has it there is nothing left to wait for, and the rest are catching
+// up.
 func (m *Manager) waitedForLocked(room *room, playback *playback, memberID string) bool {
-	if !m.hostLeadsLocked(room, playback) {
+	if room.out[memberID] {
+		return false
+	}
+	if _, isMember := room.members[memberID]; !isMember {
+		return false
+	}
+	if playback.startedAtMs != 0 {
+		// The song is running: whatever anyone's file is doing, nobody is
+		// holding the room up.
+		return false
+	}
+	if len(playback.ready) == 0 {
+		// Nobody has the file yet, and any of them could be the one that starts
+		// it, so the room is waiting on all of them.
 		return true
 	}
-	return memberID == room.host
+	if m.hostLeadsLocked(room, playback) {
+		// A file is here and the host leads the room: that is enough to start.
+		return false
+	}
+	// No host to lead it, so the room as a whole decides - and the members who
+	// have not reported are what it is waiting for.
+	_, ready := playback.ready[memberID]
+	return !ready
 }
 
 // startLocked fixes the timeline and the start instant, then announces

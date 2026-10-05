@@ -310,15 +310,16 @@ func TestThreeClientsStaySynchronizedAndSkipOnVotes(t *testing.T) {
 		t.Fatalf("Enqueue: %v", err)
 	}
 
-	// The host is the room's clock, so the room does not wait for them: the song
-	// is prepared and running at once, and the host's own report is what puts
-	// the room's clock where their file is.
+	// Somebody has to have the file before the song runs: a room whose clock
+	// starts with nobody listening plays its first seconds to an empty room, and
+	// every client that arrives afterwards joins a song already under way. It is
+	// not the host in particular - whoever is ready first starts it.
 	pending := f.get(roomID)
-	if f.current(pending).StartedAtMs == 0 {
-		t.Fatal("the room waited for the host instead of starting")
+	if f.current(pending).StartedAtMs != 0 {
+		t.Fatal("the song ran with nobody ready to hear it")
 	}
-	if len(f.current(pending).Awaiting) != 0 {
-		t.Fatalf("awaiting = %v, want nobody: the host is not waited for", f.current(pending).Awaiting)
+	if len(f.current(pending).Awaiting) != 3 {
+		t.Fatalf("awaiting = %v, want everyone: the song needs one of them", f.current(pending).Awaiting)
 	}
 
 	// The other two have not reported at all; the host's word is enough.
@@ -689,13 +690,13 @@ func TestHostFollowsTheAccount(t *testing.T) {
 	}
 }
 
-// TestTheRoomDoesNotWaitForTheHost: the host is the room's clock, so the room
-// starts the song as soon as it is prepared. It does not wait for the host's
-// file - waiting is what made one slow fetch the whole room's problem, with the
-// host sitting on a play button while the room held a song nobody could hear.
-// The host's own report is what puts the room's clock where their file is, and
-// everybody else is a listen-along who joins wherever the song has got to.
-func TestTheRoomDoesNotWaitForTheHost(t *testing.T) {
+// TestTheRoomWaitsForAFileNotTheHost: the song does not run until somebody has
+// it. A room whose clock starts with nobody listening plays its first seconds to
+// an empty room, and every client that arrives afterwards joins a song already
+// under way - which is what "it starts a little in" is. It is not the host in
+// particular: whoever is ready first starts it, and the host's own report is
+// what puts the room's clock where their file is.
+func TestTheRoomWaitsForAFileNotTheHost(t *testing.T) {
 	f := newFixture(t, func(cfg *config.Config) {
 		cfg.ListenTogether.ReadyTimeoutSeconds = 30
 	})
@@ -716,41 +717,44 @@ func TestTheRoomDoesNotWaitForTheHost(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Nothing is waited for. The song is running, and the member who has not
-	// reported is catching up rather than holding the room up.
-	started := f.current(f.get(snapshot.ID))
-	if started.StartedAtMs == 0 {
-		t.Fatal("the room waited for the host instead of starting")
+	// Nobody has the file, so nothing runs yet - and the room says it is waiting
+	// on all of them, because any of them could be the one.
+	before := f.current(f.get(snapshot.ID))
+	if before.StartedAtMs != 0 {
+		t.Fatal("the song ran with nobody ready to hear it")
 	}
-	if len(started.Awaiting) != 0 {
-		t.Fatalf("awaiting = %v, want nobody", started.Awaiting)
-	}
-	// Nobody has reported yet, so both are listed as behind: the host is not
-	// waited for, and the member who follows them is not either.
-	if len(started.CatchingUp) != 2 {
-		t.Errorf("catchingUp = %v, want both members", started.CatchingUp)
+	if len(before.Awaiting) != 2 {
+		t.Fatalf("awaiting = %v, want both members", before.Awaiting)
 	}
 
-	// The host's file is the length the room runs on, and it arrives as a report
-	// rather than as a gate.
-	if _, err := f.m.Ready(snapshot.ID, "host", track.ID, variants[0].ID, 200_000); err != nil {
-		t.Fatal(err)
-	}
-	current := f.current(f.get(snapshot.ID))
-	if current.TimelineMs != 200_000 {
-		t.Errorf("timeline = %d, want the host's rendition", current.TimelineMs)
-	}
-	// The laggard is not being waited for: they join wherever the song is.
-	if len(current.CatchingUp) != 1 || current.CatchingUp[0] != "laggard" {
-		t.Errorf("catchingUp = %v, want [laggard]", current.CatchingUp)
-	}
-
-	// A late report turns a laggard into a normal member.
+	// The laggard's file arrives first. That is enough: the song runs, and the
+	// host - who is not waited for in particular - joins where it has got to.
 	if _, err := f.m.Ready(snapshot.ID, "laggard", track.ID, variants[0].ID, 200_000); err != nil {
 		t.Fatal(err)
 	}
-	if len(f.current(f.get(snapshot.ID)).CatchingUp) != 0 {
-		t.Error("catching up member still listed as lagging")
+	started := f.current(f.get(snapshot.ID))
+	if started.StartedAtMs == 0 {
+		t.Fatal("one member's file did not start the song")
+	}
+	if len(started.Awaiting) != 0 {
+		t.Fatalf("awaiting = %v, want nobody: somebody has it", started.Awaiting)
+	}
+	if len(started.CatchingUp) != 1 || started.CatchingUp[0] != "host" {
+		t.Errorf("catchingUp = %v, want [host]", started.CatchingUp)
+	}
+	// The length is the only file the room has, until the host's report says
+	// otherwise.
+	if started.TimelineMs != 200_000 {
+		t.Errorf("timeline = %d, want the file the room has (200000)", started.TimelineMs)
+	}
+
+	// And the host's own report takes the clock over: their copy is what the room
+	// runs for, and everybody else follows them.
+	if _, err := f.m.Ready(snapshot.ID, "host", track.ID, variants[0].ID, 150_000); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.current(f.get(snapshot.ID)).TimelineMs; got != 150_000 {
+		t.Errorf("timeline = %d, want the host's rendition (150000)", got)
 	}
 }
 
