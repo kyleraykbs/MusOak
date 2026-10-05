@@ -919,6 +919,34 @@ func (m *Manager) Seek(roomID, memberID string, positionMs int64) (*Snapshot, er
 	return m.snapshotLocked(room), nil
 }
 
+// Ended records that the host's copy of the current track has run out, and moves
+// the room on.
+//
+// The host is the room's clock, so their file reaching its end is the song
+// reaching its end - and their file is the one that decides when that is, not a
+// number the room worked out in advance. Anybody else's file ending says
+// nothing: they follow the host. The room's own timer stays as the backstop, for
+// a host who has gone or whose client stopped listening without saying so.
+func (m *Manager) Ended(roomID, memberID string) (*Snapshot, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	room, err := m.roomLocked(roomID)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := room.members[memberID]; !ok {
+		return nil, ErrMemberNotFound
+	}
+	if memberID != room.host || room.current == nil || room.current.startedAtMs == 0 {
+		// Not the room's clock, or nothing of the room's is playing: there is
+		// nothing for this to mean.
+		return m.snapshotLocked(room), nil
+	}
+	m.advanceLocked(context.Background(), room, "completed", memberID)
+	return m.snapshotLocked(room), nil
+}
+
 // Skip advances past the current track.
 func (m *Manager) Skip(roomID, memberID string) (*Snapshot, error) {
 	m.mu.Lock()

@@ -254,6 +254,15 @@ func (s *Server) handleRoomSkip(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleRoomEnded is the host saying their copy of the song has run out: the
+// room moves on from their end, rather than from a length it worked out before
+// the song started.
+func (s *Server) handleRoomEnded(w http.ResponseWriter, r *http.Request) {
+	s.roomCommand(w, r, func(roomID, memberID string) (*rooms.Snapshot, error) {
+		return s.rooms.Ended(roomID, memberID)
+	})
+}
+
 func (s *Server) handleRoomSeek(w http.ResponseWriter, r *http.Request) {
 	member, ok := s.callerMember(r, false)
 	if !ok {

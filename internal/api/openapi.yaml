@@ -2298,6 +2298,24 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
+  /api/v1/rooms/{roomId}/ended:
+    post:
+      tags: [rooms]
+      summary: The host's copy of the song has run out
+      description: |
+        The host is the room's clock, so their file reaching its end is the song
+        reaching its end: the room moves on from that, rather than from a length
+        it worked out before the song started. Anybody else's file ending says
+        nothing, and is ignored.
+
+        The room's own timer still ends the song for a host who has gone, or
+        whose client stopped listening without saying so.
+      operationId: reportTrackEnded
+      parameters: [{ $ref: "#/components/parameters/RoomID" }]
+      responses:
+        "200": { $ref: "#/components/responses/RoomState" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
   /api/v1/rooms/{roomId}/seek:
     post:
       tags: [rooms]
@@ -2348,8 +2366,9 @@ paths:
       summary: Report that this member can play the prepared track
       description: |
         The duration is what this client will actually play, which may come from
-        a local file. The room starts when every member is ready, or when the
-        readiness timeout passes.
+        a local file. The room starts on the host's word - they are the room's
+        clock, and the song runs as long as their copy - and a member who is
+        still fetching joins wherever the song has got to.
 
         A member may report this for the song the room has prepared behind the
         current one - the `next` in the room state - before it is needed. That
@@ -2388,11 +2407,12 @@ paths:
       tags: [rooms]
       summary: Sit the room's track out, or come back in
       description: |
-        The room plays for as long as the shortest file any member holds, so a
-        member whose copy is short or broken can step out of that reckoning
-        without leaving the room: they are not waited for and their file is not
-        what the song is measured by. Their own track keeps playing for them if
-        they have one.
+        The room runs on the host's copy, so a member whose own copy is short or
+        broken can step out of the reckoning without leaving the room: they are
+        not waited for, and they are not left out of the room. A host who sits a
+        song out hands the room back to the room as a whole, which is what the
+        shortest file and the readiness fraction are for. Their own track keeps
+        playing for them if they have one.
       operationId: setRoomOut
       parameters: [{ $ref: "#/components/parameters/RoomID" }]
       requestBody:

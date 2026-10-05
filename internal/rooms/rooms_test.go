@@ -1448,6 +1448,61 @@ func TestTransportEventsNameTheMember(t *testing.T) {
 	}
 }
 
+// TestTheHostsEndMovesTheRoomOn: the host is the room's clock, so their file
+// reaching its end is the song reaching its end - and it does not matter what
+// length the room had worked out in advance. Anybody else's file ending says
+// nothing.
+func TestTheHostsEndMovesTheRoomOn(t *testing.T) {
+	f := newFixture(t, nil)
+	ctx := context.Background()
+
+	track, variants := f.trackWithVariants("Song",
+		variantSpec{provider: "local", providerTrackID: "a", durationMs: 300_000, downloadable: true},
+	)
+	next, _ := f.trackWithVariants("Next",
+		variantSpec{provider: "local", providerTrackID: "b", durationMs: 300_000, downloadable: true},
+	)
+
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomID := snapshot.ID
+	if _, err := f.m.Join(roomID, Member{ID: "guest"}, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.enqueue(ctx, roomID, "host", track.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.enqueue(ctx, roomID, "host", next.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.m.Ready(roomID, "host", track.ID, variants[0].ID, 300_000); err != nil {
+		t.Fatal(err)
+	}
+	if f.current(f.get(roomID)).StartedAtMs == 0 {
+		t.Fatal("the track did not start")
+	}
+
+	// Somebody who is not the room's clock saying so changes nothing.
+	if _, err := f.m.Ended(roomID, "guest"); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.current(f.get(roomID)).Item.TrackID; got != track.ID {
+		t.Fatalf("current = %s, want the same song: a guest's file ending says nothing", got)
+	}
+
+	// The host's own file ending is the end of the song, well before the length
+	// the room worked out.
+	if _, err := f.m.Ended(roomID, "host"); err != nil {
+		t.Fatal(err)
+	}
+	after := f.get(roomID)
+	if after.Current == nil || after.Current.Item.TrackID != next.ID {
+		t.Fatalf("current = %+v, want the next song", after.Current)
+	}
+}
+
 // TestRoomPassword gates joining. The password lives in the manager and is
 // never part of any state clients see.
 func TestRoomPassword(t *testing.T) {
