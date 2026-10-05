@@ -1511,6 +1511,14 @@ func (m *Manager) retimeLocked(room *room, playback *playback) {
 	if timeline == playback.timelineMs {
 		return
 	}
+	// A length that moves after the song has started is a song that can be cut
+	// short, so what moved it is worth saying: it is the host's copy, a member
+	// who left, or a member who reported a different file.
+	m.logger.Info("room: the song's length moved",
+		"room", room.id, "track", playback.item.TrackID,
+		"was_ms", playback.timelineMs, "now_ms", timeline,
+		"position_ms", playback.positionMs(m.nowMsLocked()),
+		"host", room.host, "out", outMembers(room))
 	playback.timelineMs = timeline
 	m.scheduleAdvanceLocked(room, playback)
 	m.publishLocked(room, EventReadyState, map[string]any{
@@ -1695,6 +1703,14 @@ func memberRefLocked(room *room, memberID string) map[string]any {
 func (m *Manager) advanceLocked(ctx context.Context, room *room, reason string, by string) {
 	playback := room.current
 	if playback != nil {
+		// Why a song ended is the one thing about a room that leaves no trace.
+		// The length it was given, and where it had got to when something moved
+		// it on, is what tells a song that was cut short from one played out.
+		m.logger.Info("room: track ended",
+			"room", room.id, "reason", reason, "by", by,
+			"track", playback.item.TrackID,
+			"timeline_ms", playback.timelineMs,
+			"position_ms", playback.positionMs(m.nowMsLocked()))
 		playback.advanceVersion++
 		if playback.advanceTimer != nil {
 			playback.advanceTimer.Stop()
