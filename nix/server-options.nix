@@ -113,6 +113,16 @@ rec {
       default = 0.5;
       description = "Fraction of the room that must have voted.";
     };
+    readyFraction = lib.mkOption {
+      type = lib.types.float;
+      default = 0.75;
+      description = ''
+        How much of the room must have the song before it starts, when the host
+        is not the one leading it - the host has left, or is sitting this track
+        out. While the host leads, their own file is what starts the song and
+        this is not consulted.
+      '';
+    };
     readyTimeoutSeconds = lib.mkOption {
       type = lib.types.ints.unsigned;
       default = 30;
@@ -163,6 +173,7 @@ rec {
           skipThreshold
           minVotersForSkip
           voterFractionForSkip
+          readyFraction
           readyTimeoutSeconds;
       };
       match = {

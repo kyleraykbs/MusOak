@@ -389,6 +389,7 @@ func (s *Server) handleClock(w http.ResponseWriter, r *http.Request) {
 			"skipThreshold":        s.cfg.ListenTogether.SkipThreshold,
 			"minVotersForSkip":     s.cfg.ListenTogether.MinVotersForSkip,
 			"voterFractionForSkip": s.cfg.ListenTogether.VoterFractionForSkip,
+			"readyFraction":        s.cfg.ListenTogether.ReadyFraction,
 			"readyTimeoutSeconds":  s.cfg.ListenTogether.ReadyTimeoutSeconds,
 		},
 	})

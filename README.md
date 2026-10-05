@@ -145,6 +145,7 @@ the client; a missing file at the last location is not an error (defaults apply)
 | `listenTogether.skipThreshold` | `2.0` | Mean vote below which the room skips. |
 | `listenTogether.minVotersForSkip` | `2` | Voters needed before a skip can fire. |
 | `listenTogether.voterFractionForSkip` | `0.5` | Fraction of the room that must have voted. |
+| `listenTogether.readyFraction` | `0.75` | How much of the room must have the song to start it, when the host is not leading (they have left or are sitting the track out). While the host leads, their own file is what starts the song. |
 | `listenTogether.readyTimeoutSeconds` | `30` | How long to wait for readiness; `0` waits for everybody. |
 | `client.serverURL` | `""` | Server to talk to. Empty runs the server inside the CLI. |
 | `client.cacheDir` | `$XDG_CACHE_HOME/musoak` | Client-side media cache, queue and session token. |

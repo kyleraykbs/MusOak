@@ -1360,6 +1360,13 @@ func (m *Manager) beginNextLocked(room *room) {
 		if !ok || current.current != playback || playback.prepareVersion != version {
 			return
 		}
+		// The window is armed when the song starts, so for a song longer than
+		// the window this fires while that song is playing normally: nothing is
+		// waiting on it, and logging it is what made the journal read as though
+		// rooms were timing out constantly.
+		if playback.startedAtMs != 0 {
+			return
+		}
 		m.logger.Info("room: readiness timeout, starting without everyone",
 			"room", room.id, "item", playback.item.ID)
 		playback.timedOut = true
@@ -1408,7 +1415,7 @@ func (m *Manager) prepare(roomID, itemID string) {
 		}
 	}
 	for _, member := range members {
-		if room.out[member.ID] {
+		if member.Out {
 			continue // no rendition to fetch: they are not playing this one
 		}
 		if variant, ok := m.pickVariant(ctx, member, variants); ok {
@@ -1568,14 +1575,23 @@ func (m *Manager) maybeStartLocked(room *room) {
 }
 
 // hostLeadsLocked reports whether the host is the one the room waits for: they
-// are still here, and they are not sitting this song out.
-func (m *Manager) hostLeadsLocked(room *room) bool {
+// are still here, they are not sitting this song out, and the room has a
+// rendition to hand them.
+//
+// That last part matters. A host the room could not find anything to play for
+// can never report ready, so waiting for them is waiting for something that
+// cannot happen: a room where nothing could be resolved for the host would sit
+// still for ever. The room falls back to the room as a whole, and its window
+// moves the song on.
+func (m *Manager) hostLeadsLocked(room *room, playback *playback) bool {
 	host := room.host
 	if host == "" || room.out[host] {
 		return false
 	}
-	_, ok := room.members[host]
-	return ok
+	if _, ok := room.members[host]; !ok {
+		return false
+	}
+	return playback != nil && playback.variants[host] != uuid.Nil
 }
 
 // quorumReadyLocked reports whether the room can begin.
@@ -1590,7 +1606,7 @@ func (m *Manager) hostLeadsLocked(room *room) bool {
 // the room as a whole decides again - and there the window is the backstop, for
 // a room that would otherwise wait on somebody who may never arrive.
 func (m *Manager) quorumReadyLocked(room *room, playback *playback) bool {
-	if m.hostLeadsLocked(room) {
+	if m.hostLeadsLocked(room, playback) {
 		// No window while the host leads: their file is what starts the song,
 		// and starting without them would be the room playing to somebody who
 		// cannot hear it yet. A host who cannot fetch it sits the song out,
@@ -1621,8 +1637,8 @@ func (m *Manager) quorumReadyLocked(room *room, playback *playback) bool {
 // member: the host alone while the host is here, and the room as a whole when
 // there is no host to lead it. What the room says it is waiting for is what it
 // is really waiting for.
-func (m *Manager) waitedForLocked(room *room, memberID string) bool {
-	if !m.hostLeadsLocked(room) {
+func (m *Manager) waitedForLocked(room *room, playback *playback, memberID string) bool {
+	if !m.hostLeadsLocked(room, playback) {
 		return true
 	}
 	return memberID == room.host
@@ -1888,7 +1904,7 @@ func (m *Manager) snapshotLocked(room *room) *Snapshot {
 			continue
 		}
 		if playback.startedAtMs == 0 {
-			if m.waitedForLocked(room, memberID) {
+			if m.waitedForLocked(room, playback, memberID) {
 				view.Awaiting = append(view.Awaiting, memberID)
 			}
 		} else {
