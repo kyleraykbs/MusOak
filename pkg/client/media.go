@@ -3,7 +3,6 @@ package client
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -87,18 +86,26 @@ const (
 	defaultClockSamples = 5
 	// defaultResyncEvery is how often the clock is re-synced.
 	defaultResyncEvery = 15 * time.Second
-	// defaultDriftToleranceMs is the drift worth correcting with a small seek.
-	defaultDriftToleranceMs = 150
+	// defaultDriftToleranceMs is how far a client may be from the room's
+	// position before it seeks. Two seconds is the whole sync rule: a client
+	// that is within it is close enough, and a song that ends slightly early
+	// or late for somebody is not worth a jump.
+	defaultDriftToleranceMs = 2000
 	// prefetchAhead is how many of the room's upcoming songs this member keeps
-	// ready. The server prepares the one it is about to play and assigns a
-	// rendition of it; the songs after that are nobody's job until they are
-	// reached, and a room moves faster than a download does.
+	// ready. The room prepares nothing; a client downloading the next few
+	// songs itself is what makes an advance cost only the time to switch
+	// files.
 	prefetchAhead = 3
 )
 
-// Participant follows a room on behalf of one member: it downloads what the
-// server assigns, reports readiness with the length of its own rendition, and
-// plays along the server's timeline.
+// Participant follows a room on behalf of one member.
+//
+// It plays the room's current song and keeps itself on the room's position: if
+// the song the room is on is not the one playing, it loads it; if it is, it
+// seeks when it is more than two seconds away. It picks its own rendition of
+// every song, because the room does not assign one. The host's participant also
+// reports the two things the room cannot know otherwise — that its player has
+// begun a song (`/started`) and that its file has run out (`/ended`).
 type Participant struct {
 	room   *RoomClient
 	cache  *Cache
@@ -114,23 +121,28 @@ type Participant struct {
 	// OnTrack observes each playback slot this participant starts.
 	OnTrack func(SinkTrack)
 
-	mu          sync.Mutex
-	offsetMs    int64
-	assignments map[string]CacheEntry
-	// warming is the songs being fetched ahead right now, so the same one is
-	// not asked for twice while it is on its way.
+	mu       sync.Mutex
+	offsetMs int64
+	// room state, kept current from the snapshot and the event stream. It is
+	// what the follower rule runs against.
+	host     string
+	current  *RoomPlayback
+	playing  *localPlayback
 	warming  map[string]bool
-	playback *playbackState
+	lastSeq  int64
+	started  bool
+	reported string // the item id whose start the host has already reported
 }
 
-type playbackState struct {
+// localPlayback is the song this participant has on its sink.
+type localPlayback struct {
+	itemID     string
 	trackID    string
-	variantID  string
-	startedAt  int64
-	timelineMs int64
-	positionMs int64
+	entry      CacheEntry
 	paused     bool
+	playing    bool
 	cancel     context.CancelFunc
+	generation int
 }
 
 // NewParticipant returns a participant for a room.
@@ -146,7 +158,6 @@ func NewParticipant(room *RoomClient, cache *Cache, sink Sink, logger *slog.Logg
 		clockSamples:   defaultClockSamples,
 		resyncEvery:    defaultResyncEvery,
 		driftTolerance: defaultDriftToleranceMs,
-		assignments:    map[string]CacheEntry{},
 		warming:        map[string]bool{},
 	}
 }
@@ -170,9 +181,11 @@ func (p *Participant) Run(ctx context.Context) error {
 		return err
 	}
 
-	// A room may already be playing when we arrive.
-	if snapshot, err := p.room.Snapshot(ctx); err == nil && snapshot.Current != nil && snapshot.Current.StartedAtMs != 0 {
-		p.adoptSnapshot(ctx, snapshot)
+	// A room may already be playing when we arrive: adopt what it holds.
+	if snapshot, err := p.room.Snapshot(ctx); err == nil {
+		p.adopt(snapshot)
+		p.warmAhead(ctx, snapshot.Pending())
+		p.reconcile(ctx)
 	}
 
 	drift := time.NewTicker(time.Second)
@@ -183,22 +196,22 @@ func (p *Participant) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			_ = p.stopPlayback(ctx)
+			p.stop(ctx)
 			return ctx.Err()
 		case event, ok := <-events:
 			if !ok {
-				_ = p.stopPlayback(ctx)
+				p.stop(ctx)
 				return nil
 			}
-			if err := p.handle(ctx, event); err != nil {
-				if errors.Is(err, errRoomClosed) {
-					_ = p.stopPlayback(ctx)
-					return nil
-				}
-				p.logger.Warn("participant: event failed", "type", event.Type, "error", err)
+			if event.Type == EventRoomClosed {
+				p.stop(ctx)
+				return nil
+			}
+			if p.apply(ctx, event) {
+				p.reconcile(ctx)
 			}
 		case <-drift.C:
-			p.correctDrift(ctx)
+			p.reconcile(ctx)
 		case <-resync.C:
 			if offset, err := p.room.client.ClockOffset(ctx, 3); err == nil {
 				p.setOffset(offset)
@@ -207,180 +220,243 @@ func (p *Participant) Run(ctx context.Context) error {
 	}
 }
 
-var errRoomClosed = errors.New("room closed")
+// adopt takes the room as the snapshot has it.
+func (p *Participant) adopt(room *Room) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if room == nil {
+		return
+	}
+	p.host = room.Host
+	p.current = room.Current
+	p.lastSeq = room.Seq
+}
 
-func (p *Participant) handle(ctx context.Context, event Event) error {
+// apply folds one event into the room state, reporting whether anything the
+// follower rule cares about changed. A gap in the event counter refetches the
+// snapshot, which is the way back from a missed event.
+func (p *Participant) apply(ctx context.Context, event Event) bool {
 	if p.OnEvent != nil {
 		p.OnEvent(event)
 	}
 
+	p.mu.Lock()
+	if p.lastSeq != 0 && event.Seq != 0 && event.Seq != p.lastSeq+1 {
+		seq := p.lastSeq
+		p.mu.Unlock()
+		p.logger.Warn("participant: missed room events, resyncing", "last_seq", seq, "event_seq", event.Seq)
+		if snapshot, err := p.room.Snapshot(context.Background()); err == nil {
+			p.adopt(snapshot)
+		}
+		return true
+	}
+	if event.Seq != 0 {
+		p.lastSeq = event.Seq
+	}
+	p.mu.Unlock()
+
 	switch event.Type {
-	case EventRoomClosed:
-		return errRoomClosed
-
-	case EventTrackPrepared:
-		var data TrackPrepared
+	case EventPlayback:
+		var data PlaybackEvent
 		if err := event.DecodeData(&data); err != nil {
-			return err
-		}
-		return p.prepare(ctx, data)
-
-	case EventTrackStarted:
-		var data TrackStarted
-		if err := event.DecodeData(&data); err != nil {
-			return err
-		}
-		return p.start(ctx, data)
-
-	case EventTrackSkipped:
-		return p.stopPlayback(ctx)
-
-	case EventPaused:
-		if pauser, ok := p.sink.(Pauser); ok {
-			p.mu.Lock()
-			state := p.playback
-			p.mu.Unlock()
-			if state != nil && !state.paused {
-				state.paused = true
-				return pauser.Pause(ctx)
-			}
-		}
-		return nil
-
-	case EventResumed:
-		if pauser, ok := p.sink.(Pauser); ok {
-			p.mu.Lock()
-			state := p.playback
-			p.mu.Unlock()
-			if state != nil && state.paused {
-				state.paused = false
-				return pauser.Resume(ctx)
-			}
-		}
-		return nil
-
-	case EventSeeked:
-		var data struct {
-			PositionMs int64 `json:"positionMs"`
-			StartedAt  int64 `json:"startedAt"`
-		}
-		if err := event.DecodeData(&data); err != nil {
-			return err
+			p.logger.Warn("participant: bad playback event", "error", err)
+			return false
 		}
 		p.mu.Lock()
-		if p.playback != nil {
-			p.playback.positionMs = data.PositionMs
-			p.playback.startedAt = data.StartedAt
-		}
+		previous := p.current
+		p.current = data.Current
 		p.mu.Unlock()
-		if seeker, ok := p.sink.(Seeker); ok {
-			return seeker.Seek(ctx, data.PositionMs)
+		changed := previous == nil || data.Current == nil || previous.Item.ID != data.Current.Item.ID
+		if changed {
+			// A new song is up: keep the next few on disk while it plays.
+			go p.warmRoom(ctx)
 		}
-		return nil
+		return true
+
+	case EventHostChanged:
+		var data HostChangedEvent
+		if err := event.DecodeData(&data); err != nil {
+			return false
+		}
+		p.mu.Lock()
+		p.host = data.Host
+		p.mu.Unlock()
+		return true
 	}
-	return nil
+	return false
 }
 
-// prepare downloads this member's assigned rendition and reports readiness.
-func (p *Participant) prepare(ctx context.Context, data TrackPrepared) error {
-	variantID, ok := data.Variants[p.room.MemberID]
-	if !ok || variantID == "" {
-		// The server picked nothing for us; it will retry on the next event.
-		return nil
+// reconcile is the whole follower rule, run on every event and once a second.
+func (p *Participant) reconcile(ctx context.Context) {
+	p.mu.Lock()
+	current := p.current
+	host := p.host
+	p.mu.Unlock()
+
+	if current == nil {
+		p.stop(ctx)
+		return
+	}
+	item := current.Item
+	isHost := host == p.room.MemberID
+	expected := current.PositionAt(p.serverNow())
+
+	local := p.local()
+	if local == nil || local.itemID != item.ID {
+		// The room is on a different song: load it. A follower holds it until
+		// the host has begun it; the host is the one who begins it.
+		entry, err := p.ensureTrack(ctx, item.TrackID)
+		if err != nil {
+			p.logger.Warn("participant: could not load the room's song", "track", item.TrackID, "error", err)
+			return
+		}
+		p.setLocal(&localPlayback{itemID: item.ID, trackID: item.TrackID, entry: entry})
+		local = p.local()
 	}
 
-	// A rendition of this track we already hold is reported as-is: no
-	// download, and the room learns the duration we will really play.
-	if entry, ok := p.cache.LookupTrack(data.Item.TrackID); ok {
-		p.remember(data.Item.TrackID, entry)
-		_, err := p.room.Ready(ctx, data.Item.TrackID, entry.VariantID, entry.DurationMs)
-		return err
+	if !current.Started {
+		if !isHost {
+			return // loaded and holding; the host is what starts the song
+		}
+		if !local.playing {
+			p.play(ctx, local, current, expected, true)
+		}
+		return
 	}
 
-	entry, err := p.cache.Fetch(ctx, p.room.client, variantID)
-	if err != nil {
-		return fmt.Errorf("fetch %s: %w", variantID, err)
-	}
-	entry.TrackID = data.Item.TrackID
-	p.remember(data.Item.TrackID, entry)
-
-	if _, err := p.room.Ready(ctx, data.Item.TrackID, entry.VariantID, entry.DurationMs); err != nil {
-		return err
-	}
-
-	// If the room is already playing this track — we joined late, or the server
-	// assigned our rendition after the start — play from the room position.
-	if snapshot, err := p.room.Snapshot(ctx); err == nil {
-		// The songs after this one are worth having too: the server prepares
-		// them one at a time, and a skip should not wait on a download.
-		p.warmAhead(ctx, snapshot, data.Item.ID)
-		if current := snapshot.Current; current != nil {
-			if current.Item.TrackID == data.Item.TrackID && current.StartedAtMs != 0 {
-				p.mu.Lock()
-				alreadyPlaying := p.playback != nil && p.playback.trackID == data.Item.TrackID
-				p.mu.Unlock()
-				if !alreadyPlaying {
-					p.adoptSnapshot(ctx, snapshot)
+	if !current.Paused {
+		if !local.playing {
+			p.play(ctx, local, current, expected, isHost)
+			return
+		}
+		if local.paused {
+			if pauser, ok := p.sink.(Pauser); ok {
+				if err := pauser.Resume(ctx); err != nil {
+					p.logger.Warn("participant: resume", "error", err)
 				}
+			}
+			p.setPaused(local, false)
+			return
+		}
+		p.correctDrift(ctx, local, expected)
+		return
+	}
+
+	// Not started, or paused: hold where the room is.
+	if local.playing && !local.paused {
+		if pauser, ok := p.sink.(Pauser); ok {
+			if err := pauser.Pause(ctx); err != nil {
+				p.logger.Warn("participant: pause", "error", err)
+			}
+		}
+		p.setPaused(local, true)
+	}
+}
+
+// play starts one slot: it plays this client's file from where the room is and
+// reports the start when this client is the host.
+func (p *Participant) play(ctx context.Context, local *localPlayback, current *RoomPlayback, expected int64, isHost bool) {
+	slot := SinkTrack{
+		TrackID:    local.trackID,
+		VariantID:  local.entry.VariantID,
+		Path:       local.entry.Path,
+		DurationMs: local.entry.DurationMs,
+		PositionMs: expected,
+	}
+	if p.OnTrack != nil {
+		p.OnTrack(slot)
+	}
+
+	playCtx, cancel := context.WithCancel(ctx)
+	p.mu.Lock()
+	if local.cancel != nil {
+		local.cancel()
+	}
+	local.cancel = cancel
+	local.playing = true
+	local.paused = false
+	local.generation++
+	generation := local.generation
+	item := current.Item
+	p.mu.Unlock()
+
+	if isHost && !current.Started {
+		// The host's player is what starts the room's clock. Report where its
+		// file actually is, once per song.
+		p.mu.Lock()
+		already := p.reported == item.ID
+		if !already {
+			p.reported = item.ID
+		}
+		p.mu.Unlock()
+		if !already {
+			if _, err := p.room.Started(ctx, item.TrackID, expected, local.entry.DurationMs); err != nil {
+				p.logger.Warn("participant: report start", "error", err)
 			}
 		}
 	}
-	return nil
-}
 
-// warmAhead gets the room's next few songs onto disk, skipping the one being
-// prepared, which is already on its way.
-//
-// These are not readiness reports: the server decides what is prepared and
-// when, and this only means the file is already here by then. The room's own
-// order is what to follow, because that is what will be played.
-func (p *Participant) warmAhead(ctx context.Context, snapshot *Room, preparingItemID string) {
-	if snapshot == nil {
-		return
-	}
-	currentID := preparingItemID
-	if snapshot.Current != nil {
-		currentID = snapshot.Current.Item.ID
-	}
-	ahead := 0
-	for _, item := range snapshot.Queue {
-		if item.ID == currentID || item.TrackID == "" {
-			continue
+	go func() {
+		err := p.sink.Play(playCtx, slot)
+		finished := playCtx.Err() == nil
+		p.mu.Lock()
+		same := p.playing != nil && p.playing.generation == generation
+		if same {
+			p.playing.playing = false
 		}
-		p.warm(ctx, item.TrackID)
-		ahead++
-		if ahead == prefetchAhead {
+		p.mu.Unlock()
+		if err != nil && finished {
+			p.logger.Warn("participant: playback failed", "variant", slot.VariantID, "error", err)
+		}
+		if !finished || !same {
 			return
 		}
-	}
-}
-
-// warm fetches one song the room will reach, unless this member already holds
-// it or somebody is already fetching it. Nothing waits on it: a song that
-// cannot be fetched says so when it is reached.
-func (p *Participant) warm(ctx context.Context, trackID string) {
-	if trackID == "" {
-		return
-	}
-	if _, ok := p.cache.LookupTrack(trackID); ok {
-		return
-	}
-	if !p.claimWarm(trackID) {
-		return
-	}
-	go func() {
-		defer p.releaseWarm(trackID)
-		if _, err := p.fetchAny(ctx, trackID); err != nil {
-			p.logger.Debug("participant: could not warm an upcoming song", "track", trackID, "error", err)
+		// This client's file has played out. The host's file running out is
+		// what moves the room on; anybody else's just goes quiet.
+		if isHost {
+			if _, err := p.room.Ended(ctx, item.TrackID); err != nil {
+				p.logger.Warn("participant: report end", "error", err)
+			}
 		}
 	}()
 }
 
-// fetchAny downloads some rendition of a track nobody has assigned this member
-// yet. Which one matters less than having one: the room plays whatever a member
-// reports, and the rendition the server assigns later is used as it is when the
-// file is already here.
-func (p *Participant) fetchAny(ctx context.Context, trackID string) (CacheEntry, error) {
+// correctDrift nudges the sink back onto the room's position.
+func (p *Participant) correctDrift(ctx context.Context, local *localPlayback, expected int64) {
+	positioner, ok := p.sink.(Positioner)
+	seeker, canSeek := p.sink.(Seeker)
+	if !ok || !canSeek {
+		return
+	}
+	if local.entry.DurationMs > 0 && expected >= local.entry.DurationMs {
+		// This client's file is over; the room is still on it. Wait for the
+		// room to move, which is what "a song ends slightly early" means.
+		return
+	}
+	got, err := positioner.PositionMs(ctx)
+	if err != nil {
+		return
+	}
+	drift := got - expected
+	if drift < 0 {
+		drift = -drift
+	}
+	if drift <= p.driftTolerance {
+		return
+	}
+	p.logger.Debug("participant: correcting drift", "drift_ms", got-expected)
+	if err := seeker.Seek(ctx, expected); err != nil {
+		p.logger.Warn("participant: drift correction failed", "error", err)
+	}
+}
+
+// ensureTrack makes sure a rendition of the track is on disk locally. A copy
+// this client already has is used as-is; otherwise the first downloadable
+// rendition is fetched, which is this member's own choice of version.
+func (p *Participant) ensureTrack(ctx context.Context, trackID string) (CacheEntry, error) {
+	if entry, ok := p.cache.LookupTrack(trackID); ok {
+		return entry, nil
+	}
 	variants, err := p.room.client.TrackVariants(ctx, trackID)
 	if err != nil {
 		return CacheEntry{}, err
@@ -399,8 +475,6 @@ func (p *Participant) fetchAny(ctx context.Context, trackID string) (CacheEntry,
 	if err != nil {
 		return CacheEntry{}, err
 	}
-	// The index is what says which track a file belongs to, so that the next
-	// look for this song finds it.
 	entry.TrackID = trackID
 	if err := p.cache.Put(entry); err != nil {
 		return CacheEntry{}, err
@@ -408,8 +482,45 @@ func (p *Participant) fetchAny(ctx context.Context, trackID string) (CacheEntry,
 	return entry, nil
 }
 
-// claimWarm reports whether this song should be fetched here, taking the claim
-// when it should.
+// warmRoom fetches the room and warms the songs behind the current one. It is
+// best effort, and a failure just means the file is fetched when it is reached.
+func (p *Participant) warmRoom(ctx context.Context) {
+	snapshot, err := p.room.Snapshot(ctx)
+	if err != nil {
+		return
+	}
+	p.warmAhead(ctx, snapshot.Pending())
+}
+
+// warmAhead gets the room's next few songs onto disk. Nothing waits on it: a
+// song that cannot be fetched says so when it is reached.
+func (p *Participant) warmAhead(ctx context.Context, pending []QueueItem) {
+	for i, item := range pending {
+		if i == prefetchAhead {
+			return
+		}
+		p.warm(ctx, item.TrackID)
+	}
+}
+
+func (p *Participant) warm(ctx context.Context, trackID string) {
+	if trackID == "" {
+		return
+	}
+	if _, ok := p.cache.LookupTrack(trackID); ok {
+		return
+	}
+	if !p.claimWarm(trackID) {
+		return
+	}
+	go func() {
+		defer p.releaseWarm(trackID)
+		if _, err := p.ensureTrack(ctx, trackID); err != nil {
+			p.logger.Debug("participant: could not warm an upcoming song", "track", trackID, "error", err)
+		}
+	}()
+}
+
 func (p *Participant) claimWarm(trackID string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -426,156 +537,26 @@ func (p *Participant) releaseWarm(trackID string) {
 	delete(p.warming, trackID)
 }
 
-func (p *Participant) start(ctx context.Context, started TrackStarted) error {
-	entry, ok := p.assignment(started.Item.TrackID)
-	if !ok {
-		// We missed the preparation (we joined late, or we were catching up):
-		// fetch our assigned rendition now and play from the room position.
-		variantID := started.Variants[p.room.MemberID]
-		if variantID == "" {
-			return nil
-		}
-		fetched, err := p.cache.Fetch(ctx, p.room.client, variantID)
-		if err != nil {
-			return fmt.Errorf("catch up on %s: %w", variantID, err)
-		}
-		fetched.TrackID = started.Item.TrackID
-		p.remember(started.Item.TrackID, fetched)
-		entry = fetched
-	}
-
-	position := p.serverNow() - started.StartedAt
-	if position < 0 {
-		position = 0
-	}
-	if started.TimelineMs > 0 && position >= started.TimelineMs {
-		return nil // this track is already over
-	}
-
-	slot := SinkTrack{
-		TrackID:           started.Item.TrackID,
-		VariantID:         entry.VariantID,
-		Path:              entry.Path,
-		DurationMs:        entry.DurationMs,
-		TimelineMs:        started.TimelineMs,
-		PositionMs:        position,
-		StartedAtServerMs: started.StartedAt,
-	}
-	if p.OnTrack != nil {
-		p.OnTrack(slot)
-	}
-
-	playCtx, cancel := context.WithCancel(ctx)
-	p.mu.Lock()
-	if p.playback != nil && p.playback.cancel != nil {
-		p.playback.cancel()
-	}
-	p.playback = &playbackState{
-		trackID:    slot.TrackID,
-		variantID:  slot.VariantID,
-		startedAt:  slot.StartedAtServerMs,
-		timelineMs: slot.TimelineMs,
-		positionMs: position,
-		cancel:     cancel,
-	}
-	p.mu.Unlock()
-
-	go p.play(playCtx, slot)
-	return nil
-}
-
-// play runs one slot: it plays this client's file and, if that file is shorter
-// than the room's timeline, holds silence until the slot ends.
-func (p *Participant) play(ctx context.Context, slot SinkTrack) {
-	if err := p.sink.Play(ctx, slot); err != nil && !errors.Is(err, context.Canceled) && ctx.Err() == nil {
-		p.logger.Warn("participant: playback failed", "variant", slot.VariantID, "error", err)
-	}
-	if ctx.Err() != nil {
-		return
-	}
-
-	// Pad the rest of the slot with silence: never end the room's track early.
-	deadline := time.Duration(slot.StartedAtServerMs+slot.TimelineMs-p.serverNow()) * time.Millisecond
-	if deadline <= 0 {
-		return
-	}
-	timer := time.NewTimer(deadline)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-	case <-timer.C:
-	}
-}
-
-// adoptSnapshot resumes a track that was already playing when we joined.
-func (p *Participant) adoptSnapshot(ctx context.Context, snapshot *Room) {
-	current := snapshot.Current
-	if current == nil {
-		return
-	}
-	variantID := current.Variants[p.room.MemberID]
-	for _, report := range current.Ready {
-		if report.MemberID == p.room.MemberID {
-			variantID = report.VariantID
-		}
-	}
-	started := TrackStarted{Item: current.Item, StartedAt: current.StartedAtMs, TimelineMs: current.TimelineMs}
-	if variantID != "" {
-		started.Variants = map[string]string{p.room.MemberID: variantID}
-	}
-	if err := p.start(ctx, started); err != nil {
-		p.logger.Warn("participant: could not join the running track", "error", err)
-	}
-}
-
-// correctDrift nudges the sink back onto the room timeline.
-func (p *Participant) correctDrift(ctx context.Context) {
-	positioner, ok := p.sink.(Positioner)
-	if !ok {
-		return
-	}
-	p.mu.Lock()
-	state := p.playback
-	p.mu.Unlock()
-	if state == nil || state.paused {
-		return
-	}
-
-	want := p.serverNow() - state.startedAt
-	if want < 0 || (state.timelineMs > 0 && want > state.timelineMs) {
-		return
-	}
-	got, err := positioner.PositionMs(ctx)
-	if err != nil {
-		return
-	}
-	drift := got - want
-	if drift < 0 {
-		drift = -drift
-	}
-	if drift <= p.driftTolerance {
-		return
-	}
-	if seeker, ok := p.sink.(Seeker); ok {
-		p.logger.Debug("participant: correcting drift", "drift_ms", got-want)
-		if err := seeker.Seek(ctx, want); err != nil {
-			p.logger.Warn("participant: drift correction failed", "error", err)
-		}
-	}
-}
-
 // Position reports where the room should be right now, on the server clock.
 func (p *Participant) Position() int64 {
 	p.mu.Lock()
-	state := p.playback
+	current := p.current
 	p.mu.Unlock()
-	if state == nil {
-		return 0
+	return current.PositionAt(p.serverNow())
+}
+
+// LocalPosition reports where this client's own player is, when its sink can
+// say so.
+func (p *Participant) LocalPosition(ctx context.Context) (int64, bool) {
+	positioner, ok := p.sink.(Positioner)
+	if !ok {
+		return 0, false
 	}
-	if state.paused {
-		return state.positionMs
+	position, err := positioner.PositionMs(ctx)
+	if err != nil {
+		return 0, false
 	}
-	return p.serverNow() - state.startedAt
+	return position, true
 }
 
 // Vote scores the current track from 1 (bad) to 5 (great).
@@ -586,18 +567,47 @@ func (p *Participant) Vote(ctx context.Context, score int) error {
 
 // StopPlayback stops this client's audio without leaving the room.
 func (p *Participant) StopPlayback(ctx context.Context) error {
-	return p.stopPlayback(ctx)
+	p.stop(ctx)
+	return nil
 }
 
-func (p *Participant) stopPlayback(ctx context.Context) error {
+// stop abandons whatever this participant is playing.
+func (p *Participant) stop(ctx context.Context) {
 	p.mu.Lock()
-	state := p.playback
-	p.playback = nil
+	local := p.playing
+	p.playing = nil
 	p.mu.Unlock()
-	if state != nil && state.cancel != nil {
-		state.cancel()
+	if local != nil && local.cancel != nil {
+		local.cancel()
 	}
-	return p.sink.Stop(ctx)
+	if err := p.sink.Stop(ctx); err != nil {
+		p.logger.Debug("participant: stop", "error", err)
+	}
+}
+
+func (p *Participant) local() *localPlayback {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.playing
+}
+
+// setLocal installs a newly loaded song, abandoning whatever was playing.
+func (p *Participant) setLocal(local *localPlayback) {
+	p.mu.Lock()
+	previous := p.playing
+	p.playing = local
+	p.mu.Unlock()
+	if previous != nil && previous.cancel != nil {
+		previous.cancel()
+	}
+}
+
+func (p *Participant) setPaused(local *localPlayback, paused bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.playing != nil && p.playing.itemID == local.itemID {
+		p.playing.paused = paused
+	}
 }
 
 // serverNow is the server clock as this client sees it.
@@ -619,17 +629,4 @@ func (p *Participant) ClockOffset() time.Duration {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return time.Duration(p.offsetMs) * time.Millisecond
-}
-
-func (p *Participant) remember(trackID string, entry CacheEntry) {
-	p.mu.Lock()
-	p.assignments[trackID] = entry
-	p.mu.Unlock()
-}
-
-func (p *Participant) assignment(trackID string) (CacheEntry, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	entry, ok := p.assignments[trackID]
-	return entry, ok
 }

@@ -51,39 +51,23 @@ type voteRequest struct {
 	Score int `json:"score"`
 }
 
-type readyRequest struct {
-	TrackID    string `json:"trackId"`
-	VariantID  string `json:"variantId"`
-	DurationMs int64  `json:"durationMs"`
-}
-
-// roomOutRequest is a member saying whether they are playing the room's track.
-type roomOutRequest struct {
-	Out bool `json:"out"`
-}
-
-// modeRequest is the host saying who holds the song: the server's clock, or
-// their own player.
-type modeRequest struct {
-	Mode rooms.Mode `json:"mode"`
-}
-
-// startedRequest is the host's player saying a song is playing, and where: the
-// room's clock is put where their file is, and it runs as long as their file
-// says it is.
+// startedRequest is the host's player saying it has begun the room's song, and
+// where in it. The room's clock is put where their file is, so every follower
+// starts from the same place; until it arrives the song waits at zero.
 type startedRequest struct {
-	TrackID    string `json:"trackId"`
-	PositionMs int64  `json:"positionMs"`
-	DurationMs int64  `json:"durationMs"`
+	TrackID string `json:"trackId"`
+	// PositionMs is where the host's file is, normally zero.
+	PositionMs int64 `json:"positionMs"`
+	// DurationMs is the host's file length, shown next to the position. It ends
+	// nothing: the host's file running out is what ends the song.
+	DurationMs int64 `json:"durationMs"`
 }
 
-// endedRequest names the track whose file has run out, and where that file had
-// got to. A client that has already moved on names the track it moved on to; a
-// file that stopped short names a position well short of the song. The room
-// ignores both, because neither is a song reaching its end.
+// endedRequest names the song whose file has run out. A late report names a
+// song the room has already moved past, and the room ignores it - an end must
+// never cut the song that is playing now.
 type endedRequest struct {
-	TrackID    string `json:"trackId"`
-	PositionMs int64  `json:"positionMs"`
+	TrackID string `json:"trackId"`
 }
 
 // callerMember builds the member identity for a room command. Authenticated
@@ -194,6 +178,7 @@ func (s *Server) handleRoomLeave(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
+
 func (s *Server) handleRoomEnqueue(w http.ResponseWriter, r *http.Request) {
 	member, ok := s.callerMember(r, false)
 	if !ok {
@@ -311,37 +296,8 @@ func (s *Server) handleRoomSkip(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleRoomEnded is the host saying their copy of the song has run out: the
-// room moves on from their end, rather than from a length it worked out before
-// the song started. The track is named so that an end which arrives late - the
-// client having already moved on - cannot cut the song that is playing now.
-func (s *Server) handleRoomEnded(w http.ResponseWriter, r *http.Request) {
-	member, ok := s.callerMember(r, false)
-	if !ok {
-		writeError(w, http.StatusBadRequest, "member identity required")
-		return
-	}
-	var req endedRequest
-	if r.ContentLength > 0 && !decodeJSON(w, r, &req) {
-		return
-	}
-	trackID := uuid.Nil
-	if req.TrackID != "" {
-		parsed, err := uuid.Parse(req.TrackID)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid trackId")
-			return
-		}
-		trackID = parsed
-	}
-	room, err := s.rooms.Ended(r.PathValue("roomId"), member.ID, trackID, req.PositionMs)
-	if err != nil {
-		writeRoomError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, room)
-}
-
+// handleRoomSeek moves the room position. Clients correct their drift with
+// small seeks; under everyone-controls any member may ask.
 func (s *Server) handleRoomSeek(w http.ResponseWriter, r *http.Request) {
 	member, ok := s.callerMember(r, false)
 	if !ok {
@@ -378,79 +334,8 @@ func (s *Server) handleRoomVote(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, room)
 }
 
-// handleRoomOut records that a member is sitting the room's track out, or is
-// back in. The room plays for as long as the shortest file in it, so a member
-// holding a short or broken copy can step out of that reckoning without
-// leaving the room.
-func (s *Server) handleRoomOut(w http.ResponseWriter, r *http.Request) {
-	member, ok := s.callerMember(r, false)
-	if !ok {
-		writeError(w, http.StatusBadRequest, "member identity required")
-		return
-	}
-	var req roomOutRequest
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	room, err := s.rooms.SetOut(r.PathValue("roomId"), member.ID, req.Out)
-	if err != nil {
-		writeRoomError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"room": room})
-}
-
-func (s *Server) handleRoomReady(w http.ResponseWriter, r *http.Request) {
-	member, ok := s.callerMember(r, false)
-	if !ok {
-		writeError(w, http.StatusBadRequest, "member identity required")
-		return
-	}
-	var req readyRequest
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	trackID, err := uuid.Parse(req.TrackID)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid trackId")
-		return
-	}
-	variantID, err := uuid.Parse(req.VariantID)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid variantId")
-		return
-	}
-	room, err := s.rooms.Ready(r.PathValue("roomId"), member.ID, trackID, variantID, req.DurationMs)
-	if err != nil {
-		writeRoomError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, room)
-}
-
-// handleRoomMode is the host's checkbox: who holds the song. The song in
-// flight changes hands with it.
-func (s *Server) handleRoomMode(w http.ResponseWriter, r *http.Request) {
-	member, ok := s.callerMember(r, false)
-	if !ok {
-		writeError(w, http.StatusBadRequest, "member identity required")
-		return
-	}
-	var req modeRequest
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	room, err := s.rooms.SetMode(r.PathValue("roomId"), member.ID, req.Mode)
-	if err != nil {
-		writeRoomError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, room)
-}
-
-// handleRoomStarted is the host's player saying the song is playing. In host
-// mode their player is the clock, and this is what puts the room's clock where
-// their file is.
+// handleRoomStarted is the host's player saying the song is playing, and where.
+// It is the one thing that starts the room's clock; only the host may send it.
 func (s *Server) handleRoomStarted(w http.ResponseWriter, r *http.Request) {
 	member, ok := s.callerMember(r, false)
 	if !ok {
@@ -474,6 +359,35 @@ func (s *Server) handleRoomStarted(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, room)
 }
 
+// handleRoomEnded is the host saying its file has run out: the room moves on
+// from the host's end, which is the only end the room knows.
+func (s *Server) handleRoomEnded(w http.ResponseWriter, r *http.Request) {
+	member, ok := s.callerMember(r, false)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "member identity required")
+		return
+	}
+	var req endedRequest
+	if r.ContentLength > 0 && !decodeJSON(w, r, &req) {
+		return
+	}
+	trackID := uuid.Nil
+	if req.TrackID != "" {
+		parsed, err := uuid.Parse(req.TrackID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid trackId")
+			return
+		}
+		trackID = parsed
+	}
+	room, err := s.rooms.Ended(r.PathValue("roomId"), member.ID, trackID)
+	if err != nil {
+		writeRoomError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, room)
+}
+
 // handleClock reports the server clock; clients measure their offset from it
 // and keep re-syncing while they follow a room.
 func (s *Server) handleClock(w http.ResponseWriter, r *http.Request) {
@@ -483,8 +397,6 @@ func (s *Server) handleClock(w http.ResponseWriter, r *http.Request) {
 			"skipThreshold":        s.cfg.ListenTogether.SkipThreshold,
 			"minVotersForSkip":     s.cfg.ListenTogether.MinVotersForSkip,
 			"voterFractionForSkip": s.cfg.ListenTogether.VoterFractionForSkip,
-			"readyFraction":        s.cfg.ListenTogether.ReadyFraction,
-			"readyTimeoutSeconds":  s.cfg.ListenTogether.ReadyTimeoutSeconds,
 		},
 	})
 }
@@ -511,11 +423,10 @@ func writeRoomError(w http.ResponseWriter, err error) {
 	case errors.Is(err, rooms.ErrMemberNotFound), errors.Is(err, rooms.ErrForbidden),
 		errors.Is(err, rooms.ErrWrongPassword):
 		writeError(w, http.StatusForbidden, err.Error())
-	case errors.Is(err, rooms.ErrNoPlayback), errors.Is(err, rooms.ErrNotHostMode):
+	case errors.Is(err, rooms.ErrNoPlayback):
 		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, rooms.ErrInvalidVote), errors.Is(err, rooms.ErrInvalidOrder),
-		errors.Is(err, rooms.ErrInvalidSeek), errors.Is(err, rooms.ErrInvalidControl),
-		errors.Is(err, rooms.ErrInvalidMode):
+		errors.Is(err, rooms.ErrInvalidSeek), errors.Is(err, rooms.ErrInvalidControl):
 		writeError(w, http.StatusBadRequest, err.Error())
 	default:
 		writeError(w, http.StatusInternalServerError, err.Error())

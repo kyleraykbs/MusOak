@@ -55,14 +55,16 @@ track; the provider ranking decides which variant is played.
 
 Listen Together details worth knowing before you rely on it:
 
-* The server is the source of truth. A track starts once every member reports
-  ready, or when `readyTimeoutSeconds` passes; members who were not ready are
-  marked *catching up* and may still join mid-track.
-* The room's timeline is the longest rendition in the room. A shorter file is
-  padded with silence, a longer one is cut at the timeline, and nobody ends the
-  track early.
+* The host's player is the room's clock. The room holds a song at zero until
+  the host's player says it has begun it (`/started`), and the host's file
+  running out (`/ended`) is what moves the room on. There is no readiness gate:
+  a member plays what it can play.
+* Everybody else follows one rule. A different song is loaded; the same song
+  within two seconds of the room's position is left alone; the same song
+  further out is seeked. Each member plays the version it likes, and a song
+  ending slightly early or late for one of them is fine.
 * Clients ping the server to estimate their clock offset (NTP-style, lowest
-  round trip wins) and correct drift with small seeks.
+  round trip wins), which is the clock the room's position is expressed in.
 * Votes are 1 (bad) to 5 (great), one per member per track, changeable while the
   track plays. A skip fires when enough members have voted
   (`minVotersForSkip`), they are enough of the room (`voterFractionForSkip`) and
@@ -145,8 +147,6 @@ the client; a missing file at the last location is not an error (defaults apply)
 | `listenTogether.skipThreshold` | `2.0` | Mean vote below which the room skips. |
 | `listenTogether.minVotersForSkip` | `2` | Voters needed before a skip can fire. |
 | `listenTogether.voterFractionForSkip` | `0.5` | Fraction of the room that must have voted. |
-| `listenTogether.readyFraction` | `0.75` | How much of the room must have the song to start it, when the host is not leading (they have left or are sitting the track out). While the host leads, their own file is what starts the song. |
-| `listenTogether.readyTimeoutSeconds` | `30` | How long to wait for readiness; `0` waits for everybody. |
 | `client.serverURL` | `""` | Server to talk to. Empty runs the server inside the CLI. |
 | `client.cacheDir` | `$XDG_CACHE_HOME/musoak` | Client-side media cache, queue and session token. |
 

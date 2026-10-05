@@ -13,8 +13,9 @@ info:
       it never starts a download. Ask for one with
       `POST /api/v1/media/{variantId}/download` first.
     * Room commands are REST calls; room state changes arrive on
-      `GET /api/v1/ws` as events. The server owns the room timeline, clients
-      follow `track_started.startedAt`.
+      `GET /api/v1/ws` as events. The host's player is the room's clock: it
+      reports where the song is (`/started`) and when its file runs out
+      (`/ended`), and every other client follows the room position.
 servers:
   - url: /
     description: the same host and port this document came from
@@ -2311,15 +2312,14 @@ paths:
   /api/v1/rooms/{roomId}/ended:
     post:
       tags: [rooms]
-      summary: The host's copy of the song has run out
+      summary: The host's file for the current song has run out
       description: |
-        The host is the room's clock, so their file reaching its end is the song
-        reaching its end: the room moves on from that, rather than from a length
-        it worked out before the song started. Anybody else's file ending says
-        nothing, and is ignored.
-
-        The room's own timer still ends the song for a host who has gone, or
-        whose client stopped listening without saying so.
+        The host's player is the room's clock, so its file running out is the
+        song reaching its end: the room drops the played song and puts up the
+        next one from the mix. Only the host may report this, and only for the
+        song the room is on - an end that arrives late names a song the room
+        has already moved past and is ignored, so that it cannot cut the song
+        playing now.
       operationId: reportTrackEnded
       parameters: [{ $ref: "#/components/parameters/RoomID" }]
       requestBody:
@@ -2333,22 +2333,11 @@ paths:
                 trackId:
                   type: string
                   format: uuid
-                  description: |
-                    The track whose file has run out. A client that has already
-                    moved on names the one it has moved on to, and the room
-                    ignores it: an end that arrives late is not the end of the
-                    song playing now.
-                positionMs:
-                  type: integer
-                  format: int64
-                  description: |
-                    Where that file had got to. A file that stopped well short
-                    of the song is a file that gave up rather than a song that
-                    ended, and the room ignores it too - the song is over when
-                    the host's copy of it runs out, not when a file stops.
+                  description: The song the host's file has finished.
       responses:
         "200": { $ref: "#/components/responses/RoomState" }
         "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
 
   /api/v1/rooms/{roomId}/seek:
     post:
@@ -2394,131 +2383,22 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
 
-  /api/v1/rooms/{roomId}/ready:
-    post:
-      tags: [rooms]
-      summary: Report that this member can play the prepared track
-      description: |
-        The duration is what this client will actually play, which may come from
-        a local file. The room starts on the host's word - they are the room's
-        clock, and the song runs as long as their copy - and a member who is
-        still fetching joins wherever the song has got to.
 
-        A member may report this for the song the room has prepared behind the
-        current one - the `next` in the room state - before it is needed. That
-        is what makes the advance cost nothing: the room already knows every
-        file is here, so it starts the song the instant the last one ends
-        instead of spending its timeout on a download that began too late.
-        Reporting for the next song is accepted and kept; it is not announced,
-        because there is nothing to show about a song the room has not started.
-      operationId: reportReady
-      parameters: [{ $ref: "#/components/parameters/RoomID" }]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [trackId, variantId]
-              properties:
-                trackId: { type: string, format: uuid }
-                variantId: { type: string, format: uuid }
-                durationMs:
-                  type: integer
-                  format: int64
-                  description: Length of this member's rendition.
-      responses:
-        "200": { $ref: "#/components/responses/RoomState" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "409":
-          description: That track is not the one being prepared.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
 
-  /api/v1/rooms/{roomId}/out:
-    post:
-      tags: [rooms]
-      summary: Sit the room's track out, or come back in
-      description: |
-        The room runs on the host's copy, so a member whose own copy is short or
-        broken can step out of the reckoning without leaving the room: they are
-        not waited for, and they are not left out of the room. A host who sits a
-        song out hands the room back to the room as a whole, which is what the
-        shortest file and the readiness fraction are for. Their own track keeps
-        playing for them if they have one.
-      operationId: setRoomOut
-      parameters: [{ $ref: "#/components/parameters/RoomID" }]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [out]
-              properties:
-                out: { type: boolean }
-      responses:
-        "200":
-          description: The room, with the member's new state.
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [room]
-                properties:
-                  room: { $ref: "#/components/schemas/Room" }
-        "400": { $ref: "#/components/responses/BadRequest" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "404": { $ref: "#/components/responses/NotFound" }
-
-  /api/v1/rooms/{roomId}/mode:
-    post:
-      tags: [rooms]
-      summary: Change who holds the song
-      description: |
-        The host's choice, and a live one - the song in flight changes hands
-        with it.
-
-        In `server` mode the room waits for every member's file, then plays on
-        its own clock: a room spread across the world. In `host` mode the
-        host's player is the one everybody follows - a party in one room,
-        where their speakers are the ones everybody hears: their player says
-        where the song is, how long it is, and when it is over.
-
-        Handed to the host's player, the room stops waiting on anybody; handed
-        back to the server, the wait is for everyone again and the readiness
-        window counts from now.
-      operationId: setRoomMode
-      parameters: [{ $ref: "#/components/parameters/RoomID" }]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [mode]
-              properties:
-                mode: { type: string, enum: [server, host] }
-      responses:
-        "200": { $ref: "#/components/responses/RoomState" }
-        "400": { $ref: "#/components/responses/BadRequest" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "404": { $ref: "#/components/responses/NotFound" }
 
   /api/v1/rooms/{roomId}/started:
     post:
       tags: [rooms]
-      summary: The host's player has started the song
+      summary: The host's player has begun the song
       description: |
-        In host mode the room never starts a song - the host's player does, and
-        this is the word for it. The room's clock is put where their file is:
-        `positionMs` is where their file has got to, and `durationMs` is how
-        long their file says the song is. Everybody else follows from there,
-        and their file running out (see `/ended`) is the song ending.
+        The room holds a song at zero until the host's player says it has begun
+        it: this is that word, and it is what starts the room's clock. The room
+        is put at `positionMs` on the host's file, and `durationMs` (the host's
+        file length) is shown next to the position; nothing ends at it - the
+        host's file running out does (see `/ended`).
 
-        Only the host's, only in host mode; in server mode the room's own
-        clock says when a song is over and this is refused.
+        Only the host may report this, and only for the song the room is on;
+        anything else is ignored and the room state is returned unchanged.
       operationId: reportTrackStarted
       parameters: [{ $ref: "#/components/parameters/RoomID" }]
       requestBody:
@@ -2534,21 +2414,16 @@ paths:
                   type: integer
                   format: int64
                   minimum: 0
-                  description: Where the host's file has got to, usually zero at the start.
+                  description: Where the host's file is, normally zero.
                 durationMs:
                   type: integer
                   format: int64
-                  description: How long the host's file says the song is; the room's clock runs this long.
+                  description: The host's file length, for display.
       responses:
         "200": { $ref: "#/components/responses/RoomState" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409":
-          description: The server holds this room's song, not the host's player.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
 
   /api/v1/ws:
     get:
@@ -3168,15 +3043,6 @@ components:
         skipThreshold: { type: number, format: double }
         minVotersForSkip: { type: integer }
         voterFractionForSkip: { type: number, format: double }
-        readyFraction:
-          type: number
-          format: double
-          description: |
-            How much of the room must have the song before it starts. Waiting
-            for every last member is waiting for the slowest connection in the
-            room; the timeout is what ends that wait when even this does not
-            arrive, and whoever missed it is catching up.
-        readyTimeoutSeconds: { type: integer }
 
     RoomMember:
       type: object
@@ -3186,6 +3052,12 @@ components:
         userId: { type: string, format: uuid }
         name: { type: string }
         joinedAtMs: { type: integer, format: int64 }
+        iconUrl:
+          type: string
+          description: The member's picture; empty for a guest.
+        iconVersion:
+          type: integer
+          description: Changes when the picture does.
 
     QueueItem:
       type: object
@@ -3196,45 +3068,37 @@ components:
         title: { type: string }
         addedBy: { type: string }
         addedAtMs: { type: integer, format: int64 }
-
-    ReadyReport:
-      type: object
-      required: [memberId, trackId, variantId]
-      properties:
-        memberId: { type: string }
-        trackId: { type: string, format: uuid }
-        variantId: { type: string, format: uuid }
         durationMs: { type: integer, format: int64 }
-        atMs: { type: integer, format: int64 }
+        artworkUrl: { type: string }
+        artistIds: { type: array, items: { type: string, format: uuid } }
+
 
     RoomPlayback:
       type: object
-      required: [item, startedAtMs, timelineMs, positionMs]
+      required: [item, positionMs, atMs]
       properties:
         item: { $ref: "#/components/schemas/QueueItem" }
-        startedAtMs:
+        positionMs:
           type: integer
           format: int64
-          description: Server clock instant the track started; zero while preparing.
-        timelineMs:
+          description: Where the song is at `atMs`.
+        atMs:
           type: integer
           format: int64
-          description: Longest rendition in the room; the room plays exactly this long.
-        positionMs: { type: integer, format: int64 }
+          description: |
+            Server clock instant `positionMs` is true at. While `started` is
+            true and `paused` is false, the room is at
+            `positionMs + (serverNow - atMs)`.
+        started:
+          type: boolean
+          description: |
+            Whether the host's player has begun the song. Until it has, every
+            client loads the song and holds it at the position.
         paused: { type: boolean }
-        variants:
-          type: object
-          description: Member id to the rendition the server picked for it.
-          additionalProperties: { type: string }
-        ready: { type: array, items: { $ref: "#/components/schemas/ReadyReport" } }
-        awaiting:
-          type: array
-          description: Members that have not reported readiness yet.
-          items: { type: string }
-        catchingUp:
-          type: array
-          description: Members that were not ready when the track started.
-          items: { type: string }
+        durationMs:
+          type: integer
+          format: int64
+          description: The host's file length, for display; nothing ends at it.
         votes:
           type: object
           additionalProperties: { type: integer }
@@ -3242,27 +3106,18 @@ components:
 
     Room:
       type: object
-      required: [id, name, host, controls, members, queue]
+      required: [id, name, host, controls, members, queues]
       properties:
         id: { type: string }
         name: { type: string }
         host: { type: string }
         controls: { type: string, enum: [host, everyone] }
-        mode:
-          type: string
-          enum: [server, host]
-          description: |
-            Who holds the song. In `server` mode the room waits for every
-            member's file, then plays on its own clock; in `host` mode the
-            host's player is the clock - it says where the song is and when
-            it is over. The host's choice, changeable while the room runs.
         hasPassword:
           type: boolean
           description: Whether joining requires a password.
         createdAtMs: { type: integer, format: int64 }
         members: { type: array, items: { $ref: "#/components/schemas/RoomMember" } }
         memberCount: { type: integer }
-        queue: { type: array, items: { $ref: "#/components/schemas/QueueItem" } }
         queues:
           type: object
           description: Each member's own queue, by member id.
@@ -3272,18 +3127,21 @@ components:
         masterQueue:
           type: array
           description: |
-            The fair mix the room actually plays: round-robin across the
-            members in join order, one track each pass.
+            The fair mix the room plays: round-robin across the members in join
+            order, one track each pass. The current song keeps its place here
+            until the room moves off it.
           items: { $ref: "#/components/schemas/QueueItem" }
-        current: { $ref: "#/components/schemas/RoomPlayback" }
-        next:
-          allOf: [{ $ref: "#/components/schemas/QueueItem" }]
-          description: |
-            The song prepared behind the current one, while it is still what the
-            room would play next. Its renditions are already assigned and a
-            member may report ready for it, which is how the advance avoids
-            starting with a download. Absent when there is nothing to prepare.
+        current:
+          allOf: [{ $ref: "#/components/schemas/RoomPlayback" }]
+          nullable: true
+          description: The song playing, or null when the room is idle.
         serverNowMs: { type: integer, format: int64 }
+        seq:
+          type: integer
+          format: int64
+          description: |
+            The room's event counter at this instant; a client following the
+            event stream refetches the state when it sees a gap.
         skip: { $ref: "#/components/schemas/SkipRules" }
 
     RoomEnvelope:

@@ -29,8 +29,6 @@
   "listenTogether": {
     "skipThreshold": 2.0,
     "minVotersForSkip": 2,
-    "voterFractionForSkip": 0.5,
-    "readyFraction": 0.75,
-    "readyTimeoutSeconds": 30
+    "voterFractionForSkip": 0.5
   }
 }

@@ -3,7 +3,6 @@ package client_test
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"log/slog"
 	"net/http/httptest"
 	"os/exec"
@@ -61,47 +60,120 @@ func tone(t *testing.T, dir, name string, seconds float64) string {
 	return dst
 }
 
-// fakeSink simulates a player: it "plays" for as long as this client's own
-// file lasts, and records every slot it was handed.
-type fakeSink struct {
-	mu      sync.Mutex
-	plays   []client.SinkTrack
-	stopped int
+// playerSink simulates a player that can pause, seek and report where it is,
+// which is what the follower rule needs to be exercised end to end.
+type playerSink struct {
+	mu       sync.Mutex
+	plays    []client.SinkTrack
+	seeks    []int64
+	finished int
+	stopped  int
+	position int64
+	started  time.Time
+	paused   bool
+	pausedAt int64
 }
 
-func (s *fakeSink) Play(ctx context.Context, track client.SinkTrack) error {
+func (s *playerSink) Play(ctx context.Context, track client.SinkTrack) error {
 	s.mu.Lock()
 	s.plays = append(s.plays, track)
+	s.position = track.PositionMs
+	s.started = time.Now()
+	s.paused = false
 	s.mu.Unlock()
 
-	remaining := track.DurationMs - track.PositionMs
-	if remaining < 0 {
-		remaining = 0
-	}
-	timer := time.NewTimer(time.Duration(remaining) * time.Millisecond)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
+	for {
+		s.mu.Lock()
+		position, paused := s.at(time.Now())
+		s.mu.Unlock()
+		if !paused && track.DurationMs > 0 && position >= track.DurationMs {
+			s.mu.Lock()
+			s.finished++
+			s.mu.Unlock()
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(20 * time.Millisecond):
+		}
 	}
 }
 
-func (s *fakeSink) Stop(ctx context.Context) error {
+func (s *playerSink) at(now time.Time) (int64, bool) {
+	if s.paused {
+		return s.pausedAt, true
+	}
+	return s.position + now.Sub(s.started).Milliseconds(), false
+}
+
+func (s *playerSink) Stop(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.stopped++
 	return nil
 }
 
-func (s *fakeSink) recorded() []client.SinkTrack {
+func (s *playerSink) Pause(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.paused {
+		s.pausedAt, _ = s.at(time.Now())
+		s.paused = true
+	}
+	return nil
+}
+
+func (s *playerSink) Resume(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.paused {
+		s.position = s.pausedAt
+		s.started = time.Now()
+		s.paused = false
+	}
+	return nil
+}
+
+func (s *playerSink) Seek(ctx context.Context, positionMs int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.seeks = append(s.seeks, positionMs)
+	s.position = positionMs
+	s.started = time.Now()
+	if s.paused {
+		s.pausedAt = positionMs
+	}
+	return nil
+}
+
+func (s *playerSink) PositionMs(ctx context.Context) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	position, _ := s.at(time.Now())
+	return position, nil
+}
+
+func (s *playerSink) recorded() []client.SinkTrack {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]client.SinkTrack(nil), s.plays...)
 }
 
-func (s *fakeSink) stopCount() int {
+func (s *playerSink) seekCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.seeks)
+}
+
+func (s *playerSink) currentPosition() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	position, _ := s.at(time.Now())
+	return position
+}
+
+func (s *playerSink) stopCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.stopped
@@ -110,80 +182,63 @@ func (s *fakeSink) stopCount() int {
 type participantClient struct {
 	api         *client.Client
 	room        *client.RoomClient
-	sink        *fakeSink
+	sink        *playerSink
 	participant *client.Participant
 }
 
-// TestParticipantsFollowTheRoom is Block 9's acceptance scenario driven
-// entirely through the SDK: three clients hold renditions of different
-// lengths, start together on the server's timeline, the shortest one pads with
-// silence instead of ending the slot early, and a unanimous low vote skips the
-// track.
-func TestParticipantsFollowTheRoom(t *testing.T) {
-	apiClient := newServer(t, func(cfg *config.Config) {
-		cfg.ListenTogether.ReadyTimeoutSeconds = 5
-		// All three clients must vote before the skip fires, so the test can
-		// vote one by one and still observe the unanimous result.
-		cfg.ListenTogether.MinVotersForSkip = 3
-	})
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+// importTrack renders a tone and imports it under the given title.
+func importTrack(t *testing.T, ctx context.Context, apiClient *client.Client, title string, seconds float64) (string, string, client.Imported) {
+	t.Helper()
+	path := tone(t, t.TempDir(), title, seconds)
+	result, err := apiClient.ImportPath(ctx, path)
+	if err != nil {
+		t.Fatalf("ImportPath: %v", err)
+	}
+	if len(result.Imported) != 1 {
+		t.Fatalf("imported %d entries, want 1", len(result.Imported))
+	}
+	return path, result.Imported[0].Track.ID, result.Imported[0]
+}
 
-	// Three renditions of one recording: same name, different lengths. The
-	// server matches them onto a single canonical track.
-	files := t.TempDir()
+// roomClients builds n clients that each hold their own rendition of the same
+// recording. Every client chooses its own version: the room assigns nothing.
+func roomClients(t *testing.T, ctx context.Context, apiClient *client.Client, title string, lengths []float64) (*client.Client, []*participantClient, string) {
+	t.Helper()
 	var (
 		imported []client.Imported
 		paths    []string
 	)
-	for _, length := range []float64{0.5, 0.4, 0.6} {
-		path := tone(t, files, "Song One.opus", length)
-		result, err := apiClient.ImportPath(ctx, path)
-		if err != nil {
-			t.Fatalf("ImportPath: %v", err)
+	var trackID string
+	for _, length := range lengths {
+		path, id, entry := importTrack(t, ctx, apiClient, title, length)
+		if trackID == "" {
+			trackID = id
+		} else if id != trackID {
+			t.Fatalf("rendition landed on track %s, want them merged onto %s", id, trackID)
 		}
-		if len(result.Imported) != 1 {
-			t.Fatalf("imported %d entries, want 1", len(result.Imported))
-		}
-		imported = append(imported, result.Imported[0])
+		imported = append(imported, entry)
 		paths = append(paths, path)
 	}
 
-	trackID := imported[0].Track.ID
-	for i, entry := range imported {
-		if entry.Track.ID != trackID {
-			t.Fatalf("rendition %d landed on track %s, want them merged onto %s",
-				i, entry.Track.ID, trackID)
-		}
-		if entry.Variant.Media.State != client.MediaReady {
-			t.Fatalf("rendition %d is %s, want ready", i, entry.Variant.Media.State)
-		}
-	}
-
-	// Every client already holds one rendition locally, like a CLI with a warm
-	// cache: no downloads, and each reports its own duration to the room.
 	clients := make([]*participantClient, len(imported))
 	for i := range clients {
 		clients[i] = &participantClient{
 			api:  client.New(apiClient.BaseURL()),
-			sink: &fakeSink{},
+			sink: &playerSink{},
 		}
 	}
-
-	// The host opens the room; the others join as guests.
-	room, err := clients[0].api.CreateRoom(ctx, "test room", "everyone")
+	host, err := clients[0].api.CreateRoom(ctx, "test room", "everyone")
 	if err != nil {
 		t.Fatalf("CreateRoom: %v", err)
 	}
-	clients[0].room = room
+	clients[0].room = host
 	for i := 1; i < len(clients); i++ {
-		joined, err := clients[i].api.JoinRoom(ctx, room.RoomID)
+		joined, err := clients[i].api.JoinRoom(ctx, host.RoomID)
 		if err != nil {
 			t.Fatalf("JoinRoom: %v", err)
 		}
 		clients[i].room = joined
 	}
-	// Each participant gets a cache holding its own rendition of the track.
 	for i, c := range clients {
 		cache, err := client.OpenCache(filepath.Join(t.TempDir(), "cache"))
 		if err != nil {
@@ -197,14 +252,14 @@ func TestParticipantsFollowTheRoom(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("cache.Put: %v", err)
 		}
-		if _, ok := cache.LookupTrack(trackID); !ok {
-			t.Fatal("cache does not report the rendition it was given")
-		}
 		c.participant = client.NewParticipant(c.room, cache, c.sink, slog.New(slog.DiscardHandler))
 	}
+	return apiClient, clients, trackID
+}
 
-	runCtx, stopRuns := context.WithCancel(ctx)
-	defer stopRuns()
+func runParticipants(t *testing.T, ctx context.Context, clients []*participantClient) func() {
+	t.Helper()
+	runCtx, stop := context.WithCancel(ctx)
 	var runs sync.WaitGroup
 	for _, c := range clients {
 		runs.Add(1)
@@ -215,15 +270,34 @@ func TestParticipantsFollowTheRoom(t *testing.T) {
 			}
 		}(c)
 	}
+	return func() {
+		stop()
+		runs.Wait()
+	}
+}
+
+// TestTheHostStartsAndFollowersFollow is the whole contract: the room holds a
+// song until the host's player begins it, everybody plays the same song at the
+// same position, and a room seek pulls a follower that has drifted back.
+func TestTheHostStartsAndFollowersFollow(t *testing.T) {
+	apiClient := newServer(t, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+
+	// Different lengths: each client plays its own version, and nobody waits
+	// for anybody.
+	apiClient, clients, trackID := roomClients(t, ctx, apiClient, "Same Song.opus", []float64{8.0, 7.0})
 
 	// Let the participants attach their event sockets before the room starts.
+	stop := runParticipants(t, ctx, clients)
+	defer stop()
 	time.Sleep(300 * time.Millisecond)
 
 	if _, err := clients[0].room.Queue(ctx, trackID); err != nil {
 		t.Fatalf("Queue: %v", err)
 	}
 
-	waitFor(t, 10*time.Second, "everybody to start playing", func() bool {
+	waitFor(t, 15*time.Second, "everybody to start playing", func() bool {
 		for _, c := range clients {
 			if len(c.sink.recorded()) == 0 {
 				return false
@@ -236,236 +310,126 @@ func TestParticipantsFollowTheRoom(t *testing.T) {
 	for _, c := range clients {
 		slots = append(slots, c.sink.recorded()[0])
 	}
-
-	var shortest int64 = 1 << 40
-	var longest int64
-	timeline := slots[0].TimelineMs
 	for i, slot := range slots {
 		if slot.TrackID != trackID {
 			t.Fatalf("client %d played %s, want %s", i, slot.TrackID, trackID)
 		}
-		if slot.StartedAtServerMs != slots[0].StartedAtServerMs {
-			t.Errorf("client %d started at %d, want %d (synchronized start)",
-				i, slot.StartedAtServerMs, slots[0].StartedAtServerMs)
-		}
-		if slot.PositionMs > 200 {
+		if slot.PositionMs > 2000 {
 			t.Errorf("client %d began %d ms in; the room had just started", i, slot.PositionMs)
-		}
-		if slot.DurationMs < shortest {
-			shortest = slot.DurationMs
-		}
-		if slot.DurationMs > longest {
-			longest = slot.DurationMs
-		}
-		if slot.TimelineMs != timeline {
-			t.Errorf("client knew a timeline of %d, want every client to agree on %d", slot.TimelineMs, timeline)
 		}
 	}
 
-	// The room's timeline is the host's rendition: the host is the room's clock,
-	// so their copy is what the room runs for, and everybody else follows them.
-	// The room no longer waits for the host's report before starting, so the
-	// timeline settles onto their copy when that report lands rather than being
-	// right at the start - the clients that began on the room's fallback length
-	// are told the new one and follow it.
-	var settled int64
-	waitFor(t, 5*time.Second, "the timeline to settle on the host's copy", func() bool {
-		room, err := clients[0].room.Snapshot(ctx)
+	// The room's clock is the host's file, and the host's report is what ran it.
+	snapshot, err := clients[0].room.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if snapshot.Current == nil || !snapshot.Current.Started {
+		t.Fatalf("the room never started: %+v", snapshot.Current)
+	}
+	if snapshot.Current.DurationMs != slots[0].DurationMs {
+		t.Errorf("room length = %d, want the host's file %d",
+			snapshot.Current.DurationMs, slots[0].DurationMs)
+	}
+
+	// A seek four seconds in is more than the two-second tolerance: the
+	// follower must move.
+	if _, err := clients[0].room.Seek(ctx, 4000); err != nil {
+		t.Fatalf("Seek: %v", err)
+	}
+	waitFor(t, 10*time.Second, "the follower to seek back onto the room", func() bool {
+		return clients[1].sink.seekCount() > 0
+	})
+	waitFor(t, 5*time.Second, "both clients to sit within the tolerance", func() bool {
+		room, err := clients[1].room.Snapshot(ctx)
 		if err != nil || room.Current == nil {
 			return false
 		}
-		settled = room.Current.TimelineMs
-		return settled == slots[0].DurationMs
-	})
-	if settled != slots[0].DurationMs {
-		t.Errorf("timeline = %d, want the host's rendition %d", settled, slots[0].DurationMs)
-	}
-	if shortest >= longest {
-		t.Fatalf("expected renditions of different lengths: %d vs %d", shortest, longest)
-	}
-
-	for _, c := range clients {
-		if err := c.participant.Vote(ctx, 1); err != nil {
-			t.Fatalf("Vote: %v", err)
+		want := room.Current.PositionAt(room.ServerNowMs)
+		got := clients[1].sink.currentPosition()
+		drift := got - want
+		if drift < 0 {
+			drift = -drift
 		}
-	}
-
-	waitFor(t, 10*time.Second, "the vote to skip the track", func() bool {
-		snapshot, err := clients[0].room.Snapshot(ctx)
-		if err != nil {
-			return false
-		}
-		return snapshot.Current == nil && len(snapshot.Queue) == 0
+		return drift <= 2500
 	})
-
-	waitFor(t, 10*time.Second, "clients to stop playing", func() bool {
-		for _, c := range clients {
-			if c.sink.stopCount() == 0 {
-				return false
-			}
-		}
-		return true
-	})
-
-	// The room kept every rendition as a variant of one track.
-	variants, err := clients[0].api.TrackVariants(ctx, trackID)
-	if err != nil {
-		t.Fatalf("TrackVariants: %v", err)
-	}
-	if len(variants) != len(imported) {
-		t.Errorf("variants = %d, want %d", len(variants), len(imported))
-	}
-
-	stopRuns()
-	runs.Wait()
 }
 
-// TestParticipantReportsLocalRendition checks the no-download path: a client
-// that already has the track never asks the server for media, and the room
-// learns the duration of the copy it will really play.
-func TestParticipantReportsLocalRendition(t *testing.T) {
-	apiClient := newServer(t, func(cfg *config.Config) {
-		cfg.ListenTogether.ReadyTimeoutSeconds = 5
-	})
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	files := t.TempDir()
-	path := tone(t, files, "Local Song.opus", 0.4)
-	result, err := apiClient.ImportPath(ctx, path)
-	if err != nil {
-		t.Fatalf("ImportPath: %v", err)
-	}
-	entry := result.Imported[0]
-
-	cache, err := client.OpenCache(filepath.Join(t.TempDir(), "cache"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := cache.Put(client.CacheEntry{
-		VariantID:  entry.Variant.ID,
-		TrackID:    entry.Track.ID,
-		Path:       path,
-		DurationMs: entry.Variant.Media.DurationMs,
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	// This client opens the room, so it is the host: the room waits for its
-	// file, and reporting ready is what starts the track.
-	self := client.New(apiClient.BaseURL())
-	room, err := self.CreateRoom(ctx, "pair", "everyone")
-	if err != nil {
-		t.Fatalf("CreateRoom: %v", err)
-	}
-
-	sink := &fakeSink{}
-	participant := client.NewParticipant(room, cache, sink, slog.New(slog.DiscardHandler))
-
-	runCtx, stop := context.WithCancel(ctx)
-	defer stop()
-	done := make(chan error, 1)
-	go func() { done <- participant.Run(runCtx) }()
-	time.Sleep(300 * time.Millisecond)
-
-	if _, err := room.Queue(ctx, entry.Track.ID); err != nil {
-		t.Fatalf("Queue: %v", err)
-	}
-
-	// The host's own word starts the track, and the file it plays is the one it
-	// already had: nothing is downloaded, and the room learns the length of the
-	// copy that will really be heard.
-	waitFor(t, 10*time.Second, "the cached rendition to play", func() bool {
-		return len(sink.recorded()) > 0
-	})
-
-	slot := sink.recorded()[0]
-	if slot.VariantID != entry.Variant.ID {
-		t.Errorf("played variant %s, want the cached %s", slot.VariantID, entry.Variant.ID)
-	}
-	if slot.Path != path {
-		t.Errorf("played %s, want the local copy %s", slot.Path, path)
-	}
-	if slot.DurationMs != entry.Variant.Media.DurationMs {
-		t.Errorf("duration = %d, want %d", slot.DurationMs, entry.Variant.Media.DurationMs)
-	}
-
-	stop()
-	<-done
-}
-
-// TestParticipantWarmsTheRoomsNextSongs checks that a member keeps the room's
-// upcoming songs on disk rather than only the one it is playing. The server
-// prepares a track at a time, and a room moves faster than a download: without
-// this, a skip waits for one.
-func TestParticipantWarmsTheRoomsNextSongs(t *testing.T) {
-	apiClient := newServer(t, func(cfg *config.Config) {
-		cfg.ListenTogether.ReadyTimeoutSeconds = 5
-	})
+// TestTheHostsFileEndingMovesTheSongOn: the host's participant plays the room's
+// queue to the end, reporting each file running out, and the room advances with
+// it while followers follow.
+func TestTheHostsFileEndingMovesTheSongOn(t *testing.T) {
+	apiClient := newServer(t, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// Five local songs: one to play, the three after it, and one beyond the
-	// window for the queue to be longer than what is fetched.
-	files := t.TempDir()
-	tracks := make([]string, 0, 5)
-	for i := range 5 {
-		path := tone(t, files, fmt.Sprintf("Ahead %d.opus", i), 0.4)
-		result, err := apiClient.ImportPath(ctx, path)
-		if err != nil {
-			t.Fatalf("ImportPath: %v", err)
-		}
-		tracks = append(tracks, result.Imported[0].Track.ID)
-	}
+	apiClient, clients, first := roomClients(t, ctx, apiClient, "First Song.opus", []float64{0.7, 0.7})
+	// A second recording, so the queue has somewhere to advance to.
+	_, secondTrack, _ := importTrack(t, ctx, apiClient, "Second Song.opus", 0.7)
 
-	cache, err := client.OpenCache(filepath.Join(t.TempDir(), "cache"))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	peer := client.New(apiClient.BaseURL())
-	room, err := peer.CreateRoom(ctx, "ahead", "everyone")
-	if err != nil {
-		t.Fatalf("CreateRoom: %v", err)
-	}
-	self := client.New(apiClient.BaseURL())
-	joined, err := self.JoinRoom(ctx, room.RoomID)
-	if err != nil {
-		t.Fatalf("JoinRoom: %v", err)
-	}
-
-	participant := client.NewParticipant(joined, cache, &fakeSink{}, slog.New(slog.DiscardHandler))
-	runCtx, stop := context.WithCancel(ctx)
+	stop := runParticipants(t, ctx, clients)
 	defer stop()
-	done := make(chan error, 1)
-	go func() { done <- participant.Run(runCtx) }()
 	time.Sleep(300 * time.Millisecond)
 
-	for _, trackID := range tracks {
-		if _, err := room.Queue(ctx, trackID); err != nil {
-			t.Fatalf("Queue: %v", err)
-		}
+	if _, err := clients[0].room.Queue(ctx, first); err != nil {
+		t.Fatalf("Queue first: %v", err)
+	}
+	if _, err := clients[0].room.Queue(ctx, secondTrack); err != nil {
+		t.Fatalf("Queue second: %v", err)
 	}
 
-	// The room prepares the first song; the three that follow it should be on
-	// disk before anybody asks for them.
-	waitFor(t, 20*time.Second, "the room's next three songs to be ready", func() bool {
-		for _, trackID := range tracks[1:4] {
-			if _, ok := cache.LookupTrack(trackID); !ok {
-				return false
-			}
-		}
-		return true
+	// The host's first file ends, which advances the room, and its second file
+	// ends, which leaves the room idle.
+	waitFor(t, 20*time.Second, "the host to play through both songs", func() bool {
+		return len(clients[0].sink.recorded()) >= 2
 	})
-
-	// And no further: the room is still on its first song, so the one after
-	// the window is not this member's to fetch yet.
-	if _, ok := cache.LookupTrack(tracks[4]); ok {
-		t.Error("fetched a song beyond the room's next three")
+	waitFor(t, 20*time.Second, "the room to go idle", func() bool {
+		room, err := clients[0].room.Snapshot(ctx)
+		return err == nil && room.Current == nil
+	})
+	// The follower played both too.
+	if played := clients[1].sink.recorded(); len(played) < 2 || played[1].TrackID != secondTrack {
+		t.Fatalf("follower played %d slots (%+v)", len(played), played)
 	}
+}
 
-	stop()
-	<-done
+// TestAShortFollowersFileDoesNotEndTheSong: a follower whose own copy is
+// shorter than the host's goes quiet when its file ends and the song plays on.
+func TestAShortFollowersFileDoesNotEndTheSong(t *testing.T) {
+	apiClient := newServer(t, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+
+	apiClient, clients, trackID := roomClients(t, ctx, apiClient, "Long Song.opus", []float64{3.0, 0.5})
+
+	stop := runParticipants(t, ctx, clients)
+	defer stop()
+	time.Sleep(300 * time.Millisecond)
+
+	if _, err := clients[0].room.Queue(ctx, trackID); err != nil {
+		t.Fatalf("Queue: %v", err)
+	}
+	waitFor(t, 15*time.Second, "both to start", func() bool {
+		return len(clients[0].sink.recorded()) > 0 && len(clients[1].sink.recorded()) > 0
+	})
+	// The follower's short file runs out first.
+	waitFor(t, 10*time.Second, "the follower's file to finish", func() bool {
+		clients[1].sink.mu.Lock()
+		defer clients[1].sink.mu.Unlock()
+		return clients[1].sink.finished > 0
+	})
+	time.Sleep(500 * time.Millisecond)
+
+	room, err := clients[0].room.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if room.Current == nil || room.Current.Item.TrackID != trackID {
+		t.Fatalf("the follower's file ending moved the room on: %+v", room.Current)
+	}
+	if room.Current.Paused {
+		t.Fatal("the room paused itself")
+	}
 }
 
 // TestClockOffsetIsStable checks the NTP-style clock estimate.

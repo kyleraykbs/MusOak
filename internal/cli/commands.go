@@ -582,13 +582,15 @@ func (a *App) roomJoin(ctx context.Context, roomID string) error {
 
 	participant := client.NewParticipant(room, a.cache, sink, a.logger)
 	participant.OnTrack = func(track client.SinkTrack) {
-		a.printf("playing %s (from %s, %s in, room slot %s)\n", track.VariantID[:8],
-			track.Path, formatDuration(track.PositionMs), formatDuration(track.TimelineMs))
+		version := track.VariantID
+		if len(version) > 8 {
+			version = version[:8]
+		}
+		a.printf("playing %s (from %s, %s in)\n", version,
+			track.Path, formatDuration(track.PositionMs))
 	}
 	participant.OnEvent = func(event client.Event) {
-		if event.Type == client.EventTrackPrepared || event.Type == client.EventTrackSkipped {
-			a.logger.Debug("room event", "type", event.Type)
-		}
+		a.logger.Debug("room event", "type", event.Type)
 	}
 
 	a.printf("joined %s as %s; Ctrl-C to leave\n", roomID, room.MemberID)
@@ -616,7 +618,7 @@ func (a *App) joinedRoom(ctx context.Context, required bool) (*client.RoomClient
 
 func (a *App) printRoom(room *client.Room) {
 	a.printf("room %s (%s), %d member(s)\n", room.ID, room.Name, len(room.Members))
-	for i, item := range room.Queue {
+	for i, item := range room.Pending() {
 		a.printf("  queue %2d. %s\n", i, item.Title)
 	}
 	if room.Current == nil {
@@ -624,17 +626,16 @@ func (a *App) printRoom(room *client.Room) {
 		return
 	}
 	current := room.Current
+	if !current.Started {
+		a.printf("  up next: %s (waiting for the host to start it)\n", current.Item.Title)
+		return
+	}
 	a.printf("  playing: %s  %s / %s%s\n", current.Item.Title,
-		formatDuration(current.PositionMs), formatDuration(current.TimelineMs), pausedSuffix(current.Paused))
+		formatDuration(current.PositionAt(room.ServerNowMs)), formatDuration(current.DurationMs),
+		pausedSuffix(current.Paused))
 	if len(current.Votes) > 0 {
 		a.printf("  votes: %d, mean %.2f (skip below %.1f)\n",
 			len(current.Votes), current.MeanScore, room.Skip.SkipThreshold)
-	}
-	if len(current.Awaiting) > 0 {
-		a.printf("  waiting for: %s\n", strings.Join(current.Awaiting, ", "))
-	}
-	if len(current.CatchingUp) > 0 {
-		a.printf("  catching up: %s\n", strings.Join(current.CatchingUp, ", "))
 	}
 }
 

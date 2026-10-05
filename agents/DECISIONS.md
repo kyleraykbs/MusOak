@@ -154,3 +154,25 @@
 - Why: the queuer's-file rule still left the members holding shorter copies in silence at the end of their own song - the exact complaint, twice. Ending when the first file ends means nobody ever sits in silence, and a longer copy is cut at that point, which the room already did. The escape hatch exists because one member's short or broken file would otherwise end the song for everybody.
 - Also: `retimeLocked` runs on every ready report, on a leave and on a late assignment, so the end of the track follows whoever is in the room now; the timer that advances the room moves with it. `ready_state` carries `timelineMs` and `out`, so clients follow without refetching.
 - Reversible: yes
+
+## [2026-10-05] Rooms are rebuilt around the host's player as the clock
+- Decision: the room's current song is an anchor — a position, the server instant it is true at, `started` and `paused` — and nothing else. The host's player is the clock: `POST /started` puts the room at the position its file has actually reached and starts the song, `POST /ended` moves the room off it. Everybody else follows one rule: a different song is loaded, the same song within two seconds of the room's position is left alone, the same song further out is seeked. Each client plays the rendition it likes; the room assigns none.
+- Why: the readiness gate, per-member variant assignment, dual clock modes and the shortest-file timeline each existed to make members agree about a song nobody had started. The host's player starting it is the agreement, and everything else was machinery that could disagree with it. The old engine was 2,200 lines with 2,400 of tests; the new one owns the queue, the mix and the anchor, and the tests are behavioural.
+- Also: the config knobs that belonged to it (`listenTogether.readyFraction`, `readyTimeoutSeconds`) are gone — the config is strict, so an existing config.json with them must drop both keys.
+- Reversible: no (the API surface and both clients are built on it)
+
+## [2026-10-05] Six room events, and the play order is spliced rather than sent
+- Decision: `member_joined`, `member_left`, `host_changed`, `queue_updated` (one member's queue), `playback` (the whole current state) and `room_closed`. Votes travel inside `playback`, so one event type carries start, pause, resume, seek, vote and advance. The play order is never sent: a client derives it from the member queues and the join order, and when the room moves off a song it removes that item from its queue and its order exactly as the server dropped it — spliced, never rebuilt, because rebuilding restarts the round-robin and would make the next song a different one from the room's.
+- Why: state a client can compute is state that can arrive stale. The derivation is only sound if both sides apply the same two transitions, which is why the splice is a contract and not an optimisation. Events also carry a per-room `seq` now: the bus drops events for a client that cannot keep up, and a gap in the counter is what tells it to refetch the snapshot.
+- Reversible: yes
+
+## [2026-10-05] Votes score a song and can skip it; nothing else waits on anybody
+- Decision: 1–5 per member per song, mean on screen, persisted for stats, and the existing threshold rule (`skipThreshold`, `minVotersForSkip`, `voterFractionForSkip`) still advances the room. No server-side advance timer: the host's file running out is what ends a song, and a host who disconnects is promoted away from by the existing leave grace.
+- Why: the timer existed to end songs nobody's file could end. With the host's file as the clock there is no such song, and a timer is one more thing that can disagree with the player everybody is hearing.
+- Also: the room's `durationMs` is the host's file length, for display only — nothing is cut at it.
+- Reversible: yes
+
+## [2026-10-05] Four live browser checks found four bugs the unit tests could not
+- Decision: the rebuild was verified in two real browsers (a host tab and a follower tab, separate profiles) against a real server, and the four bugs that turned up there were fixed and pinned with tests: the clock-sync pong's stamps are top-level fields (reading them from `data` gave every client a garbage offset); a load never seeks to position zero (so a file this client already held at its end played out instantly); the follower's "my file is over, wait" guard paused the *host's* file a hair before its natural end (so the room never heard it end); and a re-queued song whose copy this client still held played out instead of starting again.
+- Why: each one is invisible to a reducer test and fatal in a browser. The rule they share: the room's behaviour lives in what the elements do, so the check has to be a real element.
+- Reversible: yes

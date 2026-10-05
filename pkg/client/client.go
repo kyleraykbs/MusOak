@@ -213,16 +213,16 @@ type Track struct {
 
 // Variant is one provider's rendition of a track.
 type Variant struct {
-	ID              string      `json:"id"`
-	TrackID         string      `json:"trackId"`
-	Provider        string      `json:"provider"`
-	ProviderTrackID string      `json:"providerTrackId"`
-	Title           string      `json:"title"`
-	Artists         []string    `json:"artists"`
-	Album           string      `json:"album"`
-	DurationMs      int64       `json:"durationMs"`
-	Downloadable    bool        `json:"downloadable"`
-	ISRC            string      `json:"isrc,omitempty"`
+	ID              string   `json:"id"`
+	TrackID         string   `json:"trackId"`
+	Provider        string   `json:"provider"`
+	ProviderTrackID string   `json:"providerTrackId"`
+	Title           string   `json:"title"`
+	Artists         []string `json:"artists"`
+	Album           string   `json:"album"`
+	DurationMs      int64    `json:"durationMs"`
+	Downloadable    bool     `json:"downloadable"`
+	ISRC            string   `json:"isrc,omitempty"`
 	// Slot is the account-order position this rendition fills when it is not a
 	// provider's own: "self" for the caller's upload, "uploaded" for somebody
 	// else's. Empty for a provider rendition, whose position is its provider.

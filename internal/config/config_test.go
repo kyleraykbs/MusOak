@@ -37,9 +37,6 @@ func TestLoadExample(t *testing.T) {
 	if got := cfg.DefaultProviderOrder; len(got) != 2 || got[0] != "ytmusic" || got[1] != "spotify" {
 		t.Errorf("defaultProviderOrder = %v", got)
 	}
-	if cfg.ListenTogether.ReadyTimeoutSeconds != 30 {
-		t.Errorf("readyTimeoutSeconds = %d, want 30", cfg.ListenTogether.ReadyTimeoutSeconds)
-	}
 	if cfg.Match.Threshold != DefaultMatchThreshold {
 		t.Errorf("match.threshold = %v, want %v", cfg.Match.Threshold, DefaultMatchThreshold)
 	}
@@ -164,7 +161,6 @@ func TestValidateErrors(t *testing.T) {
 		{"skip threshold zero", func(c *Config) { c.ListenTogether.SkipThreshold = 0 }, "skipThreshold"},
 		{"no voters", func(c *Config) { c.ListenTogether.MinVotersForSkip = 0 }, "minVotersForSkip"},
 		{"fraction high", func(c *Config) { c.ListenTogether.VoterFractionForSkip = 1.5 }, "voterFractionForSkip"},
-		{"negative timeout", func(c *Config) { c.ListenTogether.ReadyTimeoutSeconds = -1 }, "readyTimeoutSeconds"},
 		{"bad match threshold", func(c *Config) { c.Match.Threshold = 1.5 }, "match.threshold"},
 		{"negative search limit", func(c *Config) { c.RateLimit.SearchPerMinute = -1 }, "rateLimit.searchPerMinute"},
 		{"negative login limit", func(c *Config) { c.RateLimit.LoginPerMinute = -1 }, "rateLimit.loginPerMinute"},

@@ -77,12 +77,6 @@ type ListenTogether struct {
 	SkipThreshold        float64 `json:"skipThreshold"`
 	MinVotersForSkip     int     `json:"minVotersForSkip"`
 	VoterFractionForSkip float64 `json:"voterFractionForSkip"`
-	// ReadyFraction is how much of the room has to have the song before it
-	// starts: waiting for the last member is waiting for the slowest one.
-	ReadyFraction float64 `json:"readyFraction"`
-	// ReadyTimeoutSeconds is how long the room waits for that fraction before
-	// starting anyway. Members who missed it are catching up.
-	ReadyTimeoutSeconds int `json:"readyTimeoutSeconds"`
 }
 
 // Match tunes cross-provider track merging.
@@ -164,12 +158,6 @@ func Default() *Config {
 			SkipThreshold:        2.0,
 			MinVotersForSkip:     2,
 			VoterFractionForSkip: 0.5,
-			ReadyFraction:        0.75,
-			// Thirty, not six: the module, the example and the README all say
-			// thirty, and a default that only disagrees with every one of them
-			// is a default nobody can reason about. A deployment that wants a
-			// shorter backstop sets it.
-			ReadyTimeoutSeconds: 30,
 		},
 		Match:  Match{Threshold: DefaultMatchThreshold},
 		Client: Client{CacheDir: DefaultCacheDir()},
@@ -303,12 +291,6 @@ func (c *Config) Validate() error {
 	}
 	if lt.VoterFractionForSkip <= 0 || lt.VoterFractionForSkip > 1 {
 		return fmt.Errorf("listenTogether.voterFractionForSkip must be in (0, 1], got %g", lt.VoterFractionForSkip)
-	}
-	if lt.ReadyFraction <= 0 || lt.ReadyFraction > 1 {
-		return fmt.Errorf("listenTogether.readyFraction must be in (0, 1], got %g", lt.ReadyFraction)
-	}
-	if lt.ReadyTimeoutSeconds < 0 {
-		return fmt.Errorf("listenTogether.readyTimeoutSeconds must be >= 0, got %d", lt.ReadyTimeoutSeconds)
 	}
 
 	if c.Match.Threshold <= 0 || c.Match.Threshold > 1 {

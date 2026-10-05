@@ -9,44 +9,53 @@ import (
 
 // RoomMember is one participant in a room. UserID is empty for guests.
 type RoomMember struct {
-	ID         string `json:"id"`
-	UserID     string `json:"userId,omitempty"`
-	Name       string `json:"name"`
-	JoinedAtMs int64  `json:"joinedAtMs"`
+	ID          string `json:"id"`
+	UserID      string `json:"userId,omitempty"`
+	Name        string `json:"name"`
+	JoinedAtMs  int64  `json:"joinedAtMs"`
+	IconURL     string `json:"iconUrl,omitempty"`
+	IconVersion int    `json:"iconVersion,omitempty"`
 }
 
 // QueueItem is one entry of a room's queue.
 type QueueItem struct {
-	ID        string `json:"id"`
-	TrackID   string `json:"trackId"`
-	Title     string `json:"title"`
-	AddedBy   string `json:"addedBy"`
-	AddedAtMs int64  `json:"addedAtMs"`
+	ID         string   `json:"id"`
+	TrackID    string   `json:"trackId"`
+	Title      string   `json:"title"`
+	AddedBy    string   `json:"addedBy"`
+	AddedAtMs  int64    `json:"addedAtMs"`
+	DurationMs int64    `json:"durationMs,omitempty"`
+	ArtworkURL string   `json:"artworkUrl,omitempty"`
+	ArtistIDs  []string `json:"artistIds,omitempty"`
 }
 
-// ReadyReport is a member's readiness for a track.
-type ReadyReport struct {
-	MemberID   string `json:"memberId"`
-	TrackID    string `json:"trackId"`
-	VariantID  string `json:"variantId"`
-	DurationMs int64  `json:"durationMs"`
-	AtMs       int64  `json:"atMs"`
-}
-
-// RoomPlayback is the current track's room state. PositionMs is the position
-// at the server time the snapshot carried.
+// RoomPlayback is the current song and where the room is in it. PositionMs is
+// the position at AtMs on the server clock: while Started is true and Paused
+// is false, the room is at PositionMs + (serverNow - AtMs).
 type RoomPlayback struct {
-	Item        QueueItem         `json:"item"`
-	StartedAtMs int64             `json:"startedAtMs"`
-	TimelineMs  int64             `json:"timelineMs"`
-	PositionMs  int64             `json:"positionMs"`
-	Paused      bool              `json:"paused"`
-	Variants    map[string]string `json:"variants"`
-	Ready       []ReadyReport     `json:"ready"`
-	Awaiting    []string          `json:"awaiting"`
-	CatchingUp  []string          `json:"catchingUp"`
-	Votes       map[string]int    `json:"votes"`
-	MeanScore   float64           `json:"meanScore"`
+	Item       QueueItem      `json:"item"`
+	PositionMs int64          `json:"positionMs"`
+	AtMs       int64          `json:"atMs"`
+	Started    bool           `json:"started"`
+	Paused     bool           `json:"paused"`
+	DurationMs int64          `json:"durationMs"`
+	Votes      map[string]int `json:"votes"`
+	MeanScore  float64        `json:"meanScore"`
+}
+
+// PositionAt is where the room is at the given server time.
+func (p *RoomPlayback) PositionAt(serverNowMs int64) int64 {
+	if p == nil {
+		return 0
+	}
+	if !p.Started || p.Paused {
+		return p.PositionMs
+	}
+	position := p.PositionMs + (serverNowMs - p.AtMs)
+	if position < 0 {
+		return 0
+	}
+	return position
 }
 
 // RoomSkipRules are the tunables shown next to the vote buttons.
@@ -54,21 +63,39 @@ type RoomSkipRules struct {
 	SkipThreshold        float64 `json:"skipThreshold"`
 	MinVotersForSkip     int     `json:"minVotersForSkip"`
 	VoterFractionForSkip float64 `json:"voterFractionForSkip"`
-	ReadyTimeoutSeconds  int     `json:"readyTimeoutSeconds"`
 }
 
 // Room is a Listen Together room.
 type Room struct {
-	ID          string        `json:"id"`
-	Name        string        `json:"name"`
-	Host        string        `json:"host"`
-	Controls    string        `json:"controls"`
-	CreatedAtMs int64         `json:"createdAtMs"`
-	Members     []RoomMember  `json:"members"`
-	Queue       []QueueItem   `json:"queue"`
-	Current     *RoomPlayback `json:"current,omitempty"`
-	ServerNowMs int64         `json:"serverNowMs"`
-	Skip        RoomSkipRules `json:"skip"`
+	ID          string                 `json:"id"`
+	Name        string                 `json:"name"`
+	Host        string                 `json:"host"`
+	Controls    string                 `json:"controls"`
+	CreatedAtMs int64                  `json:"createdAtMs"`
+	Members     []RoomMember           `json:"members"`
+	MemberCount int                    `json:"memberCount"`
+	Queues      map[string][]QueueItem `json:"queues"`
+	MasterQueue []QueueItem            `json:"masterQueue"`
+	Current     *RoomPlayback          `json:"current,omitempty"`
+	ServerNowMs int64                  `json:"serverNowMs"`
+	Seq         int64                  `json:"seq"`
+	Skip        RoomSkipRules          `json:"skip"`
+}
+
+// Pending is the play order with the current song taken out: what the room
+// will play after this one.
+func (r *Room) Pending() []QueueItem {
+	current := ""
+	if r.Current != nil {
+		current = r.Current.Item.ID
+	}
+	pending := make([]QueueItem, 0, len(r.MasterQueue))
+	for _, item := range r.MasterQueue {
+		if item.ID != current {
+			pending = append(pending, item)
+		}
+	}
+	return pending
 }
 
 // RoomMemberID reports which member id this client joined as.
@@ -226,11 +253,24 @@ func (r *RoomClient) Vote(ctx context.Context, score int) (*Room, error) {
 	return &out, nil
 }
 
-// Ready reports that this member has its rendition and how long it plays.
-func (r *RoomClient) Ready(ctx context.Context, trackID, variantID string, durationMs int64) (*Room, error) {
+// Started is the host's player saying it has begun the room's song, and where.
+// The room's clock is put at positionMs on the host's file, and durationMs is
+// shown next to it. Only the host's report counts; anyone else's is ignored.
+func (r *RoomClient) Started(ctx context.Context, trackID string, positionMs, durationMs int64) (*Room, error) {
 	var out Room
-	body := map[string]any{"trackId": trackID, "variantId": variantID, "durationMs": durationMs}
-	if err := r.client.do(ctx, http.MethodPost, r.path("/ready"), body, &out); err != nil {
+	body := map[string]any{"trackId": trackID, "positionMs": positionMs, "durationMs": durationMs}
+	if err := r.client.do(ctx, http.MethodPost, r.path("/started"), body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Ended is the host's player saying its file for trackID has run out: the room
+// drops that song and puts up the next one. Only the host's report counts.
+func (r *RoomClient) Ended(ctx context.Context, trackID string) (*Room, error) {
+	var out Room
+	body := map[string]string{"trackId": trackID}
+	if err := r.client.do(ctx, http.MethodPost, r.path("/ended"), body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -268,28 +308,24 @@ func (r *RoomClient) Events(ctx context.Context) (<-chan Event, error) {
 	return r.client.Events(ctx, r.RoomID)
 }
 
-// Event is one message from the room event stream.
+// Event is one message from the room event stream. Seq is per-room: a gap in it
+// means events were missed, and the snapshot is the way back.
 type Event struct {
 	Type   string          `json:"type"`
 	RoomID string          `json:"roomId,omitempty"`
+	Seq    int64           `json:"seq,omitempty"`
 	AtMs   int64           `json:"atMs,omitempty"`
 	Data   json.RawMessage `json:"data,omitempty"`
 }
 
 // Event types.
 const (
-	EventMemberJoined  = "member_joined"
-	EventMemberLeft    = "member_left"
-	EventQueueUpdated  = "queue_updated"
-	EventTrackPrepared = "track_prepared"
-	EventTrackStarted  = "track_started"
-	EventTrackSkipped  = "track_skipped"
-	EventPaused        = "paused"
-	EventResumed       = "resumed"
-	EventSeeked        = "seeked"
-	EventVoteUpdated   = "vote_updated"
-	EventReadyState    = "ready_state"
-	EventRoomClosed    = "room_closed"
+	EventMemberJoined = "member_joined"
+	EventMemberLeft   = "member_left"
+	EventHostChanged  = "host_changed"
+	EventQueueUpdated = "queue_updated"
+	EventPlayback     = "playback"
+	EventRoomClosed   = "room_closed"
 )
 
 // DecodeData decodes the event payload into v.
@@ -300,25 +336,22 @@ func (e Event) DecodeData(v any) error {
 	return json.Unmarshal(e.Data, v)
 }
 
-// TrackPrepared is the payload of track_prepared: which variant each member
-// was told to play.
-type TrackPrepared struct {
-	Item     QueueItem         `json:"item"`
-	Variants map[string]string `json:"variants"`
+// PlaybackEvent is the payload of playback: the whole current state, or a null
+// current when the room has nothing playing.
+type PlaybackEvent struct {
+	Current *RoomPlayback `json:"current"`
 }
 
-// TrackStarted is the payload of track_started.
-type TrackStarted struct {
-	Item       QueueItem         `json:"item"`
-	StartedAt  int64             `json:"startedAt"`
-	TimelineMs int64             `json:"timelineMs"`
-	Variants   map[string]string `json:"variants"`
+// QueueEvent is the payload of queue_updated: one member's queue, or notice
+// that they left and their queue is gone.
+type QueueEvent struct {
+	MemberID    string      `json:"memberId"`
+	MemberQueue []QueueItem `json:"memberQueue"`
+	Gone        bool        `json:"gone"`
 }
 
-// TrackSkipped is the payload of track_skipped.
-type TrackSkipped struct {
-	Item       QueueItem `json:"item"`
-	Reason     string    `json:"reason"`
-	PositionMs int64     `json:"positionMs"`
-	Mean       float64   `json:"mean"`
+// HostChangedEvent is the payload of host_changed.
+type HostChangedEvent struct {
+	Host string `json:"host"`
+	Was  string `json:"was"`
 }

@@ -28,8 +28,11 @@ type serverMessage struct {
 	ServerReceivedAt int64  `json:"serverReceivedAt,omitempty"`
 	ServerSentAt     int64  `json:"serverSentAt,omitempty"`
 	RoomID           string `json:"roomId,omitempty"`
-	AtMs             int64  `json:"atMs,omitempty"`
-	Data             any    `json:"data,omitempty"`
+	// Seq counts a room's events: a client that sees a gap refetches the room,
+	// because the bus drops events for a client that cannot keep up.
+	Seq  int64 `json:"seq,omitempty"`
+	AtMs int64 `json:"atMs,omitempty"`
+	Data any   `json:"data,omitempty"`
 }
 
 // handleWS streams room events and answers clock-sync pings.
@@ -99,6 +102,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			message := serverMessage{
 				Type:   string(event.Type),
 				RoomID: event.RoomID,
+				Seq:    event.Seq,
 				AtMs:   event.AtMs,
 				Data:   event.Data,
 			}
