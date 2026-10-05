@@ -924,6 +924,14 @@ func (m *Manager) Seek(roomID, memberID string, positionMs int64) (*Snapshot, er
 		return nil, ErrNoPlayback
 	}
 
+	// A seek is the one thing that moves a room's position and leaves nothing
+	// else behind: no track change, no event a client would read as an
+	// explanation. A room whose songs keep ending early is a room somebody is
+	// seeking, so it says who asked and where they put it.
+	m.logger.Info("room: seek",
+		"room", room.id, "by", memberID, "to_ms", positionMs,
+		"was_ms", playback.positionMs(m.nowMsLocked()), "timeline_ms", playback.timelineMs)
+
 	playback.pausedPositionMs = positionMs
 	playback.startedAtMs = m.nowMsLocked()
 	if playback.timelineMs > 0 && positionMs >= playback.timelineMs {
