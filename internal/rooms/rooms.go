@@ -919,20 +919,30 @@ func (m *Manager) Seek(roomID, memberID string, positionMs int64) (*Snapshot, er
 	return m.snapshotLocked(room), nil
 }
 
+// endGraceMs is how far short of the song's length a file may stop and still
+// count as having reached its end. Measurement is not exact, and a copy can be
+// a second or two short of another; a file that stops well before this is a
+// file that gave up, not a song that ended.
+const endGraceMs = 5000
+
 // Ended records that the host's copy of a track has run out, and moves the room
-// on when that track is the one it is playing.
+// on when that track is the one it is playing and the file really reached its
+// end.
 //
-// The track is named because a file can end late. A client that has already
-// moved on to the next song - or an element that reports the same end twice -
-// would otherwise move the room past a song that has only just started, which
-// is a song cut off in the middle for everybody.
+// The track and the position are named because an end can be wrong in two ways.
+// It can arrive late - a client that has already moved on to the next song, or
+// an element that reports the same end twice - and it can arrive early, from a
+// file that stopped well short of the song. Either one would move the room past
+// a song that is still playing, which is a song cut off in the middle for
+// everybody. A song is not over because a file stopped; it is over when the
+// host's copy of it runs out.
 //
 // The host is the room's clock, so their file reaching its end is the song
 // reaching its end - and their file is the one that decides when that is, not a
 // number the room worked out in advance. Anybody else's file ending says
 // nothing: they follow the host. The room's own timer stays as the backstop, for
 // a host who has gone or whose client stopped listening without saying so.
-func (m *Manager) Ended(roomID, memberID string, trackID uuid.UUID) (*Snapshot, error) {
+func (m *Manager) Ended(roomID, memberID string, trackID uuid.UUID, positionMs int64) (*Snapshot, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -949,7 +959,14 @@ func (m *Manager) Ended(roomID, memberID string, trackID uuid.UUID) (*Snapshot, 
 		return m.snapshotLocked(room), nil
 	}
 	if trackID != uuid.Nil && room.current.item.TrackID != trackID {
-		// The room is past that song: this is an end that arrived late.
+		m.logger.Info("room: an end arrived for a song already past",
+			"room", room.id, "ended", trackID, "playing", room.current.item.TrackID)
+		return m.snapshotLocked(room), nil
+	}
+	if positionMs > 0 && room.current.timelineMs-positionMs > endGraceMs {
+		m.logger.Warn("room: the host's file stopped short of the song",
+			"room", room.id, "track", room.current.item.TrackID,
+			"position_ms", positionMs, "timeline_ms", room.current.timelineMs)
 		return m.snapshotLocked(room), nil
 	}
 	m.advanceLocked(context.Background(), room, "completed", memberID)

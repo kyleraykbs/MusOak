@@ -57,10 +57,13 @@ type roomOutRequest struct {
 	Out bool `json:"out"`
 }
 
-// endedRequest names the track whose file has run out. A client that has
-// already moved on names the one it has moved on to, and the room ignores it.
+// endedRequest names the track whose file has run out, and where that file had
+// got to. A client that has already moved on names the track it moved on to; a
+// file that stopped short names a position well short of the song. The room
+// ignores both, because neither is a song reaching its end.
 type endedRequest struct {
-	TrackID string `json:"trackId"`
+	TrackID    string `json:"trackId"`
+	PositionMs int64  `json:"positionMs"`
 }
 
 // callerMember builds the member identity for a room command. Authenticated
@@ -283,7 +286,7 @@ func (s *Server) handleRoomEnded(w http.ResponseWriter, r *http.Request) {
 		}
 		trackID = parsed
 	}
-	room, err := s.rooms.Ended(r.PathValue("roomId"), member.ID, trackID)
+	room, err := s.rooms.Ended(r.PathValue("roomId"), member.ID, trackID, req.PositionMs)
 	if err != nil {
 		writeRoomError(w, err)
 		return

@@ -2328,6 +2328,14 @@ paths:
                     moved on names the one it has moved on to, and the room
                     ignores it: an end that arrives late is not the end of the
                     song playing now.
+                positionMs:
+                  type: integer
+                  format: int64
+                  description: |
+                    Where that file had got to. A file that stopped well short
+                    of the song is a file that gave up rather than a song that
+                    ended, and the room ignores it too - the song is over when
+                    the host's copy of it runs out, not when a file stops.
       responses:
         "200": { $ref: "#/components/responses/RoomState" }
         "403": { $ref: "#/components/responses/Forbidden" }

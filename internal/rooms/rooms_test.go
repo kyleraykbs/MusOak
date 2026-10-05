@@ -1485,7 +1485,7 @@ func TestTheHostsEndMovesTheRoomOn(t *testing.T) {
 	}
 
 	// Somebody who is not the room's clock saying so changes nothing.
-	if _, err := f.m.Ended(roomID, "guest", track.ID); err != nil {
+	if _, err := f.m.Ended(roomID, "guest", track.ID, 0); err != nil {
 		t.Fatal(err)
 	}
 	if got := f.current(f.get(roomID)).Item.TrackID; got != track.ID {
@@ -1495,16 +1495,26 @@ func TestTheHostsEndMovesTheRoomOn(t *testing.T) {
 	// An end that arrives late names the song the client has already moved on
 	// to. The room is playing something else, and a song is not over because a
 	// file that is no longer playing has stopped: this is what cut songs short.
-	if _, err := f.m.Ended(roomID, "host", next.ID); err != nil {
+	if _, err := f.m.Ended(roomID, "host", next.ID, 0); err != nil {
 		t.Fatal(err)
 	}
 	if got := f.current(f.get(roomID)).Item.TrackID; got != track.ID {
 		t.Fatalf("current = %s, want the same song: that end was for another one", got)
 	}
 
-	// The host's own file ending, naming the song that is playing, is the end of
-	// the song - well before the length the room worked out.
-	if _, err := f.m.Ended(roomID, "host", track.ID); err != nil {
+	// A file that stopped well short of the song is a file that gave up, not a
+	// song that ended. Obeying it is the other half of what cut songs off in the
+	// middle - 352ms into a 148s song, in the log that found this.
+	if _, err := f.m.Ended(roomID, "host", track.ID, 352); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.current(f.get(roomID)).Item.TrackID; got != track.ID {
+		t.Fatalf("current = %s, want the same song: that file stopped short", got)
+	}
+
+	// The host's own file reaching its end, naming the song that is playing, is
+	// the end of the song - well before the length the room worked out.
+	if _, err := f.m.Ended(roomID, "host", track.ID, 300_000); err != nil {
 		t.Fatal(err)
 	}
 	after := f.get(roomID)
