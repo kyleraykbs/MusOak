@@ -18,7 +18,7 @@ type accountUserResponse struct {
 	ID          string `json:"id"`
 	Username    string `json:"username"`
 	DisplayName string `json:"displayName"`
-	IconURL string `json:"iconUrl"`
+	IconURL     string `json:"iconUrl"`
 	// IconVersion changes when the picture does, so a client can tell one icon
 	// from the next: the URL itself never changes, and is cached for a week.
 	IconVersion int `json:"iconVersion"`

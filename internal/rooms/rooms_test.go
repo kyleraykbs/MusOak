@@ -310,21 +310,28 @@ func TestThreeClientsStaySynchronizedAndSkipOnVotes(t *testing.T) {
 		t.Fatalf("Enqueue: %v", err)
 	}
 
-	// Somebody has to have the file before the song runs: a room whose clock
-	// starts with nobody listening plays its first seconds to an empty room, and
-	// every client that arrives afterwards joins a song already under way. It is
-	// not the host in particular - whoever is ready first starts it.
+	// The song is for every member, so the room waits for every member's file:
+	// a room whose clock starts with somebody still fetching plays its first
+	// seconds to people who cannot hear it yet.
 	pending := f.get(roomID)
 	if f.current(pending).StartedAtMs != 0 {
 		t.Fatal("the song ran with nobody ready to hear it")
 	}
 	if len(f.current(pending).Awaiting) != 3 {
-		t.Fatalf("awaiting = %v, want everyone: the song needs one of them", f.current(pending).Awaiting)
+		t.Fatalf("awaiting = %v, want everyone", f.current(pending).Awaiting)
 	}
 
-	// The other two have not reported at all; the host's word is enough.
+	// The host's word alone is not enough: two are still fetching.
 	if _, err := f.m.Ready(roomID, host.ID, track1.ID, variants[0].ID, 180_000); err != nil {
 		t.Fatalf("Ready(host): %v", err)
+	}
+	if got := f.current(f.get(roomID)); got.StartedAtMs != 0 || len(got.Awaiting) != 2 {
+		t.Fatalf("after the host: started %d, awaiting %v, want still waiting on the two", got.StartedAtMs, got.Awaiting)
+	}
+	for _, client := range clients[1:] {
+		if _, err := f.m.Ready(roomID, client.id, track1.ID, client.variantID, client.durationMs); err != nil {
+			t.Fatalf("Ready(%s): %v", client.id, err)
+		}
 	}
 
 	started := f.get(roomID)
@@ -333,7 +340,7 @@ func TestThreeClientsStaySynchronizedAndSkipOnVotes(t *testing.T) {
 		t.Fatalf("current item = %s, want track one", current.Item.TrackID)
 	}
 	if current.StartedAtMs == 0 {
-		t.Fatal("track did not start once the host was ready")
+		t.Fatal("track did not start once everyone was ready")
 	}
 	if want := f.clock.Now().UnixMilli(); current.StartedAtMs != want {
 		t.Errorf("startedAt = %d, want %d", current.StartedAtMs, want)
@@ -345,12 +352,9 @@ func TestThreeClientsStaySynchronizedAndSkipOnVotes(t *testing.T) {
 	if current.PositionMs != 0 {
 		t.Errorf("position = %d, want 0 at start", current.PositionMs)
 	}
-	// The two who have not reported are catching up, not being waited for.
-	if len(current.Awaiting) != 0 {
-		t.Errorf("awaiting = %v, want nobody", current.Awaiting)
-	}
-	if len(current.CatchingUp) != 2 {
-		t.Errorf("catchingUp = %v, want the two who have not reported", current.CatchingUp)
+	// Everybody was ready, so nobody is catching up and nobody is waited for.
+	if len(current.Awaiting) != 0 || len(current.CatchingUp) != 0 {
+		t.Errorf("awaiting = %v, catchingUp = %v, want nobody", current.Awaiting, current.CatchingUp)
 	}
 
 	// Everybody's song ends when the host's does.
@@ -690,13 +694,12 @@ func TestHostFollowsTheAccount(t *testing.T) {
 	}
 }
 
-// TestTheRoomWaitsForAFileNotTheHost: the song does not run until somebody has
-// it. A room whose clock starts with nobody listening plays its first seconds to
-// an empty room, and every client that arrives afterwards joins a song already
-// under way - which is what "it starts a little in" is. It is not the host in
-// particular: whoever is ready first starts it, and the host's own report is
-// what puts the room's clock where their file is.
-func TestTheRoomWaitsForAFileNotTheHost(t *testing.T) {
+// TestASongWaitsForEveryMembersFile: the song is for every member of the room,
+// so the room waits for every member's file before it plays - and says who it
+// is still waiting on, so the wait is a name rather than a play button that
+// does nothing. The host's file is not special: whoever is last is waited for,
+// until the window runs out.
+func TestASongWaitsForEveryMembersFile(t *testing.T) {
 	f := newFixture(t, func(cfg *config.Config) {
 		cfg.ListenTogether.ReadyTimeoutSeconds = 30
 	})
@@ -718,7 +721,7 @@ func TestTheRoomWaitsForAFileNotTheHost(t *testing.T) {
 	}
 
 	// Nobody has the file, so nothing runs yet - and the room says it is waiting
-	// on all of them, because any of them could be the one.
+	// on all of them, because the song is for all of them.
 	before := f.current(f.get(snapshot.ID))
 	if before.StartedAtMs != 0 {
 		t.Fatal("the song ran with nobody ready to hear it")
@@ -727,34 +730,33 @@ func TestTheRoomWaitsForAFileNotTheHost(t *testing.T) {
 		t.Fatalf("awaiting = %v, want both members", before.Awaiting)
 	}
 
-	// The laggard's file arrives first. That is enough: the song runs, and the
-	// host - who is not waited for in particular - joins where it has got to.
+	// The laggard's file arrives first, and that is not enough: the host is
+	// still fetching, and the song is for both of them.
 	if _, err := f.m.Ready(snapshot.ID, "laggard", track.ID, variants[0].ID, 200_000); err != nil {
+		t.Fatal(err)
+	}
+	midway := f.current(f.get(snapshot.ID))
+	if midway.StartedAtMs != 0 {
+		t.Fatal("one member's file started the song for the whole room")
+	}
+	if len(midway.Awaiting) != 1 || midway.Awaiting[0] != "host" {
+		t.Fatalf("awaiting = %v, want [host]", midway.Awaiting)
+	}
+
+	// The host's file arrives, and the song runs - on the host's copy, with
+	// nobody left to wait for.
+	if _, err := f.m.Ready(snapshot.ID, "host", track.ID, variants[0].ID, 150_000); err != nil {
 		t.Fatal(err)
 	}
 	started := f.current(f.get(snapshot.ID))
 	if started.StartedAtMs == 0 {
-		t.Fatal("one member's file did not start the song")
+		t.Fatal("every member's file did not start the song")
 	}
-	if len(started.Awaiting) != 0 {
-		t.Fatalf("awaiting = %v, want nobody: somebody has it", started.Awaiting)
+	if len(started.Awaiting) != 0 || len(started.CatchingUp) != 0 {
+		t.Fatalf("awaiting = %v, catchingUp = %v, want nobody", started.Awaiting, started.CatchingUp)
 	}
-	if len(started.CatchingUp) != 1 || started.CatchingUp[0] != "host" {
-		t.Errorf("catchingUp = %v, want [host]", started.CatchingUp)
-	}
-	// The length is the only file the room has, until the host's report says
-	// otherwise.
-	if started.TimelineMs != 200_000 {
-		t.Errorf("timeline = %d, want the file the room has (200000)", started.TimelineMs)
-	}
-
-	// And the host's own report takes the clock over: their copy is what the room
-	// runs for, and everybody else follows them.
-	if _, err := f.m.Ready(snapshot.ID, "host", track.ID, variants[0].ID, 150_000); err != nil {
-		t.Fatal(err)
-	}
-	if got := f.current(f.get(snapshot.ID)).TimelineMs; got != 150_000 {
-		t.Errorf("timeline = %d, want the host's rendition (150000)", got)
+	if started.TimelineMs != 150_000 {
+		t.Errorf("timeline = %d, want the host's rendition (150000)", started.TimelineMs)
 	}
 }
 
@@ -1599,10 +1601,11 @@ func TestTransportEventsNameTheMember(t *testing.T) {
 	}
 }
 
-// TestTheHostsEndMovesTheRoomOn: the host is the room's clock, so their file
-// reaching its end is the song reaching its end - and it does not matter what
-// length the room had worked out in advance. Anybody else's file ending says
-// nothing.
+// TestTheHostsEndMovesTheRoomOn: in host mode the host's player is the clock, so
+// their file reaching its end is the song reaching its end - and it does not
+// matter what length the room had worked out in advance. Anybody else's file
+// ending says nothing, and in server mode nobody's does: the server's own clock
+// says when a song is over.
 func TestTheHostsEndMovesTheRoomOn(t *testing.T) {
 	f := newFixture(t, nil)
 	ctx := context.Background()
@@ -1628,11 +1631,25 @@ func TestTheHostsEndMovesTheRoomOn(t *testing.T) {
 	if _, err := f.enqueue(ctx, roomID, "host", next.ID); err != nil {
 		t.Fatal(err)
 	}
+	// The host's player holds this song: the room does not start it, and waits
+	// on nobody. Everybody being ready is not the host's player playing it.
+	if _, err := f.m.SetMode(roomID, "host", ModeHost); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := f.m.Ready(roomID, "host", track.ID, variants[0].ID, 300_000); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := f.m.Ready(roomID, "guest", track.ID, variants[0].ID, 300_000); err != nil {
+		t.Fatal(err)
+	}
+	if f.current(f.get(roomID)).StartedAtMs != 0 {
+		t.Fatal("the room started the song the host's player holds")
+	}
+	if _, err := f.m.Started(roomID, "host", track.ID, 0, 300_000); err != nil {
+		t.Fatal(err)
+	}
 	if f.current(f.get(roomID)).StartedAtMs == 0 {
-		t.Fatal("the track did not start")
+		t.Fatal("the host's player did not start the song")
 	}
 
 	// Somebody who is not the room's clock saying so changes nothing.
@@ -2040,9 +2057,10 @@ func TestRoomWarmsWhatItIsAboutToPlay(t *testing.T) {
 	t.Error("the room never asked for the prepared song's rendition")
 }
 
-// The host's readiness is what starts the room. Nobody else's is needed, which
-// is what waiting for the slowest connection in the room used to cost.
-func TestTheHostStartsTheRoomAlone(t *testing.T) {
+// The host's readiness alone does not start the song: the song is for every
+// member, and the room waits for all of them - or for the window. One person's
+// speakers being ready is not a room being ready.
+func TestTheHostsWordAloneDoesNotStartTheSong(t *testing.T) {
 	f := newFixture(t, nil)
 	ctx := context.Background()
 
@@ -2061,22 +2079,26 @@ func TestTheHostStartsTheRoomAlone(t *testing.T) {
 		t.Fatalf("Enqueue: %v", err)
 	}
 
-	// The host alone. b, c and d have not reported, and are not waited for.
+	// The host alone. b, c and d have not reported, and the song is for them too.
 	if _, err := f.m.Ready(roomID, "a", track.ID, uuid.Nil, 180_000); err != nil {
 		t.Fatalf("Ready(host): %v", err)
 	}
 	current := f.current(f.get(roomID))
-	if current.StartedAtMs == 0 {
-		t.Error("the host's readiness did not start the room")
+	if current.StartedAtMs != 0 {
+		t.Error("the host's file alone started the song for the whole room")
 	}
-	if len(current.CatchingUp) != 3 {
-		t.Errorf("catchingUp = %v, want the three who have not reported", current.CatchingUp)
+	if len(current.Awaiting) != 3 {
+		t.Errorf("awaiting = %v, want the three who have not reported", current.Awaiting)
+	}
+	for _, id := range []string{"b", "c", "d"} {
+		if _, err := f.m.Ready(roomID, id, track.ID, uuid.Nil, 180_000); err != nil {
+			t.Fatalf("Ready(%s): %v", id, err)
+		}
+	}
+	if current := f.current(f.get(roomID)); current.StartedAtMs == 0 {
+		t.Error("every member's file did not start the song")
 	}
 }
-
-// The room no longer waits for the host's file at all - see
-// TestTheRoomDoesNotWaitForTheHost - so the test that pinned the opposite is
-// gone rather than re-pinned.
 
 // A member with one song should not wait behind two of somebody else's: the
 // round-robin is one item per member per pass, so a short queue is placed by
@@ -2143,5 +2165,212 @@ func TestSingleItemMemberJoinsTheNextPass(t *testing.T) {
 	want := []string{"K3", "L1", "K4"}
 	if !slices.Equal(got, want) {
 		t.Errorf("master queue = %v, want %v", got, want)
+	}
+}
+
+// TestHostModeRunsOnTheHostsPlayer: when the host's player holds the song, the
+// room starts nothing, waits on nobody, and runs on the host's word - their
+// player says where the song is and how long it is, and their file running out
+// is the song ending. A party in one room, one queue and everybody hearing the
+// host's speakers, sounds exactly as smooth as the host's own player.
+func TestHostModeRunsOnTheHostsPlayer(t *testing.T) {
+	f := newFixture(t, nil)
+	ctx := context.Background()
+
+	track, variants := f.trackWithVariants("Song",
+		variantSpec{provider: "local", providerTrackID: "a", durationMs: 200_000, downloadable: true},
+	)
+	next, _ := f.trackWithVariants("Next",
+		variantSpec{provider: "local", providerTrackID: "b", durationMs: 150_000, downloadable: true},
+	)
+
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomID := snapshot.ID
+	if _, err := f.m.Join(roomID, Member{ID: "guest"}, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.m.SetMode(roomID, "host", ModeHost); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.enqueue(ctx, roomID, "host", track.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.enqueue(ctx, roomID, "host", next.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.prepared(roomID)
+
+	// Both files are here, and the room has still started nothing: the host's
+	// player starts this song, not the room, and nobody is waited for.
+	if _, err := f.m.Ready(roomID, "guest", track.ID, variants[0].ID, 200_000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.m.Ready(roomID, "host", track.ID, variants[0].ID, 200_000); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.current(f.get(roomID)); got.StartedAtMs != 0 || len(got.Awaiting) != 0 {
+		t.Fatalf("host mode waited on somebody: started %d, awaiting %v", got.StartedAtMs, got.Awaiting)
+	}
+
+	// A member who is not the host cannot say the song has started.
+	if _, err := f.m.Started(roomID, "guest", track.ID, 0, 200_000); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("guest Started: err = %v, want ErrForbidden", err)
+	}
+	// The host's word puts the room's clock where their file is, for as long as
+	// their file says it is.
+	if _, err := f.m.Started(roomID, "host", track.ID, 1_000, 200_000); err != nil {
+		t.Fatal(err)
+	}
+	current := f.current(f.get(roomID))
+	if current.StartedAtMs == 0 {
+		t.Fatal("the host's word did not start the clock")
+	}
+	if current.PositionMs != 1_000 {
+		t.Errorf("position = %d, want 1000: the clock is where their file is", current.PositionMs)
+	}
+	if current.TimelineMs != 200_000 {
+		t.Errorf("timeline = %d, want the host's file (200000)", current.TimelineMs)
+	}
+
+	// Their file running out is the song ending, and the next song waits for
+	// their player rather than starting on its own.
+	f.nextPrepared(roomID)
+	if _, err := f.m.Ended(roomID, "host", track.ID, 200_000); err != nil {
+		t.Fatal(err)
+	}
+	after := f.get(roomID)
+	if after.Current == nil || after.Current.Item.TrackID != next.ID {
+		t.Fatalf("current = %+v, want the next song", after.Current)
+	}
+	if after.Current.StartedAtMs != 0 {
+		t.Error("the next song started without the host's player")
+	}
+}
+
+// TestTheModeIsTheHostsToChange: who holds the song is the host's choice - it
+// is their room's sound - and the room says so, so every client's checkbox
+// knows. Nobody else's is taken.
+func TestTheModeIsTheHostsToChange(t *testing.T) {
+	f := newFixture(t, nil)
+
+	events, cancel := f.m.Subscribe()
+	defer cancel()
+
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomID := snapshot.ID
+	if _, err := f.m.Join(roomID, Member{ID: "guest"}, "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	if snapshot.Mode != ModeServer {
+		t.Fatalf("a new room's mode = %q, want the server's clock", snapshot.Mode)
+	}
+	if _, err := f.m.SetMode(roomID, "guest", ModeHost); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("guest SetMode: err = %v, want ErrForbidden", err)
+	}
+	if _, err := f.m.SetMode(roomID, "host", Mode("nonsense")); !errors.Is(err, ErrInvalidMode) {
+		t.Fatalf("SetMode(nonsense): err = %v, want ErrInvalidMode", err)
+	}
+	changed, err := f.m.SetMode(roomID, "host", ModeHost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.Mode != ModeHost {
+		t.Fatalf("mode = %q, want host", changed.Mode)
+	}
+	if again, err := f.m.SetMode(roomID, "host", ModeHost); err != nil || again.Mode != ModeHost {
+		t.Fatalf("setting the same mode again: %v", err)
+	}
+
+	// The room says so, so every client's checkbox knows.
+	heard := false
+	deadline := time.After(5 * time.Second)
+	for !heard {
+		select {
+		case event := <-events:
+			if event.Type != EventModeChanged {
+				continue
+			}
+			if data, ok := event.Data.(map[string]any); ok && data["mode"] == ModeHost {
+				heard = true
+			}
+		case <-deadline:
+			t.Fatal("the room never announced the mode change")
+		}
+	}
+}
+
+// TestTheWindowCountsItselfDown: the wait for the last file says how much of
+// the window is left, so a member waiting on somebody else's download watches a
+// number come down rather than a play button that does nothing. When the window
+// runs out, the song plays without whoever it was still waiting for, rather
+// than sitting in silence for them.
+func TestTheWindowCountsItselfDown(t *testing.T) {
+	f := newFixture(t, func(cfg *config.Config) {
+		cfg.ListenTogether.ReadyTimeoutSeconds = 15
+	})
+	ctx := context.Background()
+
+	track, variants := f.trackWithVariants("Song",
+		variantSpec{provider: "local", providerTrackID: "a", durationMs: 200_000, downloadable: true},
+	)
+	events, cancel := f.m.Subscribe()
+	defer cancel()
+
+	snapshot, err := f.m.Create("party", ControlsEveryone, "", Member{ID: "host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.m.Join(snapshot.ID, Member{ID: "laggard"}, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.enqueue(ctx, snapshot.ID, "host", track.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.m.Ready(snapshot.ID, "host", track.ID, variants[0].ID, 200_000); err != nil {
+		t.Fatal(err)
+	}
+
+	// The wait says how much of the window is left.
+	remaining := int64(-1)
+	deadline := time.After(5 * time.Second)
+	for remaining < 0 {
+		select {
+		case event := <-events:
+			if event.Type != EventReadyState {
+				continue
+			}
+			data, ok := event.Data.(map[string]any)
+			if !ok {
+				continue
+			}
+			if ready, _ := data["ready"].(int); ready != 1 {
+				continue
+			}
+			if got, ok := data["remainingMs"].(int64); ok {
+				remaining = got
+			}
+		case <-deadline:
+			t.Fatal("the room never said how much of the window was left")
+		}
+	}
+	if remaining <= 0 || remaining > 15_000 {
+		t.Fatalf("remainingMs = %d, want some of the fifteen seconds", remaining)
+	}
+
+	// The window runs out, and the song plays without the laggard.
+	f.clock.Advance(16 * time.Second)
+	current := f.current(f.get(snapshot.ID))
+	if current.StartedAtMs == 0 {
+		t.Fatal("the window ran out and the song did not play")
+	}
+	if len(current.CatchingUp) != 1 || current.CatchingUp[0] != "laggard" {
+		t.Errorf("catchingUp = %v, want [laggard]", current.CatchingUp)
 	}
 }

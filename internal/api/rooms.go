@@ -62,6 +62,21 @@ type roomOutRequest struct {
 	Out bool `json:"out"`
 }
 
+// modeRequest is the host saying who holds the song: the server's clock, or
+// their own player.
+type modeRequest struct {
+	Mode rooms.Mode `json:"mode"`
+}
+
+// startedRequest is the host's player saying a song is playing, and where: the
+// room's clock is put where their file is, and it runs as long as their file
+// says it is.
+type startedRequest struct {
+	TrackID    string `json:"trackId"`
+	PositionMs int64  `json:"positionMs"`
+	DurationMs int64  `json:"durationMs"`
+}
+
 // endedRequest names the track whose file has run out, and where that file had
 // got to. A client that has already moved on names the track it moved on to; a
 // file that stopped short names a position well short of the song. The room
@@ -413,6 +428,52 @@ func (s *Server) handleRoomReady(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, room)
 }
 
+// handleRoomMode is the host's checkbox: who holds the song. The song in
+// flight changes hands with it.
+func (s *Server) handleRoomMode(w http.ResponseWriter, r *http.Request) {
+	member, ok := s.callerMember(r, false)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "member identity required")
+		return
+	}
+	var req modeRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	room, err := s.rooms.SetMode(r.PathValue("roomId"), member.ID, req.Mode)
+	if err != nil {
+		writeRoomError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, room)
+}
+
+// handleRoomStarted is the host's player saying the song is playing. In host
+// mode their player is the clock, and this is what puts the room's clock where
+// their file is.
+func (s *Server) handleRoomStarted(w http.ResponseWriter, r *http.Request) {
+	member, ok := s.callerMember(r, false)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "member identity required")
+		return
+	}
+	var req startedRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	trackID, err := uuid.Parse(req.TrackID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid trackId")
+		return
+	}
+	room, err := s.rooms.Started(r.PathValue("roomId"), member.ID, trackID, req.PositionMs, req.DurationMs)
+	if err != nil {
+		writeRoomError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, room)
+}
+
 // handleClock reports the server clock; clients measure their offset from it
 // and keep re-syncing while they follow a room.
 func (s *Server) handleClock(w http.ResponseWriter, r *http.Request) {
@@ -450,10 +511,11 @@ func writeRoomError(w http.ResponseWriter, err error) {
 	case errors.Is(err, rooms.ErrMemberNotFound), errors.Is(err, rooms.ErrForbidden),
 		errors.Is(err, rooms.ErrWrongPassword):
 		writeError(w, http.StatusForbidden, err.Error())
-	case errors.Is(err, rooms.ErrNoPlayback):
+	case errors.Is(err, rooms.ErrNoPlayback), errors.Is(err, rooms.ErrNotHostMode):
 		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, rooms.ErrInvalidVote), errors.Is(err, rooms.ErrInvalidOrder),
-		errors.Is(err, rooms.ErrInvalidSeek), errors.Is(err, rooms.ErrInvalidControl):
+		errors.Is(err, rooms.ErrInvalidSeek), errors.Is(err, rooms.ErrInvalidControl),
+		errors.Is(err, rooms.ErrInvalidMode):
 		writeError(w, http.StatusBadRequest, err.Error())
 	default:
 		writeError(w, http.StatusInternalServerError, err.Error())

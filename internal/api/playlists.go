@@ -14,11 +14,11 @@ import (
 )
 
 type playlistResponse struct {
-	ID         string          `json:"id"`
-	Name       string          `json:"name"`
-	TrackCount int             `json:"trackCount"`
-	DurationMs int64           `json:"durationMs"`
-	ArtworkURL string          `json:"artworkUrl,omitempty"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	TrackCount int    `json:"trackCount"`
+	DurationMs int64  `json:"durationMs"`
+	ArtworkURL string `json:"artworkUrl,omitempty"`
 	// Public decides whether anybody else may see this playlist. Public is what
 	// a new playlist is.
 	Public bool `json:"public"`

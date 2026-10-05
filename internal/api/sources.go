@@ -192,7 +192,6 @@ func slotFor(variantID uuid.UUID, uploaders map[uuid.UUID]store.VariantUploader,
 	return ranking.SlotUploaded
 }
 
-
 type variantVoteRequest struct {
 	Value *int `json:"value"`
 }

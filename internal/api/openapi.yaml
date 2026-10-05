@@ -2472,6 +2472,84 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /api/v1/rooms/{roomId}/mode:
+    post:
+      tags: [rooms]
+      summary: Change who holds the song
+      description: |
+        The host's choice, and a live one - the song in flight changes hands
+        with it.
+
+        In `server` mode the room waits for every member's file, then plays on
+        its own clock: a room spread across the world. In `host` mode the
+        host's player is the one everybody follows - a party in one room,
+        where their speakers are the ones everybody hears: their player says
+        where the song is, how long it is, and when it is over.
+
+        Handed to the host's player, the room stops waiting on anybody; handed
+        back to the server, the wait is for everyone again and the readiness
+        window counts from now.
+      operationId: setRoomMode
+      parameters: [{ $ref: "#/components/parameters/RoomID" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mode]
+              properties:
+                mode: { type: string, enum: [server, host] }
+      responses:
+        "200": { $ref: "#/components/responses/RoomState" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/rooms/{roomId}/started:
+    post:
+      tags: [rooms]
+      summary: The host's player has started the song
+      description: |
+        In host mode the room never starts a song - the host's player does, and
+        this is the word for it. The room's clock is put where their file is:
+        `positionMs` is where their file has got to, and `durationMs` is how
+        long their file says the song is. Everybody else follows from there,
+        and their file running out (see `/ended`) is the song ending.
+
+        Only the host's, only in host mode; in server mode the room's own
+        clock says when a song is over and this is refused.
+      operationId: reportTrackStarted
+      parameters: [{ $ref: "#/components/parameters/RoomID" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [trackId]
+              properties:
+                trackId: { type: string, format: uuid }
+                positionMs:
+                  type: integer
+                  format: int64
+                  minimum: 0
+                  description: Where the host's file has got to, usually zero at the start.
+                durationMs:
+                  type: integer
+                  format: int64
+                  description: How long the host's file says the song is; the room's clock runs this long.
+      responses:
+        "200": { $ref: "#/components/responses/RoomState" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: The server holds this room's song, not the host's player.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /api/v1/ws:
     get:
       tags: [rooms]
@@ -3170,6 +3248,14 @@ components:
         name: { type: string }
         host: { type: string }
         controls: { type: string, enum: [host, everyone] }
+        mode:
+          type: string
+          enum: [server, host]
+          description: |
+            Who holds the song. In `server` mode the room waits for every
+            member's file, then plays on its own clock; in `host` mode the
+            host's player is the clock - it says where the song is and when
+            it is over. The host's choice, changeable while the room runs.
         hasPassword:
           type: boolean
           description: Whether joining requires a password.

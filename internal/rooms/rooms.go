@@ -35,6 +35,8 @@ var (
 	ErrInvalidOrder   = errors.New("queue order does not match the queue")
 	ErrInvalidSeek    = errors.New("seek position must not be negative")
 	ErrInvalidControl = errors.New("controls must be \"host\" or \"everyone\"")
+	ErrInvalidMode    = errors.New("mode must be \"server\" or \"host\"")
+	ErrNotHostMode    = errors.New("this room's song is held by the server, not the host's player")
 )
 
 // defaultTimelineMs is used when neither the members nor the canonical track
@@ -51,6 +53,22 @@ type Controls string
 const (
 	ControlsHost     Controls = "host"
 	ControlsEveryone Controls = "everyone"
+)
+
+// Mode decides who holds the song: whose clock the room runs on, and whose file
+// says when it is over. It is the host's choice, and a live one - a party in
+// one room wants their speakers to be the ones everybody hears, and a room
+// spread across the world wants a clock nobody's connection owns.
+type Mode string
+
+// Room modes.
+const (
+	// ModeServer is the server holding the song: it waits until every member
+	// has their file, then plays on its own clock.
+	ModeServer Mode = "server"
+	// ModeHost is the host's player holding the song: their file is the clock,
+	// and their file running out is the song ending.
+	ModeHost Mode = "host"
 )
 
 // Member is one participant in a room. UserID is nil for guests.
@@ -124,10 +142,13 @@ type playback struct {
 	paused           bool
 	pausedPositionMs int64
 
-	prepareTimer   Timer
 	advanceTimer   Timer
+	windowTimer    Timer
 	prepareVersion int
 	advanceVersion int
+	// waitStartedAtMs is when the wait for everyone's file began: the countdown
+	// counts down from it, once per song.
+	waitStartedAtMs int64
 }
 
 // positionMs is the room position at server time nowMs.
@@ -213,9 +234,12 @@ type room struct {
 	// account's id when they have one, else the browser's member id. The host
 	// is whoever is leading right now; the owner is who leads again when they
 	// come back.
-	owner       string
-	ownerName   string
-	controls    Controls
+	owner     string
+	ownerName string
+	controls  Controls
+	// mode is who holds the song. The host's choice, changeable while the room
+	// runs; the song in flight changes hands with it.
+	mode        Mode
 	password    string // join password, empty for none; never leaves the manager
 	createdAtMs int64
 
@@ -244,6 +268,7 @@ type Snapshot struct {
 	Name        string                 `json:"name"`
 	Host        string                 `json:"host"`
 	Controls    Controls               `json:"controls"`
+	Mode        Mode                   `json:"mode"`
 	CreatedAtMs int64                  `json:"createdAtMs"`
 	Members     []Member               `json:"members"`
 	MemberCount int                    `json:"memberCount"`
@@ -480,6 +505,7 @@ func (m *Manager) Create(name string, controls Controls, password string, host M
 		owner:       ownerIdentity(host),
 		ownerName:   host.Name,
 		controls:    controls,
+		mode:        ModeServer,
 		password:    password,
 		createdAtMs: m.nowMsLocked(),
 		members:     map[string]*Member{host.ID: &host},
@@ -1009,6 +1035,11 @@ func (m *Manager) Ended(roomID, memberID string, trackID uuid.UUID, positionMs i
 	if _, ok := room.members[memberID]; !ok {
 		return nil, ErrMemberNotFound
 	}
+	if room.mode != ModeHost {
+		// The server holds the song, and the room does not end it because
+		// somebody's file did: the server's own clock says when it is over.
+		return m.snapshotLocked(room), nil
+	}
 	if memberID != room.host || room.current == nil || room.current.startedAtMs == 0 {
 		// Not the room's clock, or nothing of the room's is playing: there is
 		// nothing for this to mean.
@@ -1147,20 +1178,127 @@ func (m *Manager) Ready(roomID, memberID string, trackID, variantID uuid.UUID, d
 		return m.snapshotLocked(room), nil
 	}
 
-	state := map[string]any{
-		"ready":   len(playback.ready),
-		"members": len(room.members),
-		"item":    playback.item,
-		"out":     outMembers(room),
-	}
 	if playback.startedAtMs != 0 {
 		m.retimeLocked(room, playback)
-		state["timelineMs"] = playback.timelineMs
 	}
 
-	m.publishLocked(room, EventReadyState, state)
+	m.publishLocked(room, EventReadyState, m.readyDataLocked(room, playback))
 	m.maybeStartLocked(room)
 	return m.snapshotLocked(room), nil
+}
+
+// SetMode changes who holds the song: the server's clock, or the host's player.
+// The host's choice, and a live one - the song in flight changes hands with it.
+//
+// In server mode the room waits for every member's file, then plays on its own
+// clock: a room spread across the world. In host mode the host's player is the
+// one everybody follows - a party in one room, where their speakers are the ones
+// everybody hears, and the song ends when their file says it does.
+func (m *Manager) SetMode(roomID, memberID string, mode Mode) (*Snapshot, error) {
+	if mode != ModeServer && mode != ModeHost {
+		return nil, ErrInvalidMode
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	room, err := m.roomLocked(roomID)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := room.members[memberID]; !ok {
+		return nil, ErrMemberNotFound
+	}
+	if memberID != room.host {
+		return nil, ErrForbidden
+	}
+	if room.mode == mode {
+		return m.snapshotLocked(room), nil
+	}
+	was := room.mode
+	room.mode = mode
+	m.logger.Info("room: mode changed", "room", room.id, "was", was, "mode", mode, "by", memberID)
+	m.publishLocked(room, EventModeChanged, map[string]any{"mode": mode, "was": was})
+
+	// The song in flight changes hands. Handed to the host's player, the room
+	// stops waiting on anybody: their player starts it when it is ready, and
+	// their word is the clock. Handed back to the server, the wait is for
+	// everyone again, and the window counts from now.
+	if room.current != nil && room.current.startedAtMs == 0 {
+		if mode == ModeHost {
+			m.stopWindowLocked(room, room.current)
+		} else {
+			room.current.waitStartedAtMs = 0
+			m.maybeStartLocked(room)
+		}
+	}
+	return m.snapshotLocked(room), nil
+}
+
+// Started is the host's player saying a song is playing, and where. In host
+// mode the room never starts anything - the host's player does, and this is the
+// word for it: the room's clock is put where their file is, and it runs as long
+// as their file says it does.
+func (m *Manager) Started(roomID, memberID string, trackID uuid.UUID, positionMs, durationMs int64) (*Snapshot, error) {
+	if positionMs < 0 {
+		positionMs = 0
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	room, err := m.roomLocked(roomID)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := room.members[memberID]; !ok {
+		return nil, ErrMemberNotFound
+	}
+	if room.mode != ModeHost {
+		return nil, ErrNotHostMode
+	}
+	if memberID != room.host {
+		return nil, ErrForbidden
+	}
+	playback := room.playbackForTrack(trackID)
+	if playback == nil || playback != room.current {
+		return nil, ErrNoPlayback
+	}
+	m.startHostLocked(room, playback, positionMs, durationMs)
+	return m.snapshotLocked(room), nil
+}
+
+// startHostLocked puts the room's clock onto the host's file: their player is
+// playing it, from wherever their file has got to, for as long as their file
+// says it is. Everybody else follows from there.
+func (m *Manager) startHostLocked(room *room, playback *playback, positionMs, durationMs int64) {
+	if playback == nil || playback.startedAtMs != 0 || room.current != playback {
+		return
+	}
+	now := m.nowMsLocked()
+	playback.startedAtMs = now
+	playback.paused = false
+	playback.pausedPositionMs = positionMs
+	playback.prepareVersion++
+	m.stopWindowLocked(room, playback)
+	if durationMs > 0 {
+		playback.timelineMs = durationMs
+	} else {
+		playback.timelineMs = timelineFor(room, playback)
+	}
+
+	m.publishLocked(room, EventTrackStarted, map[string]any{
+		"item":       playback.item,
+		"startedAt":  now,
+		"timelineMs": playback.timelineMs,
+		"variants":   playback.variants,
+		"by":         memberRefLocked(room, room.host),
+	})
+	m.logger.Info("room: the host's player started the song",
+		"room", room.id, "title", playback.item.Title,
+		"position_ms", positionMs, "timeline_ms", playback.timelineMs)
+	m.scheduleAdvanceLocked(room, playback)
+	m.prepareNextLocked(room)
 }
 
 // SetOut records that a member is sitting the room's track out, or is back in.
@@ -1410,33 +1548,6 @@ func (m *Manager) beginNextLocked(room *room) {
 		go m.prepare(room.id, item.ID)
 	}
 
-	timeout := time.Duration(m.cfg.ListenTogether.ReadyTimeoutSeconds) * time.Second
-	if len(room.members) == 0 || timeout <= 0 {
-		// Nobody to wait for, or waiting disabled: start as soon as the
-		// variants are assigned.
-		return
-	}
-	playback.prepareVersion++
-	version := playback.prepareVersion
-	playback.prepareTimer = m.clock.AfterFunc(timeout, func() {
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		current, ok := m.rooms[room.id]
-		if !ok || current.current != playback || playback.prepareVersion != version {
-			return
-		}
-		// The window is armed when the song starts, so for a song longer than
-		// the window this fires while that song is playing normally: nothing is
-		// waiting on it, and logging it is what made the journal read as though
-		// rooms were timing out constantly.
-		if playback.startedAtMs != 0 {
-			return
-		}
-		m.logger.Info("room: readiness timeout, starting without everyone",
-			"room", room.id, "item", playback.item.ID)
-		playback.timedOut = true
-		m.maybeStartLocked(current)
-	})
 }
 
 // prepare resolves a playable rendition per member and announces the
@@ -1627,66 +1738,66 @@ func (m *Manager) retimeLocked(room *room, playback *playback) {
 	})
 }
 
-// maybeStartLocked starts the current track as soon as the room can begin.
+// maybeStartLocked starts the current song when the room's mode allows it.
+//
+// In server mode the room decides on its own: it waits for every member's file,
+// or for the window, and then plays on its clock. In host mode the room never
+// starts a song - the host's player does, and their word is what puts the
+// room's clock where their file is.
 func (m *Manager) maybeStartLocked(room *room) {
 	playback := room.current
 	if playback == nil || playback.startedAtMs != 0 || !playback.prepared {
 		return
 	}
-	if !m.quorumReadyLocked(room, playback) {
+	if room.mode != ModeServer {
+		return
+	}
+	if !m.everyoneReadyLocked(room, playback) {
+		m.armWindowLocked(room, playback)
 		return
 	}
 	m.startLocked(room, playback)
 }
 
-// hostLeadsLocked reports whether the host is the one the room waits for: they
-// are still here, they are not sitting this song out, and the room has a
-// rendition to hand them.
-//
-// That last part matters. A host the room could not find anything to play for
-// can never report ready, so waiting for them is waiting for something that
-// cannot happen: a room where nothing could be resolved for the host would sit
-// still for ever. The room falls back to the room as a whole, and its window
-// moves the song on.
-func (m *Manager) hostLeadsLocked(room *room, playback *playback) bool {
-	host := room.host
-	if host == "" || room.out[host] {
-		return false
-	}
-	if _, ok := room.members[host]; !ok {
-		return false
-	}
-	return playback != nil && playback.variants[host] != uuid.Nil
-}
-
-// quorumReadyLocked reports whether the room can begin.
-//
-// The host is the room's clock, so the room does not wait for *them*: they play
-// when their own player is ready, and the room's clock is put where their file
-// is by their own report. Waiting for the host is what made one slow fetch the
-// whole room's problem.
-//
-// But somebody has to have the file before the song runs. A room whose clock
-// starts with nobody listening plays its first seconds to an empty room, and
-// every client that arrives afterwards joins a song already under way - which is
-// what "it starts a little in" is. One client is enough: the song runs from
-// their file, and the rest are listen-alongs who join wherever it has got to.
-//
-// The window is the backstop for the case where nobody ever has it, so a room of
-// files that never arrive is not a room that waits for ever.
-func (m *Manager) quorumReadyLocked(room *room, playback *playback) bool {
-	if len(playback.ready) == 0 {
-		return playback.timedOut
-	}
-	if m.hostLeadsLocked(room, playback) {
-		return true
-	}
+// everyoneReadyLocked reports whether every member this song is for has their
+// file: a member sitting the song out is not one of them, and the window having
+// run out is the room deciding not to wait for whoever is left.
+func (m *Manager) everyoneReadyLocked(room *room, playback *playback) bool {
 	if playback.timedOut {
 		return true
 	}
-	playing, ready := 0, 0
 	for memberID := range room.members {
 		if room.out[memberID] {
+			continue
+		}
+		if _, ok := playback.ready[memberID]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// readyWindowMs is how long the room waits for the last file. Fifteen seconds:
+// long enough to fetch a song, short enough that a room is not left in silence -
+// and the whole of it is counted down where every member can see it.
+func (m *Manager) readyWindowMs() int64 {
+	if secs := m.cfg.ListenTogether.ReadyTimeoutSeconds; secs > 0 {
+		return int64(secs) * 1000
+	}
+	return 15_000
+}
+
+// readyDataLocked is the wait, as the room sees it: who has their file, how many
+// that is of, and how much of the window is left. This is what the countdown is
+// made of, so a member waiting on somebody else's download watches a number
+// come down rather than a play button that does nothing.
+func (m *Manager) readyDataLocked(room *room, playback *playback) map[string]any {
+	playing, ready := 0, 0
+	for _, memberID := range room.order {
+		if room.out[memberID] {
+			continue
+		}
+		if _, ok := room.members[memberID]; !ok {
 			continue
 		}
 		playing++
@@ -1694,21 +1805,83 @@ func (m *Manager) quorumReadyLocked(room *room, playback *playback) bool {
 			ready++
 		}
 	}
-	if playing == 0 {
-		return true
+	remaining := int64(0)
+	if playback.startedAtMs == 0 && !playback.timedOut && playback.waitStartedAtMs != 0 {
+		if left := playback.waitStartedAtMs + m.readyWindowMs() - m.nowMsLocked(); left > 0 {
+			remaining = left
+		}
 	}
-	return float64(ready) >= float64(playing)*m.cfg.ListenTogether.ReadyFraction
+	data := map[string]any{
+		"ready":       ready,
+		"members":     playing,
+		"out":         outMembers(room),
+		"item":        playback.item,
+		"remainingMs": remaining,
+	}
+	if playback.startedAtMs != 0 {
+		data["timelineMs"] = playback.timelineMs
+	}
+	return data
+}
+
+// armWindowLocked counts the room's wait down. Every second it says how much of
+// the window is left, so the countdown is watched rather than inferred, and the
+// last tick is the window running out: the room plays without whoever it is
+// still waiting for, rather than sitting in silence for them.
+func (m *Manager) armWindowLocked(room *room, playback *playback) {
+	if playback.windowTimer != nil {
+		return
+	}
+	if playback.waitStartedAtMs == 0 {
+		playback.waitStartedAtMs = m.nowMsLocked()
+	}
+	version := playback.prepareVersion
+	var tick func()
+	tick = func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		current, ok := m.rooms[room.id]
+		if !ok || current.current != playback || playback.prepareVersion != version {
+			return
+		}
+		if playback.startedAtMs != 0 {
+			m.stopWindowLocked(current, playback)
+			return
+		}
+		left := playback.waitStartedAtMs + m.readyWindowMs() - m.nowMsLocked()
+		if left <= 0 {
+			m.logger.Info("room: the window ran out, starting without everyone",
+				"room", room.id, "item", playback.item.ID, "ready", len(playback.ready))
+			playback.timedOut = true
+			m.stopWindowLocked(current, playback)
+			m.publishLocked(current, EventReadyState, m.readyDataLocked(current, playback))
+			m.maybeStartLocked(current)
+			return
+		}
+		m.publishLocked(current, EventReadyState, m.readyDataLocked(current, playback))
+		playback.windowTimer = m.clock.AfterFunc(time.Second, tick)
+	}
+	playback.windowTimer = m.clock.AfterFunc(time.Second, tick)
+}
+
+// stopWindowLocked stops the countdown: the song started, or stopped being the
+// room's to start.
+func (m *Manager) stopWindowLocked(room *room, playback *playback) {
+	if playback == nil || playback.windowTimer == nil {
+		return
+	}
+	playback.windowTimer.Stop()
+	playback.windowTimer = nil
 }
 
 // waitedForLocked reports whether the room's start is still waiting on this
-// member.
-//
-// The song begins as soon as one member has the file, so until then the room is
-// waiting on all of them - the host included: nothing about being the host makes
-// a file arrive sooner, and whoever gets there first starts the song. Once
-// somebody has it there is nothing left to wait for, and the rest are catching
-// up.
+// member. In host mode nobody is waited for - the host's player starts the song
+// when it is ready, and their word is the room's clock. In server mode it is
+// every member who has not said they have the file: the song is for all of them.
 func (m *Manager) waitedForLocked(room *room, playback *playback, memberID string) bool {
+	if room.mode != ModeServer {
+		return false
+	}
 	if room.out[memberID] {
 		return false
 	}
@@ -1720,17 +1893,6 @@ func (m *Manager) waitedForLocked(room *room, playback *playback, memberID strin
 		// holding the room up.
 		return false
 	}
-	if len(playback.ready) == 0 {
-		// Nobody has the file yet, and any of them could be the one that starts
-		// it, so the room is waiting on all of them.
-		return true
-	}
-	if m.hostLeadsLocked(room, playback) {
-		// A file is here and the host leads the room: that is enough to start.
-		return false
-	}
-	// No host to lead it, so the room as a whole decides - and the members who
-	// have not reported are what it is waiting for.
 	_, ready := playback.ready[memberID]
 	return !ready
 }
@@ -1748,10 +1910,7 @@ func (m *Manager) startLocked(room *room, playback *playback) {
 	playback.paused = false
 	playback.pausedPositionMs = 0
 	playback.prepareVersion++
-	if playback.prepareTimer != nil {
-		playback.prepareTimer.Stop()
-		playback.prepareTimer = nil
-	}
+	m.stopWindowLocked(room, playback)
 
 	m.publishLocked(room, EventTrackStarted, map[string]any{
 		"item":       playback.item,
@@ -1903,9 +2062,9 @@ func (m *Manager) stopTimersLocked(room *room) {
 	}
 	room.current.prepareVersion++
 	room.current.advanceVersion++
-	if room.current.prepareTimer != nil {
-		room.current.prepareTimer.Stop()
-		room.current.prepareTimer = nil
+	if room.current.windowTimer != nil {
+		room.current.windowTimer.Stop()
+		room.current.windowTimer = nil
 	}
 	if room.current.advanceTimer != nil {
 		room.current.advanceTimer.Stop()
@@ -1930,6 +2089,7 @@ func (m *Manager) snapshotLocked(room *room) *Snapshot {
 		Name:        room.name,
 		Host:        room.host,
 		Controls:    room.controls,
+		Mode:        room.mode,
 		CreatedAtMs: room.createdAtMs,
 		Members:     make([]Member, 0, len(room.order)),
 		MemberCount: len(room.members),

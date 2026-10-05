@@ -13,6 +13,7 @@ const (
 	EventMemberJoined  EventType = "member_joined"
 	EventMemberLeft    EventType = "member_left"
 	EventHostChanged   EventType = "host_changed"
+	EventModeChanged   EventType = "mode_changed"
 	EventQueueUpdated  EventType = "queue_updated"
 	EventTrackPrepared EventType = "track_prepared"
 	EventTrackStarted  EventType = "track_started"
