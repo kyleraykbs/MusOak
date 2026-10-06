@@ -106,13 +106,20 @@ func (b *Bus) Publish(e Event) {
 	}
 }
 
-// Clock abstracts time so tests can hold one still. Rooms have no timers of
-// their own — the host's player decides when a song is over — so time only
-// stamps state.
+// Clock abstracts time: it stamps state, and it is what arms the moment a song
+// ends so a test can hold the room's own clock still and move it by hand.
 type Clock interface {
 	Now() time.Time
+	AfterFunc(d time.Duration, f func()) Timer
+}
+
+// Timer is the subset of time.Timer rooms use.
+type Timer interface {
+	Stop() bool
 }
 
 type realClock struct{}
 
 func (realClock) Now() time.Time { return time.Now() }
+
+func (realClock) AfterFunc(d time.Duration, f func()) Timer { return time.AfterFunc(d, f) }

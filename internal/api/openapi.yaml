@@ -2320,6 +2320,11 @@ paths:
         song the room is on - an end that arrives late names a song the room
         has already moved past and is ignored, so that it cannot cut the song
         playing now.
+
+        This is the early word, not the only one: the room also ends a song on
+        its own clock — the position it reports reaching the length it reports,
+        the same numbers a client shows — so a report that never arrives costs
+        nothing.
       operationId: reportTrackEnded
       parameters: [{ $ref: "#/components/parameters/RoomID" }]
       requestBody:
@@ -2334,6 +2339,12 @@ paths:
                   type: string
                   format: uuid
                   description: The song the host's file has finished.
+                itemId:
+                  type: string
+                  description: |
+                    The queue entry that was playing. A report that names it is
+                    matched by entry, which the track alone cannot do: the same
+                    song queued twice is two entries and only one of them is on.
       responses:
         "200": { $ref: "#/components/responses/RoomState" }
         "403": { $ref: "#/components/responses/Forbidden" }

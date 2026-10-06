@@ -419,7 +419,7 @@ func (p *Participant) play(ctx context.Context, local *localPlayback, current *R
 		// this one stops the wait a moment after a load, and reporting that
 		// would cut the song for everybody.
 		if isHost && p.playedToTheEnd(ctx, slot) {
-			if _, err := p.room.Ended(ctx, item.TrackID); err != nil {
+			if _, err := p.room.Ended(ctx, item.ID, item.TrackID); err != nil {
 				p.logger.Warn("participant: report end", "error", err)
 			}
 		}

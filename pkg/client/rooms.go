@@ -265,11 +265,16 @@ func (r *RoomClient) Started(ctx context.Context, trackID string, positionMs, du
 	return &out, nil
 }
 
-// Ended is the host's player saying its file for trackID has run out: the room
-// drops that song and puts up the next one. Only the host's report counts.
-func (r *RoomClient) Ended(ctx context.Context, trackID string) (*Room, error) {
+// Ended is the host's player saying its file has run out: the room drops that
+// song and puts up the next one. Only the host's report counts. The entry (that
+// queue item) names it best - the same track queued twice is two entries, and
+// only one of them is playing - so it is sent beside the track.
+func (r *RoomClient) Ended(ctx context.Context, itemID, trackID string) (*Room, error) {
 	var out Room
 	body := map[string]string{"trackId": trackID}
+	if itemID != "" {
+		body["itemId"] = itemID
+	}
 	if err := r.client.do(ctx, http.MethodPost, r.path("/ended"), body, &out); err != nil {
 		return nil, err
 	}

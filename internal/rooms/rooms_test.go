@@ -14,10 +14,20 @@ import (
 	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
-// manualClock holds time still so positions are arithmetic, not waits.
+// manualClock holds time still so positions are arithmetic, not waits; its
+// timers fire when Advance passes them.
 type manualClock struct {
-	mu  sync.Mutex
-	now time.Time
+	mu     sync.Mutex
+	now    time.Time
+	timers []*manualTimer
+}
+
+type manualTimer struct {
+	mu      sync.Mutex
+	at      time.Time
+	fn      func()
+	stopped bool
+	done    bool
 }
 
 func newManualClock() *manualClock {
@@ -30,10 +40,62 @@ func (c *manualClock) Now() time.Time {
 	return c.now
 }
 
-func (c *manualClock) Advance(d time.Duration) {
+func (c *manualClock) AfterFunc(d time.Duration, fn func()) Timer {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	timer := &manualTimer{at: c.now.Add(d), fn: fn}
+	c.timers = append(c.timers, timer)
+	return timer
+}
+
+// Advance moves time forward and fires everything that became due.
+func (c *manualClock) Advance(d time.Duration) {
+	c.mu.Lock()
 	c.now = c.now.Add(d)
+	now := c.now
+	var due []func()
+	live := c.timers[:0]
+	for _, timer := range c.timers {
+		if fn, ok := timer.alarm(now); ok {
+			due = append(due, fn)
+			continue
+		}
+		if timer.live() {
+			live = append(live, timer)
+		}
+	}
+	c.timers = live
+	c.mu.Unlock()
+
+	for _, fn := range due {
+		fn()
+	}
+}
+
+func (t *manualTimer) Stop() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.stopped || t.done {
+		return false
+	}
+	t.stopped = true
+	return true
+}
+
+func (t *manualTimer) alarm(now time.Time) (func(), bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.stopped || t.done || t.at.After(now) {
+		return nil, false
+	}
+	t.done = true
+	return t.fn, true
+}
+
+func (t *manualTimer) live() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return !t.stopped && !t.done
 }
 
 type fixture struct {
@@ -109,7 +171,7 @@ func (f *fixture) start(roomID, memberID string, trackID uuid.UUID, positionMs, 
 
 func (f *fixture) ended(roomID, memberID string, trackID uuid.UUID) *Snapshot {
 	f.t.Helper()
-	snapshot, err := f.m.Ended(roomID, memberID, trackID)
+	snapshot, err := f.m.Ended(roomID, memberID, "", trackID)
 	if err != nil {
 		f.t.Fatalf("ended: %v", err)
 	}
@@ -303,6 +365,93 @@ func TestHostStartsAdvancesAndIgnoresStrays(t *testing.T) {
 	snap = f.ended(room.ID, host.ID, second.ID)
 	if snap.Current != nil {
 		t.Fatalf("idle room still has a current: %+v", snap.Current)
+	}
+}
+
+func TestTheRoomsOwnClockEndsTheSong(t *testing.T) {
+	f := newFixture(t, nil)
+	host := guest("host-1")
+	room := f.create("party", ControlsEveryone, "", host)
+	first := f.track("first", 30_000)
+	second := f.track("second", 30_000)
+	f.enqueue(room.ID, host.ID, first.ID, second.ID)
+	f.start(room.ID, host.ID, first.ID, 0, 30_000)
+
+	// Nobody reports the end - the host's word never arrives. The room's own
+	// clock carries it: the position the page shows reaching the length the page
+	// shows is the song being over.
+	f.clock.Advance(29 * time.Second)
+	if got := f.get(room.ID).Current.Item.TrackID; got != first.ID {
+		t.Fatalf("the room moved on before the song was over")
+	}
+	f.clock.Advance(2 * time.Second)
+	snap := f.get(room.ID)
+	if snap.Current == nil || snap.Current.Item.TrackID != second.ID || snap.Current.Started {
+		t.Fatalf("the room did not end the song on its own clock: %+v", snap.Current)
+	}
+	if queue := snap.Queues[host.ID]; len(queue) != 1 || queue[0].TrackID != second.ID {
+		t.Fatalf("the played song was not dropped: %+v", queue)
+	}
+
+	// The next song is nobody's until the host begins it: its own clock cannot
+	// end a song that never started.
+	f.clock.Advance(5 * time.Minute)
+	if got := f.get(room.ID).Current.Item.TrackID; got != second.ID {
+		t.Fatalf("a song that never started ended by itself")
+	}
+}
+
+func TestAPausedRoomDoesNotRunOut(t *testing.T) {
+	f := newFixture(t, nil)
+	host := guest("host-1")
+	room := f.create("party", ControlsEveryone, "", host)
+	song := f.track("song", 30_000)
+	f.enqueue(room.ID, host.ID, song.ID)
+	f.start(room.ID, host.ID, song.ID, 0, 30_000)
+	f.clock.Advance(5 * time.Second)
+	if _, err := f.m.Pause(room.ID, host.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	f.clock.Advance(10 * time.Minute)
+	snap := f.get(room.ID)
+	if snap.Current == nil || !snap.Current.Paused || snap.Current.PositionMs != 5000 {
+		t.Fatalf("a paused room moved: %+v", snap.Current)
+	}
+
+	// Resuming aims at the end again, from where it had got to.
+	if _, err := f.m.Resume(room.ID, host.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Advance(26 * time.Second)
+	if snap := f.get(room.ID); snap.Current != nil {
+		t.Fatalf("the room did not end the resumed song: %+v", snap.Current)
+	}
+}
+
+func TestALateEndDoesNotSkipTheSameSongQueuedTwice(t *testing.T) {
+	f := newFixture(t, nil)
+	host := guest("host-1")
+	room := f.create("party", ControlsEveryone, "", host)
+	song := f.track("song", 30_000)
+	f.enqueue(room.ID, host.ID, song.ID, song.ID)
+
+	first := f.get(room.ID).Current.Item.ID
+	f.start(room.ID, host.ID, song.ID, 0, 30_000)
+	// The room's own clock ends the first copy and puts the second one up.
+	f.clock.Advance(31 * time.Second)
+	second := f.get(room.ID)
+	if second.Current == nil || second.Current.Item.ID == first {
+		t.Fatalf("the second copy is not the one on: %+v", second.Current)
+	}
+
+	// The host's late word names the copy that is already past. The track alone
+	// would match the copy that is on and cut it; the entry does not.
+	if _, err := f.m.Ended(room.ID, host.ID, first, song.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.get(room.ID).Current.Item.ID; got != second.Current.Item.ID {
+		t.Fatalf("a late end skipped the second copy of the same song")
 	}
 }
 
