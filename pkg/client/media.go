@@ -413,12 +413,34 @@ func (p *Participant) play(ctx context.Context, local *localPlayback, current *R
 		}
 		// This client's file has played out. The host's file running out is
 		// what moves the room on; anybody else's just goes quiet.
-		if isHost {
+		//
+		// A player that stops on its own is only a song ending when it stopped
+		// at the song's end: an end-file event left over from the file before
+		// this one stops the wait a moment after a load, and reporting that
+		// would cut the song for everybody.
+		if isHost && p.playedToTheEnd(ctx, slot) {
 			if _, err := p.room.Ended(ctx, item.TrackID); err != nil {
 				p.logger.Warn("participant: report end", "error", err)
 			}
 		}
 	}()
+}
+
+// playedToTheEnd reports whether the file really ran out: a slot whose length
+// is known must have been played to (near) it, not merely stopped.
+func (p *Participant) playedToTheEnd(ctx context.Context, slot SinkTrack) bool {
+	if slot.DurationMs <= 0 {
+		return true
+	}
+	positioner, ok := p.sink.(Positioner)
+	if !ok {
+		return true
+	}
+	position, err := positioner.PositionMs(ctx)
+	if err != nil {
+		return true
+	}
+	return position >= slot.DurationMs-1000
 }
 
 // correctDrift nudges the sink back onto the room's position.
