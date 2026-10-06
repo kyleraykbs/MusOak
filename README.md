@@ -55,10 +55,10 @@ track; the provider ranking decides which variant is played.
 
 Listen Together details worth knowing before you rely on it:
 
-* The host's player is the room's clock. The room holds a song at zero until
-  the host's player says it has begun it (`/started`), and the host's file
-  running out (`/ended`) is what moves the room on. There is no readiness gate:
-  a member plays what it can play.
+* The host's player starts the song and reports its file length. The room's
+  position clock advances against that length and moves on when they meet; the
+  host's `/ended` report may move it on sooner. There is no readiness gate: each
+  member plays the version it can.
 * Everybody else follows one rule. A different song is loaded; the same song
   within two seconds of the room's position is left alone; the same song
   further out is seeked. Each member plays the version it likes, and a song

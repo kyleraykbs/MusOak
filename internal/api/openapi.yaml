@@ -3109,7 +3109,7 @@ components:
         durationMs:
           type: integer
           format: int64
-          description: The host's file length, for display; nothing ends at it.
+          description: The host's file length; the room's clock moves on when it reaches this.
         votes:
           type: object
           additionalProperties: { type: integer }

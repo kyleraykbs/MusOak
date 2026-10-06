@@ -166,10 +166,15 @@
 - Why: state a client can compute is state that can arrive stale. The derivation is only sound if both sides apply the same two transitions, which is why the splice is a contract and not an optimisation. Events also carry a per-room `seq` now: the bus drops events for a client that cannot keep up, and a gap in the counter is what tells it to refetch the snapshot.
 - Reversible: yes
 
+## [2026-10-05] The room's clock ends a song when it reaches the host's length
+- Decision: the position/length shown in the room is the end metric. On start, resume and seek the server arms an end timer for `durationMs - positionMs + 250ms`; pause disarms it. The host's `/ended` is an early report, not the sole way to advance. End reports name the queue entry as well as the track, so an old end for one copy cannot skip a later copy of the same song. Votes still score 1–5, persist, and the existing threshold rule advances the room.
+- Why: the host's player remains the clock, but waiting only on its `ended` event left the room sitting at `2:30 / 2:30` when the report was lost or the player stalled. The displayed clock already had the exact answer; letting the server act on it removes the dead-air window and makes the host report a fast path rather than a single point of failure.
+- Also: the timer is armed only after the host starts the song; an unstarted song and a paused song do not run out. The timer and a host report race safely because either one removes the current entry and the other can only name that now-stale entry.
+- Reversible: yes
+
 ## [2026-10-05] Votes score a song and can skip it; nothing else waits on anybody
-- Decision: 1–5 per member per song, mean on screen, persisted for stats, and the existing threshold rule (`skipThreshold`, `minVotersForSkip`, `voterFractionForSkip`) still advances the room. No server-side advance timer: the host's file running out is what ends a song, and a host who disconnects is promoted away from by the existing leave grace.
-- Why: the timer existed to end songs nobody's file could end. With the host's file as the clock there is no such song, and a timer is one more thing that can disagree with the player everybody is hearing.
-- Also: the room's `durationMs` is the host's file length, for display only — nothing is cut at it.
+- Decision: 1–5 per member per song, mean on screen, persisted for stats, and the existing threshold rule (`skipThreshold`, `minVotersForSkip`, `voterFractionForSkip`) still advances the room.
+- Why: scoring and vote-to-skip were explicitly kept; neither asks a client to agree on a rendition or a timeline.
 - Reversible: yes
 
 ## [2026-10-05] Four live browser checks found four bugs the unit tests could not
