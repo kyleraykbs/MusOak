@@ -181,3 +181,9 @@
 - Decision: the rebuild was verified in two real browsers (a host tab and a follower tab, separate profiles) against a real server, and the four bugs that turned up there were fixed and pinned with tests: the clock-sync pong's stamps are top-level fields (reading them from `data` gave every client a garbage offset); a load never seeks to position zero (so a file this client already held at its end played out instantly); the follower's "my file is over, wait" guard paused the *host's* file a hair before its natural end (so the room never heard it end); and a re-queued song whose copy this client still held played out instead of starting again.
 - Why: each one is invisible to a reducer test and fatal in a browser. The rule they share: the room's behaviour lives in what the elements do, so the check has to be a real element.
 - Reversible: yes
+## [2026-10-06] The host's mixed queue is the sole natural progression source
+- Decision: the host plays the room's generated mixed queue as its ordinary queue. `POST /sync` reports the current queue item, position, duration and pause state on player changes and once per second; the server timestamps and broadcasts it but never advances on a duration timer. Followers load a different track and seek the same track only beyond two seconds of drift.
+- Why: separate room start/end endpoints and a server end timer created competing progression authorities. The host's actual queue already knows when to advance; mirroring that state keeps playlist-style playback simple and makes room playback the same mechanism.
+- Also: mixed per-member queues, member identity/board, invites, votes and explicit room controls remain. Readiness endpoints and unused readiness state are removed.
+- Reversible: no; both web playback and the Go participant use the sync contract.
+

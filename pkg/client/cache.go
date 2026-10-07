@@ -16,10 +16,7 @@ import (
 
 // Cache is the client-side media cache. It keeps renditions on disk, remembers
 // what it has in an index file, and never downloads the same variant twice.
-//
-// A client that already holds a rendition of a track reports that local copy
-// to the room, so joining a listen-together does not re-download what is
-// already on disk.
+// Each room member uses its own cached or downloaded rendition.
 type Cache struct {
 	dir string
 

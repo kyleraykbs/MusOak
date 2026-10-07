@@ -1,9 +1,9 @@
 // Package client is the public Go SDK for MusOak.
 //
 // Everything the server does is an API call, so the CLI, a Discord bot or any
-// other tool is a plain client: authenticate, search, make media ready, queue
-// it in a room and follow that room's timeline. Nothing here reaches into
-// server internals.
+// other tool is a plain client: authenticate, search, prepare media, queue it
+// in a room and follow the host's playback state. Nothing reaches into server
+// internals.
 package client
 
 import (

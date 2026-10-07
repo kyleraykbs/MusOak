@@ -51,26 +51,16 @@ type voteRequest struct {
 	Score int `json:"score"`
 }
 
-// startedRequest is the host's player saying it has begun the room's song, and
-// where in it. The room's clock is put where their file is, so every follower
-// starts from the same place; until it arrives the song waits at zero.
-type startedRequest struct {
-	TrackID string `json:"trackId"`
-	// PositionMs is where the host's file is, normally zero.
-	PositionMs int64 `json:"positionMs"`
-	// DurationMs is the host's file length, shown next to the position. It ends
-	// nothing: the host's file running out is what ends the song.
-	DurationMs int64 `json:"durationMs"`
-}
-
-// endedRequest names the song whose file has run out. A late report names a
-// song the room has already moved past, and the room ignores it - an end must
-// never cut the song that is playing now. The entry (that queue item) is the
-// better name when the client knows it: the same track queued twice is two
-// entries, and only one of them is the one playing.
-type endedRequest struct {
-	TrackID string `json:"trackId"`
-	ItemID  string `json:"itemId"`
+// roomSyncRequest is the host's current queue entry and player state. The host
+// sends it on changes and once per second; the server timestamps it and
+// broadcasts it to the room.
+type roomSyncRequest struct {
+	ItemID     string `json:"itemId"`
+	TrackID    string `json:"trackId"`
+	PositionMs int64  `json:"positionMs"`
+	DurationMs int64  `json:"durationMs"`
+	Started    bool   `json:"started"`
+	Paused     bool   `json:"paused"`
 }
 
 // callerMember builds the member identity for a room command. Authenticated
@@ -337,41 +327,16 @@ func (s *Server) handleRoomVote(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, room)
 }
 
-// handleRoomStarted is the host's player saying the song is playing, and where.
-// It is the one thing that starts the room's clock; only the host may send it.
-func (s *Server) handleRoomStarted(w http.ResponseWriter, r *http.Request) {
+// handleRoomSync accepts the host's latest queue entry, position and pause
+// state; it timestamps and broadcasts that state to every follower.
+func (s *Server) handleRoomSync(w http.ResponseWriter, r *http.Request) {
 	member, ok := s.callerMember(r, false)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "member identity required")
 		return
 	}
-	var req startedRequest
+	var req roomSyncRequest
 	if !decodeJSON(w, r, &req) {
-		return
-	}
-	trackID, err := uuid.Parse(req.TrackID)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid trackId")
-		return
-	}
-	room, err := s.rooms.Started(r.PathValue("roomId"), member.ID, trackID, req.PositionMs, req.DurationMs)
-	if err != nil {
-		writeRoomError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, room)
-}
-
-// handleRoomEnded is the host saying its file has run out: the room moves on
-// from the host's end, which is the only end the room knows.
-func (s *Server) handleRoomEnded(w http.ResponseWriter, r *http.Request) {
-	member, ok := s.callerMember(r, false)
-	if !ok {
-		writeError(w, http.StatusBadRequest, "member identity required")
-		return
-	}
-	var req endedRequest
-	if r.ContentLength > 0 && !decodeJSON(w, r, &req) {
 		return
 	}
 	trackID := uuid.Nil
@@ -383,12 +348,15 @@ func (s *Server) handleRoomEnded(w http.ResponseWriter, r *http.Request) {
 		}
 		trackID = parsed
 	}
-	room, err := s.rooms.Ended(r.PathValue("roomId"), member.ID, req.ItemID, trackID)
+	err := s.rooms.Sync(r.PathValue("roomId"), member.ID, rooms.SyncState{
+		ItemID: req.ItemID, TrackID: trackID, PositionMs: req.PositionMs,
+		DurationMs: req.DurationMs, Started: req.Started, Paused: req.Paused,
+	})
 	if err != nil {
 		writeRoomError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, room)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleClock reports the server clock; clients measure their offset from it

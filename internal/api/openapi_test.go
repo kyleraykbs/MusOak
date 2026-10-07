@@ -110,8 +110,7 @@ func TestDocumentedEndpointsExist(t *testing.T) {
 		"/api/v1/rooms",
 		"/api/v1/rooms/{roomId}/join",
 		"/api/v1/rooms/{roomId}/vote",
-		"/api/v1/rooms/{roomId}/started",
-		"/api/v1/rooms/{roomId}/ended",
+		"/api/v1/rooms/{roomId}/sync",
 	} {
 		if doc.Paths.Find(path) == nil {
 			t.Errorf("the specification is missing %s", path)

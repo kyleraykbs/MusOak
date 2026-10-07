@@ -90,6 +90,76 @@ func TestRoomPasswordOverHTTP(t *testing.T) {
 	}
 }
 
+func TestRoomSyncDrivesCurrentPlaybackOverHTTP(t *testing.T) {
+	c := newHTTPTestServer(t, nil)
+	alice := c.register("alice", "hunter2hunter2")
+	bob := c.register("bob", "hunter2hunter2")
+	createdRec := c.do(http.MethodPost, "/api/v1/rooms", alice, map[string]string{"name": "party", "controls": "everyone"})
+	var created roomResponse
+	c.decode(createdRec, &created)
+	roomID := created.Room.ID
+	if joined := c.do(http.MethodPost, "/api/v1/rooms/"+roomID+"/join", bob, nil); joined.Code != http.StatusOK {
+		t.Fatalf("join: %d %s", joined.Code, joined.Body.String())
+	}
+	first := &store.Track{Title: "first", DurationMs: 60_000}
+	second := &store.Track{Title: "second", DurationMs: 60_000}
+	for _, track := range []*store.Track{first, second} {
+		if err := c.store.CreateTrack(context.Background(), track); err != nil {
+			t.Fatal(err)
+		}
+	}
+	queued := c.do(http.MethodPost, "/api/v1/rooms/"+roomID+"/queue", alice,
+		map[string][]string{"trackIds": {first.ID.String(), second.ID.String()}})
+	if queued.Code != http.StatusOK {
+		t.Fatalf("queue: %d %s", queued.Code, queued.Body.String())
+	}
+	get := func() rooms.Snapshot {
+		t.Helper()
+		rec := c.do(http.MethodGet, "/api/v1/rooms/"+roomID, "", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("get: %d %s", rec.Code, rec.Body.String())
+		}
+		var room rooms.Snapshot
+		c.decode(rec, &room)
+		return room
+	}
+	state := get()
+	firstItem := state.MasterQueue[0]
+
+	body := map[string]any{
+		"itemId": firstItem.ID, "trackId": first.ID.String(), "positionMs": int64(4200),
+		"durationMs": int64(59000), "started": true, "paused": false,
+	}
+	if follower := c.do(http.MethodPost, "/api/v1/rooms/"+roomID+"/sync", bob, body); follower.Code != http.StatusForbidden {
+		t.Fatalf("follower sync: %d %s", follower.Code, follower.Body.String())
+	}
+	if host := c.do(http.MethodPost, "/api/v1/rooms/"+roomID+"/sync", alice, body); host.Code != http.StatusNoContent {
+		t.Fatalf("host sync: %d %s", host.Code, host.Body.String())
+	}
+	state = get()
+	if state.Current == nil || state.Current.Item.ID != firstItem.ID || !state.Current.Started || state.Current.PositionMs != 4200 {
+		t.Fatalf("host state = %+v", state.Current)
+	}
+
+	secondItem := state.MasterQueue[1]
+	next := map[string]any{"itemId": secondItem.ID, "trackId": second.ID.String(), "positionMs": int64(0), "durationMs": int64(60000), "started": false, "paused": true}
+	if host := c.do(http.MethodPost, "/api/v1/rooms/"+roomID+"/sync", alice, next); host.Code != http.StatusNoContent {
+		t.Fatalf("advance sync: %d %s", host.Code, host.Body.String())
+	}
+	state = get()
+	if state.Current == nil || state.Current.Item.ID != secondItem.ID || state.Current.Started || !state.Current.Paused {
+		t.Fatalf("advanced state = %+v", state.Current)
+	}
+
+	idle := map[string]any{"itemId": "", "positionMs": int64(0), "started": false, "paused": true}
+	if host := c.do(http.MethodPost, "/api/v1/rooms/"+roomID+"/sync", alice, idle); host.Code != http.StatusNoContent {
+		t.Fatalf("idle sync: %d %s", host.Code, host.Body.String())
+	}
+	if state = get(); state.Current != nil || len(state.MasterQueue) != 0 {
+		t.Fatalf("idle room = %+v", state)
+	}
+}
+
 // TestQueueAddIsCapped: the room lock is held across an add, so the handler
 // refuses more than it will carry in one go - and a refused batch queues
 // nothing. The SDK splits longer runs at the same number, so the two must

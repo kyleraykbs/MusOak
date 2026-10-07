@@ -44,7 +44,7 @@ match/             ISRC and title/artist/album/duration scoring -> canonical tra
 media/             download (singleflight, retries) -> ffmpeg -> sha256 -> media/<variant>.opus
      |              local imports, quota + LRU eviction, Range serving with ETag
      v
-rooms/             the room owns the timeline; clients follow startedAt
+rooms/             per-member queues, mixed play order, host-sampled playback state
 api/               REST + WebSocket, auth, ranking, rate limits
 pkg/client         the public Go SDK: the CLI and any bot are clients of it
 ```
@@ -55,16 +55,15 @@ track; the provider ranking decides which variant is played.
 
 Listen Together details worth knowing before you rely on it:
 
-* The host's player starts the song and reports its file length. The room's
-  position clock advances against that length and moves on when they meet; the
-  host's `/ended` report may move it on sooner. There is no readiness gate: each
-  member plays the version it can.
-* Everybody else follows one rule. A different song is loaded; the same song
-  within two seconds of the room's position is left alone; the same song
-  further out is seeked. Each member plays the version it likes, and a song
-  ending slightly early or late for one of them is fine.
-* Clients ping the server to estimate their clock offset (NTP-style, lowest
-  round trip wins), which is the clock the room's position is expressed in.
+* The host plays the room's mixed queue in its ordinary player. Its current
+  queue item, position and pause state are reported on `/sync` when they change
+  and once per second; the host player advances naturally to the next song.
+* Everyone else follows one rule: a different song is loaded; the same song
+  within two seconds of the room's position is left alone; a larger drift is
+  corrected with a seek. Each member plays the version it can, so a shorter
+  local file may end before the host's and stay silent until the room moves on.
+* The server timestamps the host's position; clients estimate the server clock
+  offset from WebSocket pings. The room does not advance on a server-side timer.
 * Votes are 1 (bad) to 5 (great), one per member per track, changeable while the
   track plays. A skip fires when enough members have voted
   (`minVotersForSkip`), they are enough of the room (`voterFractionForSkip`) and
@@ -302,15 +301,14 @@ how to stay in sync — is `client.Participant`.
 
 ```go
 type Sink interface {
-    // Play starts track and returns when this client's own file has played
-    // out (not when the room's slot ends). Play ctx cancellation = stop.
+    // Play starts this client's file and returns when it ends or ctx is canceled.
     Play(ctx context.Context, track client.SinkTrack) error
     Stop(ctx context.Context) error
 }
 // Optional capabilities the participant uses when available:
-type Pauser  interface{ Pause(ctx) error; Resume(ctx) error }
-type Seeker  interface{ Seek(ctx, positionMs int64) error }
-type Positioner interface{ PositionMs(ctx) (int64, error) } // enables drift correction
+type Pauser   interface{ Pause(ctx) error; Resume(ctx) error }
+type Seeker   interface{ Seek(ctx, positionMs int64) error }
+type Positioner interface{ PositionMs(ctx) (int64, error) }
 ```
 
 A bot looks like this:
@@ -320,20 +318,18 @@ c := client.New(serverURL, client.WithToken(token))
 room, err := c.JoinRoom(ctx, roomID)
 cache, err := client.OpenCache("/var/lib/bot/cache")
 participant := client.NewParticipant(room, cache, myVoiceSink, logger)
-err = participant.Run(ctx)     // downloads, reports ready, follows the timeline
+err = participant.Run(ctx) // host advances the mixed queue; followers sync to it
 ```
 
-What the participant does for you, so a sink does not have to: it syncs the
-clock, downloads the rendition the server assigned (or reuses a local copy it
-already has, reporting that variant's real duration), reports readiness, starts
-playback at the room's `startedAt`, pads silence when its own file is shorter
-than the timeline, corrects drift with small seeks, and forwards pause/resume/
-seek/skip.
+The participant downloads a locally playable rendition, syncs the host's
+current queue item and position, and keeps followers within two seconds of the
+room position. A host advances its mixed queue when its file ends; a follower
+whose local file ends early waits for the next room item. Pause, seek, skip and
+vote commands remain room operations.
 
 Your sink only has to answer "play this file from this position" and "where are
-you now". `SinkTrack.OffsetMs` is reserved for per-variant alignment (different
-masters have different intros) and is always zero today. Discord voice needs its
-own library and a process outside this repository; the boundary is
+you now". Discord voice needs its own library and a process outside this
+repository; the boundary is
 `pkg/client`.
 
 ## Testing it yourself
@@ -376,9 +372,9 @@ repository.
 
 ## Known limits
 
-* **Timeline alignment**: platform renditions can differ by an intro even when
-  their lengths match; only length differences are handled today (see
-  `SinkTrack.OffsetMs`).
+* **Rendition alignment**: members may play different masters of the same track.
+  Room sync compares track identity and playhead position; it does not offset
+  different intros within versions of one canonical track.
 * **yt-dlp** breaks periodically; it is a runtime dependency, wrapped by the Nix
   packages so updating it is a one-line change.
 * **Spotify** needs application credentials and is metadata-only by design.

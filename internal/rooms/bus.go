@@ -1,17 +1,13 @@
-// Package rooms implements Listen Together in the simplest shape that works:
-// the host's player is the clock, and every other client follows it.
+// Package rooms implements Listen Together around a simple contract: each
+// member has a queue, the room mixes those queues, and the host's ordinary
+// player drives the mixed order.
 //
-// The room owns one queue per member (mixed round-robin into a play order) and
-// one current track. The current track starts when the host's player says it
-// started, advances when the host's file runs out — or a skip or a vote says
-// so — and moves under pause/seek as commands against the same anchor. Clients
-// keep time with arithmetic: while running, position = anchor + (now - at).
+// The host reports its current queue item, position and pause state on `/sync`.
+// The server timestamps that state and broadcasts it; it does not run its own
+// song-end timer. Votes and explicit transport commands may still skip a song.
 //
-// A follower does exactly two things: if the room's track is not the track it
-// is playing, it loads that track; if it is, it stays within two seconds of
-// where the room says it should be, seeking when it is not. The host runs the
-// same loop and adds two reports — /started when its player begins a track,
-// /ended when its file runs out — because the host is what the room follows.
+// Followers load a different song and seek the same song only when drift is
+// greater than two seconds.
 package rooms
 
 import (
@@ -22,9 +18,7 @@ import (
 // EventType identifies a room event.
 type EventType string
 
-// Room events. Clients follow the server, so every state change is announced.
-// There are six: membership, who leads, one member's queue, the whole
-// playback state (votes included), and the room going away.
+// Room events. Clients follow the room, so every state change is announced.
 const (
 	EventMemberJoined EventType = "member_joined"
 	EventMemberLeft   EventType = "member_left"
@@ -106,20 +100,11 @@ func (b *Bus) Publish(e Event) {
 	}
 }
 
-// Clock abstracts time: it stamps state, and it is what arms the moment a song
-// ends so a test can hold the room's own clock still and move it by hand.
+// Clock stamps room syncs and is replaceable in tests.
 type Clock interface {
 	Now() time.Time
-	AfterFunc(d time.Duration, f func()) Timer
-}
-
-// Timer is the subset of time.Timer rooms use.
-type Timer interface {
-	Stop() bool
 }
 
 type realClock struct{}
 
 func (realClock) Now() time.Time { return time.Now() }
-
-func (realClock) AfterFunc(d time.Duration, f func()) Timer { return time.AfterFunc(d, f) }

@@ -29,9 +29,9 @@ type QueueItem struct {
 	ArtistIDs  []string `json:"artistIds,omitempty"`
 }
 
-// RoomPlayback is the current song and where the room is in it. PositionMs is
-// the position at AtMs on the server clock: while Started is true and Paused
-// is false, the room is at PositionMs + (serverNow - AtMs).
+// RoomPlayback is the current song and where the host last said it was. The
+// host sends this state on changes and once a second; PositionMs is at AtMs on
+// the server clock, so clients can extrapolate between updates.
 type RoomPlayback struct {
 	Item       QueueItem      `json:"item"`
 	PositionMs int64          `json:"positionMs"`
@@ -43,7 +43,7 @@ type RoomPlayback struct {
 	MeanScore  float64        `json:"meanScore"`
 }
 
-// PositionAt is where the room is at the given server time.
+// PositionAt is where the room should be at serverNowMs.
 func (p *RoomPlayback) PositionAt(serverNowMs int64) int64 {
 	if p == nil {
 		return 0
@@ -51,7 +51,7 @@ func (p *RoomPlayback) PositionAt(serverNowMs int64) int64 {
 	if !p.Started || p.Paused {
 		return p.PositionMs
 	}
-	position := p.PositionMs + (serverNowMs - p.AtMs)
+	position := p.PositionMs + serverNowMs - p.AtMs
 	if position < 0 {
 		return 0
 	}
@@ -65,7 +65,6 @@ type RoomSkipRules struct {
 	VoterFractionForSkip float64 `json:"voterFractionForSkip"`
 }
 
-// Room is a Listen Together room.
 type Room struct {
 	ID          string                 `json:"id"`
 	Name        string                 `json:"name"`
@@ -253,32 +252,20 @@ func (r *RoomClient) Vote(ctx context.Context, score int) (*Room, error) {
 	return &out, nil
 }
 
-// Started is the host's player saying it has begun the room's song, and where.
-// The room's clock is put at positionMs on the host's file, and durationMs is
-// shown next to it. Only the host's report counts; anyone else's is ignored.
-func (r *RoomClient) Started(ctx context.Context, trackID string, positionMs, durationMs int64) (*Room, error) {
-	var out Room
-	body := map[string]any{"trackId": trackID, "positionMs": positionMs, "durationMs": durationMs}
-	if err := r.client.do(ctx, http.MethodPost, r.path("/started"), body, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+// RoomSync is the host's queue player state sent immediately on changes and
+// once per second. ItemID distinguishes two queued copies of the same track.
+type RoomSync struct {
+	ItemID     string `json:"itemId"`
+	TrackID    string `json:"trackId"`
+	PositionMs int64  `json:"positionMs"`
+	DurationMs int64  `json:"durationMs"`
+	Started    bool   `json:"started"`
+	Paused     bool   `json:"paused"`
 }
 
-// Ended is the host's player saying its file has run out: the room drops that
-// song and puts up the next one. Only the host's report counts. The entry (that
-// queue item) names it best - the same track queued twice is two entries, and
-// only one of them is playing - so it is sent beside the track.
-func (r *RoomClient) Ended(ctx context.Context, itemID, trackID string) (*Room, error) {
-	var out Room
-	body := map[string]string{"trackId": trackID}
-	if itemID != "" {
-		body["itemId"] = itemID
-	}
-	if err := r.client.do(ctx, http.MethodPost, r.path("/ended"), body, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+// Sync reports the host's current song and player position to the room.
+func (r *RoomClient) Sync(ctx context.Context, sync RoomSync) error {
+	return r.client.do(ctx, http.MethodPost, r.path("/sync"), sync, nil)
 }
 
 // Leave removes this member from the room.

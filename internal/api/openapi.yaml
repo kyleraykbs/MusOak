@@ -13,9 +13,8 @@ info:
       it never starts a download. Ask for one with
       `POST /api/v1/media/{variantId}/download` first.
     * Room commands are REST calls; room state changes arrive on
-      `GET /api/v1/ws` as events. The host's player is the room's clock: it
-      reports where the song is (`/started`) and when its file runs out
-      (`/ended`), and every other client follows the room position.
+      `GET /api/v1/ws` as events. The host reports its mixed-queue player state
+      through `/sync`; every other client follows that position.
 servers:
   - url: /
     description: the same host and port this document came from
@@ -2309,23 +2308,16 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
-  /api/v1/rooms/{roomId}/ended:
+  /api/v1/rooms/{roomId}/sync:
     post:
       tags: [rooms]
-      summary: The host's file for the current song has run out
+      summary: Report the host's current queue player state
       description: |
-        The host's player is the room's clock, so its file running out is the
-        song reaching its end: the room drops the played song and puts up the
-        next one from the mix. Only the host may report this, and only for the
-        song the room is on - an end that arrives late names a song the room
-        has already moved past and is ignored, so that it cannot cut the song
-        playing now.
-
-        This is the early word, not the only one: the room also ends a song on
-        its own clock — the position it reports reaching the length it reports,
-        the same numbers a client shows — so a report that never arrives costs
-        nothing.
-      operationId: reportTrackEnded
+        The host reports its current mixed-queue entry, position and pause
+        state when they change and once per second. The server timestamps the
+        position and broadcasts it to the room. Send an empty `itemId` when
+        the host queue has no current song. Only the host may report state.
+      operationId: syncRoomPlayback
       parameters: [{ $ref: "#/components/parameters/RoomID" }]
       requestBody:
         required: true
@@ -2333,23 +2325,24 @@ paths:
           application/json:
             schema:
               type: object
-              required: [trackId]
+              required: [itemId, positionMs, started, paused]
               properties:
+                itemId:
+                  type: string
+                  description: The room queue entry, empty when idle.
                 trackId:
                   type: string
                   format: uuid
-                  description: The song the host's file has finished.
-                itemId:
-                  type: string
-                  description: |
-                    The queue entry that was playing. A report that names it is
-                    matched by entry, which the track alone cannot do: the same
-                    song queued twice is two entries and only one of them is on.
+                  description: The canonical track for the queue entry.
+                positionMs: { type: integer, format: int64, minimum: 0 }
+                durationMs: { type: integer, format: int64, minimum: 0 }
+                started: { type: boolean }
+                paused: { type: boolean }
       responses:
-        "200": { $ref: "#/components/responses/RoomState" }
+        "204": { description: The host state was accepted. }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-
   /api/v1/rooms/{roomId}/seek:
     post:
       tags: [rooms]
@@ -2396,45 +2389,6 @@ paths:
 
 
 
-
-  /api/v1/rooms/{roomId}/started:
-    post:
-      tags: [rooms]
-      summary: The host's player has begun the song
-      description: |
-        The room holds a song at zero until the host's player says it has begun
-        it: this is that word, and it is what starts the room's clock. The room
-        is put at `positionMs` on the host's file, and `durationMs` (the host's
-        file length) is shown next to the position; nothing ends at it - the
-        host's file running out does (see `/ended`).
-
-        Only the host may report this, and only for the song the room is on;
-        anything else is ignored and the room state is returned unchanged.
-      operationId: reportTrackStarted
-      parameters: [{ $ref: "#/components/parameters/RoomID" }]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [trackId]
-              properties:
-                trackId: { type: string, format: uuid }
-                positionMs:
-                  type: integer
-                  format: int64
-                  minimum: 0
-                  description: Where the host's file is, normally zero.
-                durationMs:
-                  type: integer
-                  format: int64
-                  description: The host's file length, for display.
-      responses:
-        "200": { $ref: "#/components/responses/RoomState" }
-        "400": { $ref: "#/components/responses/BadRequest" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "404": { $ref: "#/components/responses/NotFound" }
 
   /api/v1/ws:
     get:
