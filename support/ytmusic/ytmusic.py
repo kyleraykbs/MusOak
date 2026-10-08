@@ -19,6 +19,32 @@ import sys
 from ytmusicapi import YTMusic
 
 
+def count_of(value):
+    """A size, however the endpoint words it.
+
+    YouTube Music shows a playlist's length the way a page does - "86K",
+    "1.2M", "1,234" - and ytmusicapi hands the display form through untouched
+    whenever it cannot read it as plain digits. A count only decorates a list,
+    so anything unreadable is none of them.
+    """
+    if isinstance(value, bool) or value is None:
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    if not isinstance(value, str):
+        return 0
+    text = value.strip().replace(",", "")
+    if not text:
+        return 0
+    scale = {"k": 1000, "m": 1000000, "b": 1000000000}.get(text[-1].lower(), 1)
+    if scale > 1:
+        text = text[:-1]
+    try:
+        return int(float(text) * scale)
+    except (ValueError, OverflowError):
+        return 0
+
+
 def duration_ms(item):
     """Read a duration from whichever field this endpoint happens to use."""
     if not item:
@@ -110,7 +136,7 @@ def search(yt, kind, query, limit):
                 "title": item.get("title", "") or "",
                 "artists": artists_of(item),
                 "year": str(item.get("year", "") or ""),
-                "trackCount": int(item.get("trackCount") or 0),
+                "trackCount": count_of(item.get("trackCount")),
                 "artworkUrl": artwork_of(item),
             }
             for item in raw
@@ -136,7 +162,7 @@ def album(yt, browse_id):
         "title": raw.get("title", "") or "",
         "artists": artists_of(raw),
         "year": str(raw.get("year", "") or ""),
-        "trackCount": int(raw.get("trackCount") or 0),
+        "trackCount": count_of(raw.get("trackCount")),
         "artworkUrl": artwork_of(raw),
         "tracks": [song(track) for track in (raw.get("tracks") or []) if track.get("videoId")],
     }
@@ -156,7 +182,7 @@ def artist(yt, browse_id):
                     "title": item.get("title", "") or "",
                     "artists": artists_of(item),
                     "year": str(item.get("year", "") or ""),
-                    "trackCount": int(item.get("trackCount") or 0),
+                    "trackCount": count_of(item.get("trackCount")),
                     "artworkUrl": artwork_of(item),
                 }
             )
@@ -179,7 +205,7 @@ def playlists(yt, query, limit):
             "title": item.get("title", "") or "",
             "owner": owner_of(item),
             "description": item.get("description", "") or "",
-            "trackCount": int(item.get("itemCount") or 0),
+            "trackCount": count_of(item.get("itemCount")),
             "artworkUrl": artwork_of(item),
         }
         for item in raw
@@ -196,7 +222,7 @@ def playlist(yt, browse_id):
         "title": raw.get("title", "") or "",
         "owner": owner_of(raw),
         "description": raw.get("description", "") or "",
-        "trackCount": int(raw.get("trackCount") or len(tracks)),
+        "trackCount": count_of(raw.get("trackCount")) or len(tracks),
         "artworkUrl": artwork_of(raw),
         "tracks": tracks,
     }

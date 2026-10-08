@@ -187,3 +187,8 @@
 - Also: mixed per-member queues, member identity/board, invites, votes and explicit room controls remain. Readiness endpoints and unused readiness state are removed.
 - Reversible: no; both web playback and the Go participant use the sync contract.
 
+
+## [2026-10-07] A size is read the way YouTube writes it, and an empty station says which provider failed
+- Decision: every count the ytmusic helper reports goes through `count_of`, which reads "86K", "1.2M" and "1,234" as well as plain digits. The web client's Radio menu names the providers that failed when a station comes back empty, instead of the bare "Nothing came back to build a radio from."
+- Why: ytmusicapi hands a playlist's size through as the display string whenever it cannot read it as digits, and `int("86K")` took the whole helper down - one unreadable count failed playlist search, album search and artist browsing alike (`exit status 1: ... invalid literal for int() with base 10: '86K'`), so a provider that had answered perfectly well was reported as having nothing. A radio that came back empty was the same story from the other end: the server was already sending `providerErrors` explaining itself, and the toast threw them away.
+- Reversible: yes
