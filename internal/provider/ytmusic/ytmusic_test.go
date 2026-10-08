@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -287,5 +288,74 @@ func TestAlbumAndArtistArtwork(t *testing.T) {
 	}
 	if len(found2) != 1 || found2[0].ArtworkURL != "https://yt.example/artist.jpg" {
 		t.Fatalf("artists = %+v", found2)
+	}
+}
+
+// realPython is the interpreter the provider would use, or a skip: the helper
+// tests need it, and the sandbox that builds this module may not have one.
+func realPython(t *testing.T) string {
+	t.Helper()
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 is not on PATH")
+	}
+	return python
+}
+
+// stubYTMusicAPI writes a ytmusicapi module under a directory of its own, so
+// the helper's imports resolve to it without the real package installed.
+func stubYTMusicAPI(t *testing.T, source string) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "ytmusicapi.py"), []byte(source), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// shimPython is a python3 that puts the stub module first on the import path.
+// The provider passes the helper on stdin, so the arguments go through as they
+// are; only PYTHONPATH is added.
+func shimPython(t *testing.T, python, moduleDir string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "python3")
+	script := "#!/bin/sh\nexec env PYTHONPATH=" + moduleDir + " " + python + " \"$@\"\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// YouTube Music sizes a playlist the way its page does: "11K", "1.2M", or plain
+// digits. The helper used to read one with int(), so a single large playlist in
+// the results took the whole command down and the provider reported a failure
+// for a number nothing depends on.
+func TestPlaylistSearchReadsADisplayedCount(t *testing.T) {
+	p := testProvider(t, shimPython(t, realPython(t), stubYTMusicAPI(t, `
+class YTMusic:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def search(self, query, filter=None, limit=None):
+        if filter != "playlists":
+            return []
+        return [
+            {"browseId": "VL11K", "title": "Eleven thousand", "itemCount": "11K"},
+            {"browseId": "VL12M", "title": "A million and change", "itemCount": "1.2M"},
+            {"browseId": "VL1234", "title": "Plain", "itemCount": 1234},
+        ]
+`)))
+
+	hits, err := p.SearchPlaylists(context.Background(), "anything", provider.SearchOpts{Limit: 5})
+	if err != nil {
+		t.Fatalf("a displayed count failed the search: %v", err)
+	}
+	if len(hits) != 3 {
+		t.Fatalf("playlists = %d, want 3", len(hits))
+	}
+	for i, want := range []int{11000, 1200000, 1234} {
+		if hits[i].TrackCount != want {
+			t.Errorf("%s trackCount = %d, want %d", hits[i].Title, hits[i].TrackCount, want)
+		}
 	}
 }

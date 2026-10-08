@@ -68,10 +68,12 @@
               "cmd/musoak"
               "cmd/musoakd"
             ];
-            # The tests render audio fixtures and drive a real mpv.
+            # The tests render audio fixtures and drive a real mpv; python3 runs
+            # the embedded helper, whose parsing a test exercises directly.
             nativeCheckInputs = [
               pkgs.ffmpeg
               pkgs.mpv
+              pkgs.python3
             ];
             checkPhase = ''
               runHook preCheck
