@@ -19,13 +19,16 @@ import sys
 from ytmusicapi import YTMusic
 
 
-def count_of(value):
-    """A size, however the endpoint words it.
+def number(value):
+    """An integer from a field the endpoint filled in, or 0.
 
-    YouTube Music shows a playlist's length the way a page does - "86K",
-    "1.2M", "1,234" - and ytmusicapi hands the display form through untouched
-    whenever it cannot read it as plain digits. A count only decorates a list,
-    so anything unreadable is none of them.
+    The endpoints are not consistent about types: a size arrives as "86K", a
+    thumbnail dimension as "1280px", a length sometimes as a number and
+    sometimes as a string, and the display form leaks through wherever
+    ytmusicapi could not read it as digits. Nothing here is worth failing a
+    search over - a song that plays with no duration shown beats a provider
+    reported as broken - so every read of an endpoint's number goes through
+    this, and anything unreadable is zero.
     """
     if isinstance(value, bool) or value is None:
         return 0
@@ -33,16 +36,29 @@ def count_of(value):
         return int(value)
     if not isinstance(value, str):
         return 0
-    text = value.strip().replace(",", "")
-    if not text:
-        return 0
-    scale = {"k": 1000, "m": 1000000, "b": 1000000000}.get(text[-1].lower(), 1)
-    if scale > 1:
-        text = text[:-1]
     try:
-        return int(float(text) * scale)
+        return int(float(value.strip()))
     except (ValueError, OverflowError):
         return 0
+
+
+def count_of(value):
+    """A size, however the endpoint words it.
+
+    A count only decorates a list, so an unreadable one is none of them: this
+    is `number` with the page's own suffixes understood.
+    """
+    if isinstance(value, str):
+        text = value.strip().replace(",", "")
+        if text:
+            scale = {"k": 1000, "m": 1000000, "b": 1000000000}.get(text[-1].lower(), 1)
+            if scale > 1:
+                text = text[:-1]
+            try:
+                return int(float(text) * scale)
+            except (ValueError, OverflowError):
+                return 0
+    return number(value)
 
 
 def duration_ms(item):
@@ -51,19 +67,25 @@ def duration_ms(item):
         return 0
     seconds = item.get("duration_seconds")
     if seconds:
-        return int(seconds * 1000)
+        # A length in seconds is the one place a fraction is real - 245.6
+        # seconds is 245600 ms - so it is not read as a whole number, and a
+        # length nobody can read is none rather than a guess.
+        try:
+            return int(float(seconds) * 1000)
+        except (TypeError, ValueError, OverflowError):
+            return 0
     for key in ("duration", "length"):
         raw = item.get(key)
         if not raw or not isinstance(raw, str):
             continue
         parts = raw.strip().split(":")
         try:
-            numbers = [int(p) for p in parts]
+            numbers = [int(p.strip()) for p in parts]
         except ValueError:
             continue
         total = 0
-        for number in numbers:
-            total = total * 60 + number
+        for part in numbers:
+            total = total * 60 + part
         return total * 1000
     return 0
 
@@ -79,7 +101,7 @@ def artwork_of(item):
             url = image.get("url") or ""
             if not url:
                 continue
-            area = int(image.get("width") or 0) * int(image.get("height") or 0)
+            area = number(image.get("width")) * number(image.get("height"))
             if area >= best_area:
                 best, best_area = url, area
     return best
@@ -237,7 +259,7 @@ def main(argv):
     if command == "search":
         if len(argv) < 4:
             raise SystemExit("usage: search <songs|albums|artists> QUERY [LIMIT]")
-        limit = int(argv[4]) if len(argv) > 4 else 20
+        limit = number(argv[4]) if len(argv) > 4 else 20
         result = search(yt, argv[2], argv[3], limit)
     elif command == "album":
         if len(argv) < 3:
@@ -250,12 +272,12 @@ def main(argv):
     elif command == "radio":
         if len(argv) < 3:
             raise SystemExit("usage: radio VIDEO_ID [LIMIT]")
-        limit = int(argv[3]) if len(argv) > 3 else 25
+        limit = number(argv[3]) if len(argv) > 3 else 25
         result = radio(yt, argv[2], limit)
     elif command == "playlists":
         if len(argv) < 3:
             raise SystemExit("usage: playlists QUERY [LIMIT]")
-        limit = int(argv[3]) if len(argv) > 3 else 20
+        limit = number(argv[3]) if len(argv) > 3 else 20
         result = playlists(yt, argv[2], limit)
     elif command == "playlist":
         if len(argv) < 3:

@@ -326,10 +326,10 @@ func shimPython(t *testing.T, python, moduleDir string) string {
 	return path
 }
 
-// YouTube Music sizes a playlist the way its page does: "11K", "1.2M", or plain
-// digits. The helper used to read one with int(), so a single large playlist in
-// the results took the whole command down and the provider reported a failure
-// for a number nothing depends on.
+// YouTube Music sizes a playlist the way its page does: "11K", "2.2K", "1.2M",
+// or plain digits. The helper used to read one with int(), so a single large
+// playlist in the results took the whole command down and the provider reported
+// a failure for a number nothing depends on.
 func TestPlaylistSearchReadsADisplayedCount(t *testing.T) {
 	p := testProvider(t, shimPython(t, realPython(t), stubYTMusicAPI(t, `
 class YTMusic:
@@ -341,8 +341,10 @@ class YTMusic:
             return []
         return [
             {"browseId": "VL11K", "title": "Eleven thousand", "itemCount": "11K"},
+            {"browseId": "VL22K", "title": "Two point two", "itemCount": "2.2K"},
             {"browseId": "VL12M", "title": "A million and change", "itemCount": "1.2M"},
             {"browseId": "VL1234", "title": "Plain", "itemCount": 1234},
+            {"browseId": "VLnone", "title": "Nothing readable", "itemCount": "many"},
         ]
 `)))
 
@@ -350,12 +352,60 @@ class YTMusic:
 	if err != nil {
 		t.Fatalf("a displayed count failed the search: %v", err)
 	}
-	if len(hits) != 3 {
-		t.Fatalf("playlists = %d, want 3", len(hits))
+	if len(hits) != 5 {
+		t.Fatalf("playlists = %d, want 5", len(hits))
 	}
-	for i, want := range []int{11000, 1200000, 1234} {
+	for i, want := range []int{11000, 2200, 1200000, 1234, 0} {
 		if hits[i].TrackCount != want {
 			t.Errorf("%s trackCount = %d, want %d", hits[i].Title, hits[i].TrackCount, want)
+		}
+	}
+}
+
+// The same endpoints spell a length as a number and a thumbnail as "1280px".
+// None of it is worth failing a search over, so an unreadable one reads as
+// nothing and the rest of the answer is still used.
+func TestAlbumSearchSurvivesUnreadableNumbers(t *testing.T) {
+	p := testProvider(t, shimPython(t, realPython(t), stubYTMusicAPI(t, `
+class YTMusic:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def get_album(self, browse_id):
+        return {
+            "title": "Album",
+            "artists": [{"name": "Artist"}],
+            "year": "1987",
+            "trackCount": "1,234",
+            "thumbnails": [
+                {"url": "junk.jpg", "width": "1280px", "height": "720px"},
+                {"url": "real.jpg", "width": 1280, "height": 720},
+            ],
+            "tracks": [
+                {"videoId": "one", "title": "One", "duration_seconds": "245.6"},
+                {"videoId": "two", "title": "Two", "duration": "3:45"},
+                {"videoId": "three", "title": "Three", "duration": "3:4x"},
+            ],
+        }
+`)))
+
+	album, err := p.Album(context.Background(), "MPREb")
+	if err != nil {
+		t.Fatalf("an unreadable number failed the album: %v", err)
+	}
+	if album.TrackCount != 1234 {
+		t.Errorf("trackCount = %d, want 1234", album.TrackCount)
+	}
+	if album.ArtworkURL != "real.jpg" {
+		t.Errorf("artworkUrl = %q, want the thumbnail with a readable size", album.ArtworkURL)
+	}
+	want := []int64{245_600, 225_000, 0}
+	if len(album.Tracks) != len(want) {
+		t.Fatalf("tracks = %d, want %d", len(album.Tracks), len(want))
+	}
+	for i, duration := range want {
+		if album.Tracks[i].DurationMs != duration {
+			t.Errorf("%s duration = %d, want %d", album.Tracks[i].Title, album.Tracks[i].DurationMs, duration)
 		}
 	}
 }

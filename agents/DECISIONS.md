@@ -189,7 +189,7 @@
 
 
 ## [2026-10-07] A size is read the way YouTube writes it, and an empty station says which provider failed
-- Decision: every count the ytmusic helper reports goes through `count_of`, which reads "86K", "1.2M" and "1,234" as well as plain digits. The web client's Radio menu names the providers that failed when a station comes back empty, instead of the bare "Nothing came back to build a radio from."
+- Decision: every number the ytmusic helper reads out of an endpoint goes through one of two functions - `count_of`, which reads "86K", "2.2K", "1.2M" and "1,234" as well as plain digits, and `number`, which reads everything else and answers 0 for anything unreadable. Thumbnail dimensions, lengths in seconds and the command's own limit all go through them, so no single unreadable field can take a command down. A length in seconds keeps its fraction (245.6 s is 245600 ms); a count does not. The web client's Radio menu names the providers that failed when a station comes back empty, instead of the bare "Nothing came back to build a radio from."
 - Why: ytmusicapi hands a playlist's size through as the display string whenever it cannot read it as digits, and `int("86K")` took the whole helper down - one unreadable count failed playlist search, album search and artist browsing alike (`exit status 1: ... invalid literal for int() with base 10: '86K'`), so a provider that had answered perfectly well was reported as having nothing. A radio that came back empty was the same story from the other end: the server was already sending `providerErrors` explaining itself, and the toast threw them away.
 - Reversible: yes
 
