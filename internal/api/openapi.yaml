@@ -3064,6 +3064,14 @@ components:
           type: integer
           format: int64
           description: The host's file length; the room's clock moves on when it reaches this.
+        drivenBy:
+          type: string
+          enum: [host, server]
+          description: |
+            Whose player is the room's clock. `host` while the host has a live
+            socket and reports its player state; `server` while the host is
+            away, when the server keeps time and moves the room on by itself
+            until the host comes back.
         votes:
           type: object
           additionalProperties: { type: integer }

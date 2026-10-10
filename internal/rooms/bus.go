@@ -100,11 +100,20 @@ func (b *Bus) Publish(e Event) {
 	}
 }
 
-// Clock stamps room syncs and is replaceable in tests.
+// Clock stamps room state and arms a room's own deadlines; it is replaceable in
+// tests, which have to fire a two-hour idle close rather than wait for one.
 type Clock interface {
 	Now() time.Time
+	AfterFunc(d time.Duration, fn func()) Timer
+}
+
+// Timer is one scheduled callback.
+type Timer interface {
+	Stop() bool
 }
 
 type realClock struct{}
 
 func (realClock) Now() time.Time { return time.Now() }
+
+func (realClock) AfterFunc(d time.Duration, fn func()) Timer { return time.AfterFunc(d, fn) }

@@ -33,14 +33,17 @@ type QueueItem struct {
 // host sends this state on changes and once a second; PositionMs is at AtMs on
 // the server clock, so clients can extrapolate between updates.
 type RoomPlayback struct {
-	Item       QueueItem      `json:"item"`
-	PositionMs int64          `json:"positionMs"`
-	AtMs       int64          `json:"atMs"`
-	Started    bool           `json:"started"`
-	Paused     bool           `json:"paused"`
-	DurationMs int64          `json:"durationMs"`
-	Votes      map[string]int `json:"votes"`
-	MeanScore  float64        `json:"meanScore"`
+	Item       QueueItem `json:"item"`
+	PositionMs int64     `json:"positionMs"`
+	AtMs       int64     `json:"atMs"`
+	Started    bool      `json:"started"`
+	Paused     bool      `json:"paused"`
+	DurationMs int64     `json:"durationMs"`
+	// DrivenBy is "host" while the host's player is the room's clock, and
+	// "server" while the server keeps time because the host is away.
+	DrivenBy  string         `json:"drivenBy"`
+	Votes     map[string]int `json:"votes"`
+	MeanScore float64        `json:"meanScore"`
 }
 
 // PositionAt is where the room should be at serverNowMs.

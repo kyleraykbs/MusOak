@@ -14,10 +14,20 @@ import (
 	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
-// manualClock keeps position arithmetic deterministic without running timers.
+// manualClock holds time still so positions are arithmetic, not waits, and
+// fires a room's deadlines only when Advance passes them.
 type manualClock struct {
-	mu  sync.Mutex
-	now time.Time
+	mu     sync.Mutex
+	now    time.Time
+	timers []*manualTimer
+}
+
+type manualTimer struct {
+	mu      sync.Mutex
+	at      time.Time
+	fn      func()
+	stopped bool
+	done    bool
 }
 
 func newManualClock() *manualClock {
@@ -30,10 +40,63 @@ func (c *manualClock) Now() time.Time {
 	return c.now
 }
 
+func (c *manualClock) AfterFunc(d time.Duration, fn func()) Timer {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	timer := &manualTimer{at: c.now.Add(d), fn: fn}
+	c.timers = append(c.timers, timer)
+	return timer
+}
+
+// Advance moves time forward and runs everything that became due, outside the
+// clock's own lock so a callback can take the manager's.
 func (c *manualClock) Advance(d time.Duration) {
 	c.mu.Lock()
 	c.now = c.now.Add(d)
+	now := c.now
+	var due []func()
+	live := c.timers[:0]
+	for _, timer := range c.timers {
+		if fn, ok := timer.alarm(now); ok {
+			due = append(due, fn)
+			continue
+		}
+		if timer.live() {
+			live = append(live, timer)
+		}
+	}
+	c.timers = live
 	c.mu.Unlock()
+
+	for _, fn := range due {
+		fn()
+	}
+}
+
+func (t *manualTimer) Stop() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.stopped || t.done {
+		return false
+	}
+	t.stopped = true
+	return true
+}
+
+func (t *manualTimer) alarm(now time.Time) (func(), bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.stopped || t.done || t.at.After(now) {
+		return nil, false
+	}
+	t.done = true
+	return t.fn, true
+}
+
+func (t *manualTimer) live() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return !t.stopped && !t.done
 }
 
 type fixture struct {
@@ -132,6 +195,18 @@ func (f *fixture) get(roomID string) *Snapshot {
 	}
 	return snapshot
 }
+
+// attach gives a member a live event socket: a room is server-driven exactly
+// while its host has none.
+func (f *fixture) attach(memberID string) { f.m.Connect(memberID) }
+
+// detach takes a member's last socket away, leaving them a member: a host whose
+// laptop slept, not a host who left.
+func (f *fixture) detach(memberID string) { f.m.Disconnect(memberID) }
+
+// longGrace keeps a detached member from being reaped mid-test, so a test can
+// hold a room in the "host is away" state it is about.
+func (f *fixture) longGrace() { f.m.grace = time.Hour }
 
 // waitEvent reads the next event of the given type, skipping the rest.
 func waitEvent(t *testing.T, ch <-chan Event, kind EventType) Event {
@@ -358,7 +433,10 @@ func TestEmptyHostSyncKeepsPendingQueuePlayable(t *testing.T) {
 	}
 }
 
-func TestRoomPositionNeverAdvancesWithoutHostSync(t *testing.T) {
+// A room the server would have to drive but that nobody is listening to is left
+// alone: the queue belongs to the people in the room, and spending it on an
+// empty room is not playing it to anyone.
+func TestServerLeavesARoomNobodyIsListeningToAlone(t *testing.T) {
 	f := newFixture(t, nil)
 	host := guest("host-1")
 	room := f.create("party", ControlsEveryone, "", host)
@@ -369,7 +447,154 @@ func TestRoomPositionNeverAdvancesWithoutHostSync(t *testing.T) {
 	f.clock.Advance(time.Minute)
 	state := f.get(room.ID)
 	if state.Current == nil || state.Current.Item.TrackID != first.ID || state.Current.PositionMs != 60_000 {
-		t.Fatalf("room advanced without the host's queue player: %+v", state.Current)
+		t.Fatalf("the room moved on with nobody listening: %+v", state.Current)
+	}
+}
+
+// A host whose socket goes is a host who cannot report a player any more, so the
+// room keeps its own time: the server moves it on when the song the host last
+// reported reaches its end.
+func TestServerDrivesTheRoomWhileTheHostIsAway(t *testing.T) {
+	f := newFixture(t, nil)
+	f.longGrace()
+	host := guest("host-1")
+	room := f.create("party", ControlsEveryone, "", host)
+	if _, err := f.m.Join(room.ID, guest("bob"), "", ""); err != nil {
+		t.Fatal(err)
+	}
+	first := f.track("first", 30_000)
+	second := f.track("second", 30_000)
+	f.enqueue(room.ID, host.ID, first.ID, second.ID)
+
+	f.attach(host.ID)
+	f.attach("bob")
+	f.start(room.ID, host.ID, first.ID, 0, 30_000)
+	if got := f.get(room.ID).Current.DrivenBy; got != DrivenByHost {
+		t.Fatalf("driver while the host is here = %q", got)
+	}
+
+	// The host's laptop sleeps. Nobody can report its player now.
+	f.detach(host.ID)
+	if got := f.get(room.ID).Current.DrivenBy; got != DrivenByServer {
+		t.Fatalf("driver with the host away = %q", got)
+	}
+
+	f.clock.Advance(29 * time.Second)
+	if got := f.get(room.ID).Current.Item.TrackID; got != first.ID {
+		t.Fatalf("the room moved on before the song was over")
+	}
+	f.clock.Advance(2 * time.Second)
+	state := f.get(room.ID)
+	if state.Current == nil || state.Current.Item.TrackID != second.ID {
+		t.Fatalf("the room did not move on without its host: %+v", state.Current)
+	}
+	if !state.Current.Started || state.Current.Paused {
+		t.Fatalf("the next song is not running for the listeners: %+v", state.Current)
+	}
+	if state.Current.DrivenBy != DrivenByServer {
+		t.Fatalf("driver after a server advance = %q", state.Current.DrivenBy)
+	}
+	if len(state.MasterQueue) != 1 || state.MasterQueue[0].TrackID != second.ID {
+		t.Fatalf("queue after a server advance = %+v", state.MasterQueue)
+	}
+}
+
+// The host coming back is the room's clock again, and the server stops moving
+// the room on: two clocks would each think the other was behind.
+func TestHostReturningTakesTheClockBack(t *testing.T) {
+	f := newFixture(t, nil)
+	f.longGrace()
+	host := guest("host-1")
+	room := f.create("party", ControlsEveryone, "", host)
+	song := f.track("song", 30_000)
+	next := f.track("next", 30_000)
+	f.enqueue(room.ID, host.ID, song.ID, next.ID)
+
+	f.attach(host.ID)
+	f.start(room.ID, host.ID, song.ID, 0, 30_000)
+	f.detach(host.ID)
+	if got := f.get(room.ID).Current.DrivenBy; got != DrivenByServer {
+		t.Fatalf("driver with the host away = %q", got)
+	}
+
+	f.attach(host.ID)
+	if got := f.get(room.ID).Current.DrivenBy; got != DrivenByHost {
+		t.Fatalf("driver after the host came back = %q", got)
+	}
+	f.clock.Advance(time.Minute)
+	if got := f.get(room.ID).Current.Item.TrackID; got != song.ID {
+		t.Fatalf("the server kept driving after the host returned: %+v", f.get(room.ID).Current)
+	}
+}
+
+// An open room nothing is playing in closes itself once it has been that way for
+// the idle window.
+func TestIdleRoomClosesItself(t *testing.T) {
+	f := newFixture(t, nil)
+	f.m.idleAfter = time.Minute
+	host := guest("host-1")
+	room := f.create("party", ControlsEveryone, "", host)
+	f.attach(host.ID)
+
+	f.clock.Advance(30 * time.Second)
+	if _, err := f.m.Get(room.ID); err != nil {
+		t.Fatalf("the room closed early: %v", err)
+	}
+	f.clock.Advance(31 * time.Second)
+	if _, err := f.m.Get(room.ID); !errors.Is(err, ErrRoomNotFound) {
+		t.Fatalf("an idle room did not close itself: %v", err)
+	}
+}
+
+// A paused song is a room going nowhere and closes like an idle one; a room that
+// is playing is not idle and does not.
+func TestPlayingRoomIsNotIdleButAPausedOneIs(t *testing.T) {
+	f := newFixture(t, nil)
+	f.m.idleAfter = time.Minute
+	host := guest("host-1")
+	room := f.create("party", ControlsEveryone, "", host)
+	song := f.track("song", 600_000)
+	f.enqueue(room.ID, host.ID, song.ID)
+	f.attach(host.ID)
+	f.start(room.ID, host.ID, song.ID, 0, 600_000)
+
+	f.clock.Advance(2 * time.Minute)
+	if _, err := f.m.Get(room.ID); err != nil {
+		t.Fatalf("a playing room closed itself: %v", err)
+	}
+
+	if _, err := f.m.Pause(room.ID, host.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Advance(59 * time.Second)
+	if _, err := f.m.Get(room.ID); err != nil {
+		t.Fatalf("a paused room closed early: %v", err)
+	}
+	f.clock.Advance(2 * time.Second)
+	if _, err := f.m.Get(room.ID); !errors.Is(err, ErrRoomNotFound) {
+		t.Fatalf("a paused room did not close itself: %v", err)
+	}
+}
+
+// Using a room puts its idle clock back: a room people are still filling is not
+// one to close under them.
+func TestUsingARoomPutsTheIdleClockBack(t *testing.T) {
+	f := newFixture(t, nil)
+	f.m.idleAfter = time.Minute
+	host := guest("host-1")
+	room := f.create("party", ControlsEveryone, "", host)
+	f.attach(host.ID)
+	song := f.track("song", 30_000)
+
+	f.clock.Advance(50 * time.Second)
+	f.enqueue(room.ID, host.ID, song.ID)
+	f.clock.Advance(50 * time.Second)
+	if _, err := f.m.Get(room.ID); err != nil {
+		t.Fatalf("the room closed although somebody was still queueing: %v", err)
+	}
+	f.clock.Advance(time.Minute)
+	if _, err := f.m.Get(room.ID); !errors.Is(err, ErrRoomNotFound) {
+		t.Fatalf("the room never closed after the idle window: %v", err)
 	}
 }
 
