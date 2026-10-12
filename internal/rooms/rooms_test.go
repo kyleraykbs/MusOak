@@ -435,6 +435,32 @@ func TestServerKeepsTimeWithASocketDown(t *testing.T) {
 	}
 }
 
+// A queue change carries the room's play order with it: the order is the
+// server's to know, and a client that works one out for itself can come out with
+// a different answer the moment a queue is edited - which is a client playing
+// one song while the room plays another.
+func TestAQueueChangeCarriesThePlayOrder(t *testing.T) {
+	f := newFixture(t, nil)
+	host := guest("host-1")
+	room := f.create("party", ControlsEveryone, "", host)
+	events, cancel := f.m.Subscribe()
+	defer cancel()
+
+	first := f.track("first", 60_000)
+	second := f.track("second", 60_000)
+	f.enqueue(room.ID, host.ID, first.ID, second.ID)
+
+	event := waitEvent(t, events, EventQueueUpdated)
+	data := event.Data.(map[string]any)
+	master, ok := data["master"].([]QueueItem)
+	if !ok {
+		t.Fatalf("a queue change carried no play order: %+v", data)
+	}
+	if len(master) != 2 || master[0].TrackID != first.ID || master[1].TrackID != second.ID {
+		t.Fatalf("the order sent is not the room's: %+v", master)
+	}
+}
+
 // An open room nothing is playing in closes itself once it has been that way for
 // the idle window.
 func TestIdleRoomClosesItself(t *testing.T) {

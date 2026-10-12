@@ -1201,12 +1201,21 @@ func (m *Manager) checkQueueEditLocked(room *room, memberID, ownerID string) err
 }
 
 // queueDataLocked renders what a queue edit changed: the edited member's own
-// queue. The play order is a function of the member queues and the join order,
-// which every client already has, so it is derived rather than sent.
+// queue, and the room's play order.
+//
+// The order travels with it because the order is the server's to know. A client
+// that works it out for itself from the member queues and the join order can
+// come out with a different answer the moment a queue is edited - one of them
+// plays a song while the room plays another, and each pulls the other - so every
+// change carries the list, the same one the snapshot carries.
 func queueDataLocked(room *room, changed string) map[string]any {
-	data := map[string]any{"memberId": changed}
+	data := map[string]any{
+		"memberId": changed,
+		"master":   append([]QueueItem(nil), room.master...),
+	}
 	if _, present := room.members[changed]; !present {
-		// They left: the client drops the queue rather than replacing it.
+		// They left: the client drops the queue rather than replacing it, and
+		// the order they were part of has changed with them.
 		data["gone"] = true
 		return data
 	}
