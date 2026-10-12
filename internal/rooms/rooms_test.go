@@ -229,10 +229,14 @@ func TestEnqueueMixesQueuesFairly(t *testing.T) {
 	if queue := data["memberQueue"].([]QueueItem); len(queue) != 2 {
 		t.Fatalf("member queue = %d items", len(queue))
 	}
-	// Enqueue only builds the mixed queue; the host creates current playback
-	// when its ordinary player syncs the first item.
-	if current := f.get(room.ID).Current; current != nil {
-		t.Fatalf("enqueue started playback before the host: %+v", current)
+	// Enqueue starts the room: the server is the clock now, so a room with a
+	// queue and somebody in it plays - there is no host sync to wait for.
+	state := f.get(room.ID)
+	if state.Current == nil {
+		t.Fatal("the room did not start on its own enqueue")
+	}
+	if state.Current.Item.ID != state.MasterQueue[0].ID {
+		t.Fatalf("the room started on something other than the first queued item: %+v", state.Current.Item)
 	}
 
 	f.enqueue(room.ID, "bob", b1.ID, b2.ID)
@@ -404,23 +408,30 @@ func TestUnknownDurationUsesTheFallbackWindow(t *testing.T) {
 	}
 }
 
-// A room nobody is listening to is left alone: the queue belongs to the people
-// in the room, and playing it to an empty room would only spend it.
-func TestServerLeavesARoomNobodyIsListeningToAlone(t *testing.T) {
+// A room with somebody in it keeps its own time, socket or no socket: a browser
+// that dropped its connection must not stop the music for the people in the
+// room. (The case this replaces - a room nobody is listening to is left alone -
+// is gone: a member with no socket is removed after the grace, and a room with
+// no members is closed, so "nobody to play to" is not a state a live room is in.
+// The queue is still never spent on an empty room, because an empty room is not
+// a room.)
+func TestServerKeepsTimeWithASocketDown(t *testing.T) {
 	f := newFixture(t, nil)
 	host := guest("host-1")
 	room := f.create("party", ControlsEveryone, "", host)
-	first := f.track("first", 1_000)
-	second := f.track("second", 1_000)
+	first := f.track("first", 30_000)
+	second := f.track("second", 30_000)
 	f.enqueue(room.ID, host.ID, first.ID, second.ID)
 
-	f.advance(time.Minute)
+	f.advance(31 * time.Second)
 	state := f.get(room.ID)
-	if state.Current != nil {
-		t.Fatalf("the room started with nobody listening: %+v", state.Current)
+	if state.Current == nil {
+		t.Fatal("a room with somebody in it never started")
 	}
-	if len(state.MasterQueue) != 2 {
-		t.Fatalf("the queue was spent on an empty room: %+v", state.MasterQueue)
+	// 30-second songs, 31 seconds on: the first one has finished and the room
+	// has moved on by itself, with no socket ever registered.
+	if got := state.Current.Item.TrackID; got != second.ID {
+		t.Fatalf("the room did not move on by itself: %s", got)
 	}
 }
 

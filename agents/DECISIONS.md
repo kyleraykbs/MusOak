@@ -216,3 +216,9 @@
 - Why: as a list that only grew, songs added by other members waited behind everything queued earlier, so the next song was ready only while the room's order stayed put. That is the difference between one member's queue, where the order never changes under the window, and a room's.
 - Also: on the client, a song that has run out before the room's own boundary advances locally rather than pausing. The pause fired a beat before the element's `ended` (the room starts its item at the boundary while the file starts after its load delay, and a trimmed file is shorter than the length the room was told), so `hasEnded()` never became true and the self-advance, which is gated on it, never ran: that was the stall at the end of a song.
 - Reversible: yes
+
+## [2026-10-11] A room keeps its own time while somebody is in it, socket or not
+- Decision: the tick's gate changed from "a member of this room has a live event socket" to "the room has members". A room with a queue and a member in it starts and advances by itself even when no socket is registered.
+- Why: that gate is what a real deployment fell over. With `requireLogin` set, a browser whose socket never registered left a room with a full queue sitting at "nothing playing" indefinitely - observed on amanita: 41 queued, 1 member, no current, and the room began the instant a socket registered as that member. A socket blinking (a reload, a sleep, a proxy hanging up, a browser that cannot hold a websocket) must not be the thing that stops the music; membership is the durable fact, since the grace after a socket closes is what removes a member and that same path closes an empty room.
+- Also: the "do not spend the queue on an empty room" intent is kept - an empty room does not exist, it is closed when its last member leaves.
+- Reversible: yes

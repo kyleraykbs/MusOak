@@ -980,16 +980,20 @@ func (m *Manager) markQueueDirtyLocked(room *room, memberID string) {
 	room.queueDirty[memberID] = true
 }
 
-// anyoneListeningLocked reports whether any member of the room has a live event
-// socket. A room nobody is listening to is not moved on: the queue belongs to
-// the people in the room, and playing it to an empty room would only spend it.
+// anyoneListeningLocked reports whether the room has anybody to play to.
+//
+// A live event socket is not the test, and was the wrong one: a socket blinks -
+// a page reload, a laptop that slept, a proxy that hangs up, a browser that
+// cannot hold a websocket at all - and a room that stops its clock because one
+// dropped is a room that stops playing music to the people in it. On a real
+// deployment with `requireLogin` set, a browser whose socket never registered
+// left the room sitting at "nothing playing" with a full queue, for good.
+//
+// Membership is the durable fact: the grace after a socket closes is what
+// removes a member, and an empty room is closed by that same path, so what is
+// left is exactly "somebody is in this room". The clock runs while that holds.
 func (m *Manager) anyoneListeningLocked(room *room) bool {
-	for memberID := range room.members {
-		if m.connections[memberID] > 0 {
-			return true
-		}
-	}
-	return false
+	return len(room.members) > 0
 }
 
 // Pause freezes the room position.
