@@ -108,9 +108,14 @@ type Participant struct {
 	offsetMs int64
 	current  *RoomPlayback
 	master   []QueueItem
-	// played names items this client has advanced past locally. A server state
-	// that still names one of them is a beat behind the client, not a
-	// correction to apply.
+	// played names items this client has advanced past locally, for the life
+	// of the participant. A server state that still names one of them is a
+	// beat behind the client, not a correction to apply - and it must stay
+	// that way: this client reads ahead of what it is playing, so its own
+	// advance comes before the room's, and a memory that was cleared once the
+	// two agreed let a later stale beat load the finished song again, at the
+	// finished song's position. Queue entries are unique and play once, so
+	// remembering them costs nothing and forbids the jump back.
 	played map[string]bool
 	// loadLatencyMs is the smoothed time a load takes, from asking for the file
 	// to the sink being ready; it is added to the room's position when starting
@@ -385,10 +390,6 @@ func (p *Participant) reconcile(ctx context.Context) {
 		p.load(ctx, current, p.startAt(current))
 		return
 	}
-	// Server and client agree on the song: any item this client advanced past
-	// locally is behind both of them now.
-	p.forgetPlayed()
-
 	if localEnded {
 		p.advanceLocal(ctx, item.ID)
 		return
@@ -586,15 +587,6 @@ func (p *Participant) hasPlayed(itemID string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.played[itemID]
-}
-
-// forgetPlayed drops the local-advance memory once the server has caught up.
-func (p *Participant) forgetPlayed() {
-	p.mu.Lock()
-	if len(p.played) > 0 {
-		p.played = map[string]bool{}
-	}
-	p.mu.Unlock()
 }
 
 // pause pauses or resumes the local sink in place.
