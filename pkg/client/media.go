@@ -156,6 +156,22 @@ func NewParticipant(room *RoomClient, cache *Cache, sink Sink, logger *slog.Logg
 	}
 }
 
+// SetDriftTolerance sets how far this client may sit from the room's position
+// before it seeks back, in milliseconds.
+//
+// It belongs to the caller's pipeline: a client that keeps a second of audio
+// buffered ahead of the wire is a second behind by design, and correcting that
+// is correcting the buffer, not the playback. A caller that buffers should set
+// this past its buffer - otherwise every beat is a correction.
+func (p *Participant) SetDriftTolerance(ms int64) {
+	if ms < 0 {
+		ms = 0
+	}
+	p.mu.Lock()
+	p.driftTolerance = ms
+	p.mu.Unlock()
+}
+
 // Room exposes the room client this participant follows.
 func (p *Participant) Room() *RoomClient { return p.room }
 

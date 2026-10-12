@@ -75,6 +75,18 @@ type playerSink struct {
 	started  time.Time
 	paused   bool
 	pausedAt int64
+	// offsetMs is how far this sink's playhead sits from where it would be
+	// with no buffer: a sink that holds audio ahead of the wire is behind by
+	// exactly that much.
+	offsetMs int64
+}
+
+// setPositionOffset makes the sink report a playhead that far behind, the way
+// a buffered client's audible position is.
+func (s *playerSink) setPositionOffset(ms int64) {
+	s.mu.Lock()
+	s.offsetMs = ms
+	s.mu.Unlock()
 }
 
 func (s *playerSink) Play(ctx context.Context, track client.SinkTrack) error {
@@ -107,7 +119,7 @@ func (s *playerSink) at(now time.Time) (int64, bool) {
 	if s.paused {
 		return s.pausedAt, true
 	}
-	return s.position + now.Sub(s.started).Milliseconds(), false
+	return s.position + now.Sub(s.started).Milliseconds() + s.offsetMs, false
 }
 
 func (s *playerSink) Stop(ctx context.Context) error {
@@ -636,6 +648,42 @@ func TestAQueueChangeIsAppliedNotRefetched(t *testing.T) {
 // A song queued while something else plays must be on disk before the room
 // reaches it: warming only when the current song changes leaves the download
 // on the critical path of the transition, which is heard as a wait.
+// A client that buffers audio is behind the room by design. Correcting that
+// with a seek is correcting the buffer: the tolerance has to cover the buffer.
+func TestTheDriftToleranceCoversTheCallersBuffer(t *testing.T) {
+	ctx := context.Background()
+	_, clients, trackID := roomClients(t, ctx, newServer(t, nil), "Buffered.opus", []float64{30.0, 30.0})
+	host, follower := clients[0], clients[1]
+	stop := runParticipants(t, ctx, clients)
+	defer stop()
+
+	if _, err := host.room.Queue(ctx, trackID); err != nil {
+		t.Fatalf("Queue: %v", err)
+	}
+	waitFor(t, 15*time.Second, "the follower to start playing", func() bool {
+		return len(follower.sink.recorded()) >= 1
+	})
+
+	// The follower sits three seconds behind, the way a client holding three
+	// seconds of audio ahead of the wire does.
+	follower.sink.setPositionOffset(-3_000)
+	follower.participant.SetDriftTolerance(5_000)
+
+	// A beat with the covering tolerance: nothing to correct.
+	seeks := follower.sink.seekCount()
+	time.Sleep(2500 * time.Millisecond)
+	if got := follower.sink.seekCount() - seeks; got != 0 {
+		t.Fatalf("a buffered client was corrected %d times with a covering tolerance", got)
+	}
+
+	// With the default tolerance the same gap is a correction, which is what a
+	// buffer without one costs.
+	follower.participant.SetDriftTolerance(2_000)
+	waitFor(t, 10*time.Second, "the default tolerance to correct the buffer", func() bool {
+		return follower.sink.seekCount() > seeks
+	})
+}
+
 func TestASongQueuedMidTrackIsFetchedBeforeItPlays(t *testing.T) {
 	ctx := context.Background()
 	apiClient := newServer(t, nil)
