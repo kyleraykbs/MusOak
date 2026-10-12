@@ -64,6 +64,10 @@ type QueueItem struct {
 	// ArtistIDs lets a client open an artist's page from a queue row's menu:
 	// the names alone cannot name a page.
 	ArtistIDs []string `json:"artistIds,omitempty"`
+	// Artists is the names in credit order, the same "artists" a track
+	// response carries: the row shows them under the title, which the ids
+	// alone cannot do.
+	Artists []string `json:"artists,omitempty"`
 }
 
 // playback is the room's current song and where the server says it is. The
@@ -697,10 +701,13 @@ func (m *Manager) queueItemLocked(ctx context.Context, memberID string, track *s
 		}
 	}
 	var artistIDs []string
+	var artistNames []string
 	if artists, err := m.store.TrackArtists(ctx, track.ID); err == nil {
 		artistIDs = make([]string, 0, len(artists))
+		artistNames = make([]string, 0, len(artists))
 		for _, artist := range artists {
 			artistIDs = append(artistIDs, artist.ID.String())
+			artistNames = append(artistNames, artist.Name)
 		}
 	}
 	return QueueItem{
@@ -712,6 +719,7 @@ func (m *Manager) queueItemLocked(ctx context.Context, memberID string, track *s
 		DurationMs: track.DurationMs,
 		ArtworkURL: artwork,
 		ArtistIDs:  artistIDs,
+		Artists:    artistNames,
 	}
 }
 

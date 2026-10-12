@@ -889,3 +889,27 @@ func TestDisconnectGraceLeavesRooms(t *testing.T) {
 		t.Fatal("the last socket closing did not take the member out")
 	}
 }
+
+// A queued row carries the artist's name beside the id: the list shows the
+// name under the title, and only the id can open the artist's page.
+func TestAQueuedItemCarriesTheArtistNames(t *testing.T) {
+	f := newFixture(t, nil)
+	track := f.track("Xtal", 200_000)
+	if err := f.db.SetTrackArtists(context.Background(), track.ID, []string{"Aphex Twin"}); err != nil {
+		t.Fatalf("SetTrackArtists: %v", err)
+	}
+	room := f.create("room", ControlsEveryone, "", guest("kyle"))
+	state := f.enqueue(room.ID, "kyle", track.ID)
+
+	items := state.Queues["kyle"]
+	if len(items) != 1 {
+		t.Fatalf("queued %d items, want 1", len(items))
+	}
+	got := items[0]
+	if len(got.Artists) != 1 || got.Artists[0] != "Aphex Twin" {
+		t.Errorf("artists = %v, want [Aphex Twin]", got.Artists)
+	}
+	if len(got.ArtistIDs) != 1 {
+		t.Errorf("artistIds = %v, want the id the menu opens", got.ArtistIDs)
+	}
+}

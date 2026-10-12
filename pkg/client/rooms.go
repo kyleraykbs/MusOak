@@ -27,6 +27,9 @@ type QueueItem struct {
 	DurationMs int64    `json:"durationMs,omitempty"`
 	ArtworkURL string   `json:"artworkUrl,omitempty"`
 	ArtistIDs  []string `json:"artistIds,omitempty"`
+	// Artists is the names in credit order, the same "artists" a track
+	// response carries: the row shows them under the title.
+	Artists []string `json:"artists,omitempty"`
 }
 
 // RoomPlayback is the room's current song and where the server says it is.
