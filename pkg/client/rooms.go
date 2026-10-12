@@ -327,6 +327,10 @@ type QueueEvent struct {
 	MemberID    string      `json:"memberId"`
 	MemberQueue []QueueItem `json:"memberQueue"`
 	Gone        bool        `json:"gone"`
+	// Master is the room's play order after the change. The server is its only
+	// author, so a follower can take it as it comes; nil means an older server
+	// that leaves the order to be derived or refetched.
+	Master []QueueItem `json:"master,omitempty"`
 }
 
 // HostChangedEvent is the payload of host_changed.

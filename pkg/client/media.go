@@ -159,7 +159,13 @@ func (p *Participant) Room() *RoomClient { return p.room }
 // MemberID is who this participant is in the room.
 func (p *Participant) MemberID() string { return p.room.MemberID }
 
-// Run follows the room until ctx ends or the room closes.
+// ErrRoomClosed is what Run returns when the room closed under it. It is
+// distinct from a plain nil, which means the connection to the room dropped:
+// the room is still there and following it again is worthwhile.
+var ErrRoomClosed = errors.New("musoak: the room closed")
+
+// Run follows the room until ctx ends, the room closes, or the connection to
+// it drops.
 func (p *Participant) Run(ctx context.Context) error {
 	offset, err := p.room.client.ClockOffset(ctx, p.clockSamples)
 	if err != nil {
@@ -196,7 +202,7 @@ func (p *Participant) Run(ctx context.Context) error {
 			}
 			if event.Type == EventRoomClosed {
 				p.stop(ctx)
-				return nil
+				return ErrRoomClosed
 			}
 			if p.apply(ctx, event) {
 				p.reconcile(ctx)
@@ -268,7 +274,26 @@ func (p *Participant) apply(ctx context.Context, event Event) bool {
 		}
 		return true
 
-	case EventQueueUpdated, EventMemberJoined, EventMemberLeft:
+	case EventQueueUpdated:
+		// The change carries the room's own order, and taking it saves a
+		// snapshot per edit: a burst of adds - somebody shuffling a playlist
+		// into the room - used to become a burst of whole-room fetches, which
+		// is enough to back the event socket up until the server drops it.
+		var data QueueEvent
+		if err := event.DecodeData(&data); err == nil && data.Master != nil {
+			p.mu.Lock()
+			p.master = append([]QueueItem(nil), data.Master...)
+			p.mu.Unlock()
+			return true
+		}
+		if snapshot, err := p.room.Snapshot(ctx); err == nil {
+			p.adopt(snapshot)
+		} else {
+			p.logger.Warn("participant: refresh room queue", "error", err)
+		}
+		return true
+
+	case EventMemberJoined, EventMemberLeft:
 		if snapshot, err := p.room.Snapshot(ctx); err == nil {
 			p.adopt(snapshot)
 		} else {

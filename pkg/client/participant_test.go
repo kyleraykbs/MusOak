@@ -3,11 +3,14 @@ package client_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -537,4 +540,95 @@ func waitFor(t *testing.T, timeout time.Duration, what string, condition func() 
 		time.Sleep(25 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
+}
+
+// countingTransport counts a client's room reads, so a test can tell an event
+// that was applied from one that was answered with a refetch.
+type countingTransport struct {
+	base http.RoundTripper
+
+	mu       sync.Mutex
+	roomGets int
+}
+
+func (c *countingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/rooms/") {
+		c.mu.Lock()
+		c.roomGets++
+		c.mu.Unlock()
+	}
+	return c.base.RoundTrip(r)
+}
+
+func (c *countingTransport) reads() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.roomGets
+}
+
+// A queue change carries the room's order, and a follower takes it as it
+// comes. Refetching the whole room per edit is what a burst of adds - somebody
+// shuffling a playlist into the room - turns into a backed-up event socket
+// that the server has to drop.
+func TestAQueueChangeIsAppliedNotRefetched(t *testing.T) {
+	ctx := context.Background()
+	apiClient := newServer(t, nil)
+	leader := client.New(apiClient.BaseURL())
+
+	var tracks []string
+	for i := range 4 {
+		_, id, _ := importTrack(t, ctx, apiClient, fmt.Sprintf("burst-%d.opus", i), 1.0+float64(i)/10)
+		tracks = append(tracks, id)
+	}
+	host, err := leader.CreateRoom(ctx, "burst", "everyone")
+	if err != nil {
+		t.Fatalf("CreateRoom: %v", err)
+	}
+	if _, err := host.Queue(ctx, tracks[0]); err != nil {
+		t.Fatalf("Queue: %v", err)
+	}
+
+	// The follower counts what it reads.
+	counter := &countingTransport{base: http.DefaultTransport}
+	follower := client.New(apiClient.BaseURL(), client.WithHTTPClient(&http.Client{Transport: counter}))
+	room, err := follower.JoinRoom(ctx, host.RoomID)
+	if err != nil {
+		t.Fatalf("JoinRoom: %v", err)
+	}
+	cache, err := client.OpenCache(filepath.Join(t.TempDir(), "cache"))
+	if err != nil {
+		t.Fatalf("OpenCache: %v", err)
+	}
+	sink := &playerSink{}
+	participant := client.NewParticipant(room, cache, sink, slog.New(slog.DiscardHandler))
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() { _ = participant.Run(runCtx) }()
+
+	waitFor(t, 15*time.Second, "the follower to start playing", func() bool {
+		return len(sink.recorded()) >= 1
+	})
+
+	// The burst: the other member adds the rest of the playlist.
+	before := counter.reads()
+	for _, id := range tracks[1:] {
+		if _, err := host.Queue(ctx, id); err != nil {
+			t.Fatalf("Queue: %v", err)
+		}
+	}
+
+	// The room plays through, and the follower's own player follows the order
+	// it was told about - the second song it plays is the master's next.
+	waitFor(t, 25*time.Second, "the follower to reach the second song", func() bool {
+		return len(sink.recorded()) >= 2
+	})
+	if got := sink.recorded()[1].TrackID; got != tracks[1] {
+		t.Errorf("second song = %s, want %s (the order the event carried)", got, tracks[1])
+	}
+
+	if reads := counter.reads() - before; reads > 1 {
+		t.Errorf("the follower read the whole room %d times for %d queue changes, want it to take the order from the events",
+			reads, len(tracks)-1)
+	}
 }

@@ -594,7 +594,12 @@ func (a *App) roomJoin(ctx context.Context, roomID string) error {
 	}
 
 	a.printf("joined %s as %s; Ctrl-C to leave\n", roomID, room.MemberID)
-	return participant.Run(ctx)
+	err = participant.Run(ctx)
+	if errors.Is(err, client.ErrRoomClosed) {
+		a.printf("the room closed\n")
+		return nil
+	}
+	return err
 }
 
 // joinedRoom returns the room this CLI is in, re-joining when needed.
