@@ -632,3 +632,58 @@ func TestAQueueChangeIsAppliedNotRefetched(t *testing.T) {
 			reads, len(tracks)-1)
 	}
 }
+
+// A song queued while something else plays must be on disk before the room
+// reaches it: warming only when the current song changes leaves the download
+// on the critical path of the transition, which is heard as a wait.
+func TestASongQueuedMidTrackIsFetchedBeforeItPlays(t *testing.T) {
+	ctx := context.Background()
+	apiClient := newServer(t, nil)
+	leader := client.New(apiClient.BaseURL())
+	host, err := leader.CreateRoom(ctx, "warm", "everyone")
+	if err != nil {
+		t.Fatalf("CreateRoom: %v", err)
+	}
+	_, firstID, _ := importTrack(t, ctx, apiClient, "first-song.opus", 10.0)
+	_, secondID, _ := importTrack(t, ctx, apiClient, "second-song.opus", 10.0)
+	if _, err := host.Queue(ctx, firstID); err != nil {
+		t.Fatalf("Queue: %v", err)
+	}
+
+	cache, err := client.OpenCache(filepath.Join(t.TempDir(), "cache"))
+	if err != nil {
+		t.Fatalf("OpenCache: %v", err)
+	}
+	follower := client.New(apiClient.BaseURL())
+	room, err := follower.JoinRoom(ctx, host.RoomID)
+	if err != nil {
+		t.Fatalf("JoinRoom: %v", err)
+	}
+	sink := &playerSink{}
+	participant := client.NewParticipant(room, cache, sink, slog.New(slog.DiscardHandler))
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() { _ = participant.Run(runCtx) }()
+
+	waitFor(t, 15*time.Second, "the follower to start playing", func() bool {
+		return len(sink.recorded()) >= 1
+	})
+
+	// Mid-track, the other member queues the next song.
+	if _, err := host.Queue(ctx, secondID); err != nil {
+		t.Fatalf("Queue: %v", err)
+	}
+
+	waitFor(t, 10*time.Second, "the queued song to be fetched", func() bool {
+		_, ok := cache.LookupTrack(secondID)
+		return ok
+	})
+	// And it beat the room to it: the first song is still the one playing.
+	state, err := host.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if state.Current != nil && state.Current.Item.TrackID != firstID {
+		t.Errorf("the room was already on the next song when the fetch landed: %s", state.Current.Item.TrackID)
+	}
+}

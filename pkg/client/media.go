@@ -270,7 +270,7 @@ func (p *Participant) apply(ctx context.Context, event Event) bool {
 		changed := previous == nil || data.Current == nil || previous.Item.ID != data.Current.Item.ID
 		p.mu.Unlock()
 		if changed {
-			go p.warmRoom(ctx)
+			go p.warmMaster(ctx)
 		}
 		return true
 
@@ -284,10 +284,16 @@ func (p *Participant) apply(ctx context.Context, event Event) bool {
 			p.mu.Lock()
 			p.master = append([]QueueItem(nil), data.Master...)
 			p.mu.Unlock()
+			// The order moved, so the songs behind the one playing did too:
+			// fetch them now, or the transition pays for the download. A song
+			// queued mid-track used to wait for the advance to be fetched at
+			// all, which is exactly the wait it was supposed to avoid.
+			go p.warmMaster(ctx)
 			return true
 		}
 		if snapshot, err := p.room.Snapshot(ctx); err == nil {
 			p.adopt(snapshot)
+			go p.warmMaster(ctx)
 		} else {
 			p.logger.Warn("participant: refresh room queue", "error", err)
 		}
@@ -296,6 +302,7 @@ func (p *Participant) apply(ctx context.Context, event Event) bool {
 	case EventMemberJoined, EventMemberLeft:
 		if snapshot, err := p.room.Snapshot(ctx); err == nil {
 			p.adopt(snapshot)
+			go p.warmMaster(ctx)
 		} else {
 			p.logger.Warn("participant: refresh room queue", "error", err)
 		}
@@ -656,6 +663,15 @@ func (p *Participant) ensureTrack(ctx context.Context, trackID string) (CacheEnt
 		return CacheEntry{}, err
 	}
 	return entry, nil
+}
+
+// warmMaster warms the songs behind the one playing from the order this
+// client already holds, so a queue change costs no round trip to act on.
+func (p *Participant) warmMaster(ctx context.Context) {
+	p.mu.Lock()
+	pending := append([]QueueItem(nil), p.master...)
+	p.mu.Unlock()
+	p.warmAhead(ctx, pending)
 }
 
 // warmRoom fetches the room and warms the songs behind the current one. It is
