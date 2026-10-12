@@ -116,6 +116,9 @@ type Participant struct {
 	// to the sink being ready; it is added to the room's position when starting
 	// a load so the audible start lands where the room will be, not where it was.
 	loadLatencyMs int64
+	// absurdSaid is whether the too-large-to-correct warning has been said for
+	// the song playing.
+	absurdSaid bool
 
 	playing         *localPlayback
 	warming         map[string]bool
@@ -627,10 +630,39 @@ func (p *Participant) correctDrift(ctx context.Context, local *localPlayback, ex
 	if drift <= p.driftTolerance {
 		return
 	}
-	p.logger.Debug("participant: correcting drift", "drift_ms", got-expected)
+	// A drift this large is not a file that runs at the wrong speed: it is two
+	// positions that do not describe the same thing — a different item, or a
+	// clock that moved under both of them. Seeking to it moves the audio
+	// somewhere worse and the next beat seeks again, so say it once and wait
+	// for the room to move instead of tearing the song apart every second.
+	if drift > absurdDriftMs {
+		p.sayAbsurdDrift(got, expected)
+		return
+	}
+	p.logger.Debug("participant: correcting drift",
+		"drift_ms", got-expected, "got_ms", got, "expected_ms", expected)
 	if err := seeker.Seek(ctx, expected); err != nil {
 		p.logger.Warn("participant: drift correction failed", "error", err)
 	}
+}
+
+// absurdDriftMs is how far apart two positions have to be before correcting
+// them stops being about playback and starts being about a broken comparison.
+const absurdDriftMs = 60_000
+
+// sayAbsurdDrift reports a drift too large to be a drift, once per song: a
+// warning every beat for a condition that is not going away is noise, and the
+// number is what matters.
+func (p *Participant) sayAbsurdDrift(got, expected int64) {
+	p.mu.Lock()
+	said := p.absurdSaid
+	p.absurdSaid = true
+	p.mu.Unlock()
+	if said {
+		return
+	}
+	p.logger.Warn("participant: drift far too large to correct; waiting for the room to move",
+		"drift_ms", got-expected, "got_ms", got, "expected_ms", expected)
 }
 
 // ensureTrack makes sure a rendition of the track is on disk locally. A copy
@@ -788,6 +820,7 @@ func (p *Participant) setLocal(local *localPlayback) {
 	p.mu.Lock()
 	previous := p.playing
 	p.playing = local
+	p.absurdSaid = false
 	p.mu.Unlock()
 	if previous != nil && previous.cancel != nil {
 		previous.cancel()
