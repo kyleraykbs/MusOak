@@ -66,9 +66,9 @@ type QueueItem struct {
 	ArtistIDs []string `json:"artistIds,omitempty"`
 }
 
-// playback is the last host sync: the item, its position and whether the host
-// is paused. The server stamps the position at receipt so clients can compare
-// their player to it between the once-per-second syncs.
+// playback is the room's current song and where the server says it is. The
+// position is anchored at server time atMs so a client can extrapolate between
+// the once-a-second updates.
 type playback struct {
 	item       QueueItem
 	votes      map[string]int
@@ -117,21 +117,14 @@ type room struct {
 	master  []QueueItem
 	current *playback
 
-	// serverDriven is true while the host has no live socket and the server is
-	// therefore the room's clock: the room keeps time and moves on by itself
-	// until the host comes back. It is derived (reticLocked) rather than set by
-	// hand, so only one place decides who drives.
-	serverDriven bool
-	// endTimer fires when the server, driving a song, reaches its end; idleTimer
-	// closes a room that has stopped making progress. Both are re-armed from
-	// scratch after every change.
-	endTimer  Timer
-	idleTimer Timer
-	// retic guards the publish funnel: reticLocked publishes the driver change,
-	// and that publish must not re-enter it.
-	retic bool
-	// closed marks a room that has been forgotten; nothing more is scheduled for
-	// it and the clock re-read leaves it alone.
+	// queueDirty names the member queues that changed since the last tick. The
+	// tick republishes those queues, so a client that missed the immediate
+	// queue_updated still gets the room's own picture of the order.
+	queueDirty map[string]bool
+	// idleSinceMs is when the room last made progress: a song running to a
+	// listener. A room that has been going nowhere for idleRoomAfter closes.
+	idleSinceMs int64
+	// closed marks a room that has been forgotten; the tick leaves it alone.
 	closed bool
 
 	// seq counts every event the room has published; a client that sees a gap
@@ -139,28 +132,18 @@ type room struct {
 	seq int64
 }
 
-// Who is running a room's clock. The host's own player is the clock while the
-// host has a live socket; otherwise the server keeps time.
-const (
-	DrivenByHost   = "host"
-	DrivenByServer = "server"
-)
-
 // PlaybackView is the current song's state. PositionMs is the position at AtMs
 // on the server clock; a client computes where the room should be with
 // position + (serverNow - atMs) while Started is true and Paused is false.
 type PlaybackView struct {
-	Item       QueueItem `json:"item"`
-	PositionMs int64     `json:"positionMs"`
-	AtMs       int64     `json:"atMs"`
-	Started    bool      `json:"started"`
-	Paused     bool      `json:"paused"`
-	DurationMs int64     `json:"durationMs"`
-	// DrivenBy is "host" while the host's player is the room's clock and
-	// "server" while the server keeps time because the host is away.
-	DrivenBy  string         `json:"drivenBy"`
-	Votes     map[string]int `json:"votes"`
-	MeanScore float64        `json:"meanScore"`
+	Item       QueueItem      `json:"item"`
+	PositionMs int64          `json:"positionMs"`
+	AtMs       int64          `json:"atMs"`
+	Started    bool           `json:"started"`
+	Paused     bool           `json:"paused"`
+	DurationMs int64          `json:"durationMs"`
+	Votes      map[string]int `json:"votes"`
+	MeanScore  float64        `json:"meanScore"`
 }
 
 // Snapshot is a room as clients see it.
@@ -222,7 +205,20 @@ type Manager struct {
 	bus    *Bus
 	clock  Clock
 	store  Store
+	// stop closes the tick loop; nil while the loop is not running.
+	stop chan struct{}
 }
+
+// tickEvery is how often the room clocks advance and republish. One second is
+// the heartbeat clients follow: their own players run between beats, and the
+// next beat is the correction.
+const tickEvery = time.Second
+
+// unknownDurationFallbackMs is how long a song whose length the server never
+// learned is left playing before the tick moves on. Without a length there is
+// nothing to compare the position to, so a generous window is used rather than
+// stranding the room on a song that can never finish.
+const unknownDurationFallbackMs = 5 * 60 * 1000
 
 // socketGrace is how long a member's rooms are kept after their last event
 // socket closes. Long enough that a client reconnecting through a dropped
@@ -230,9 +226,8 @@ type Manager struct {
 const socketGrace = 10 * time.Second
 
 // idleRoomAfter is how long a room that is not making progress is left open: no
-// song, the song paused, or a server-driven room with nothing left to play. A
-// room with nothing playing in it and nobody to come back to it is one that
-// should not sit there for ever.
+// song playing to a listener. A room with nothing playing in it and nobody to
+// come back to it is one that should not sit there for ever.
 const idleRoomAfter = 2 * time.Hour
 
 // NewManager returns a room manager. The store is what queue rows read their
@@ -268,7 +263,6 @@ func (m *Manager) Connect(memberID string) {
 		delete(m.leaving, memberID)
 	}
 	m.connections[memberID]++
-	m.reticMemberLocked(memberID)
 }
 
 // Disconnect drops one of a member's event sockets, and takes them out of every
@@ -293,8 +287,6 @@ func (m *Manager) Disconnect(memberID string) {
 		timer.Stop()
 	}
 	m.leaving[memberID] = time.AfterFunc(m.grace, func() { m.leaveEveryRoom(memberID) })
-	// A host whose socket just went is a room that has to keep its own time.
-	m.reticMemberLocked(memberID)
 }
 
 // leaveEveryRoom takes a member out of every room they are in, once the grace
@@ -323,18 +315,129 @@ func (m *Manager) Bus() *Bus { return m.bus }
 // Subscribe returns a channel of room events and a cancel function.
 func (m *Manager) Subscribe() (<-chan Event, func()) { return m.bus.Subscribe() }
 
-// Close stops the pending leave timers. Room state is in memory; nothing is
-// persisted.
+// Start begins the room clock: one tick a second advances and republishes every
+// room. It is called once by the server; a manager that was never started is
+// driven by tests through tick directly. Starting twice is a no-op.
+func (m *Manager) Start() {
+	m.mu.Lock()
+	if m.stop != nil {
+		m.mu.Unlock()
+		return
+	}
+	stop := make(chan struct{})
+	m.stop = stop
+	m.mu.Unlock()
+	go m.run(stop)
+}
+
+// run is the tick loop.
+func (m *Manager) run(stop <-chan struct{}) {
+	ticker := time.NewTicker(tickEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			m.tick(m.NowMs())
+		}
+	}
+}
+
+// tick advances every room's clock by one beat. It is unexported and takes
+// the time so tests can drive it with a held clock instead of waiting.
+func (m *Manager) tick(nowMs int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, id := range append([]string(nil), m.roomOrder...) {
+		room, ok := m.rooms[id]
+		if !ok || room.closed {
+			continue
+		}
+		m.tickRoomLocked(room, nowMs)
+	}
+}
+
+// tickRoomLocked is one room's beat: start it if it has a queue and a listener,
+// move past every song that has ended, republish the anchored position, and
+// close a room that has been going nowhere for the idle window.
+func (m *Manager) tickRoomLocked(room *room, nowMs int64) {
+	listening := m.anyoneListeningLocked(room)
+	playing := room.current != nil && room.current.started && !room.current.paused
+	// A song running to a listener is progress; its clock is put back so the
+	// idle window only counts the time a room is doing nothing.
+	if playing && listening {
+		room.idleSinceMs = nowMs
+	}
+
+	if listening {
+		published := false
+		if room.current == nil && len(room.master) > 0 {
+			published = m.beginLocked(room)
+		}
+		for m.finishedLocked(room, nowMs) {
+			if m.advanceLocked(room, "ended", "") {
+				published = true
+			}
+		}
+		// A beat carries the queue the server's own advance changed; a member's
+		// edit announced itself the moment it was made.
+		for memberID := range room.queueDirty {
+			m.publishLocked(room, EventQueueUpdated, queueDataLocked(room, memberID))
+		}
+		room.queueDirty = nil
+		// The heartbeat: the anchored state again this second, unless the beat
+		// already published it while starting or advancing.
+		if room.current != nil && !published {
+			m.publishLocked(room, EventPlayback, m.playbackDataLocked(room))
+		}
+	}
+	if room.closed {
+		return
+	}
+
+	if !(playing && listening) {
+		if room.idleSinceMs == 0 {
+			room.idleSinceMs = nowMs
+		}
+		if nowMs-room.idleSinceMs >= m.idleAfter.Milliseconds() {
+			m.logger.Info("room: closing an idle room", "room", room.id,
+				"name", room.name, "idle_for", m.idleAfter.String())
+			m.closeRoomLocked(room)
+		}
+	}
+}
+
+// finishedLocked reports whether the current song has played out at nowMs.
+func (m *Manager) finishedLocked(room *room, nowMs int64) bool {
+	current := room.current
+	if current == nil || !current.started || current.paused {
+		return false
+	}
+	if current.durationMs > 0 {
+		return current.positionMs(nowMs) >= current.durationMs
+	}
+	// The length was never learned, so there is nothing to measure against: a
+	// long fallback window of play moves the room on rather than stranding it.
+	return nowMs-current.atMs >= unknownDurationFallbackMs
+}
+
+// Close stops the room clock and the pending leave timers. Room state is in
+// memory; nothing is persisted.
 func (m *Manager) Close() {
+	m.mu.Lock()
+	stop := m.stop
+	m.stop = nil
+	m.mu.Unlock()
+	if stop != nil {
+		close(stop)
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for memberID, timer := range m.leaving {
 		timer.Stop()
 		delete(m.leaving, memberID)
-	}
-	for _, room := range m.rooms {
-		m.stopTimer(&room.endTimer)
-		m.stopTimer(&room.idleTimer)
 	}
 }
 
@@ -384,6 +487,8 @@ func (m *Manager) Create(name string, controls Controls, password string, host M
 		members:     map[string]*Member{host.ID: &host},
 		order:       []string{host.ID},
 		queues:      map[string][]QueueItem{host.ID: {}},
+		queueDirty:  map[string]bool{},
+		idleSinceMs: m.nowMsLocked(),
 	}
 	m.rooms[id] = room
 	m.roomOrder = append(m.roomOrder, id)
@@ -537,6 +642,7 @@ func (m *Manager) Join(roomID string, member Member, password, supersedes string
 	if !known || supersedes != "" {
 		m.publishLocked(room, EventQueueUpdated, queueDataLocked(room, member.ID))
 	}
+	m.startIfListeningLocked(room)
 	return m.snapshotLocked(room), nil
 }
 
@@ -651,8 +757,8 @@ func dropItemLocked(room *room, item QueueItem) {
 	}
 }
 
-// Enqueue appends a track to the member's queue. The host starts it by syncing
-// the first item from the generated mix.
+// Enqueue appends a track to the member's queue. A room with somebody
+// listening starts playing it when it reaches the front of the play order.
 func (m *Manager) Enqueue(ctx context.Context, roomID, memberID string, trackID uuid.UUID) (*Snapshot, error) {
 	return m.EnqueueMany(ctx, roomID, memberID, []uuid.UUID{trackID})
 }
@@ -687,6 +793,7 @@ func (m *Manager) EnqueueMany(ctx context.Context, roomID, memberID string, trac
 	room.queues[memberID] = append(room.queues[memberID], items...)
 	recomputeMasterLocked(room)
 	m.publishLocked(room, EventQueueUpdated, queueDataLocked(room, memberID))
+	m.startIfListeningLocked(room)
 	return m.snapshotLocked(room), nil
 }
 
@@ -803,22 +910,13 @@ func (m *Manager) Clear(roomID, memberID, targetMemberID string) (*Snapshot, err
 	return m.snapshotLocked(room), nil
 }
 
-// SyncState is one report from the host's ordinary queue player. ItemID names
-// the queue entry (not only its canonical track, which may be queued twice).
-type SyncState struct {
-	ItemID     string
-	TrackID    uuid.UUID
-	PositionMs int64
-	DurationMs int64
-	Started    bool
-	Paused     bool
-}
-
-// beginLocked puts up the first queued item when there is no current one. The
-// host's next sync starts it; explicit skips and votes also use this path.
-func (m *Manager) beginLocked(room *room) {
+// beginLocked puts the first item of the play order on, running: the server is
+// the room's clock, so a song starts when the room has one to play and stops
+// only when somebody pauses it or the room runs out. Explicit skips and votes
+// also use this path. It reports whether it published the new current.
+func (m *Manager) beginLocked(room *room) bool {
 	if room.current != nil || len(room.master) == 0 {
-		return
+		return false
 	}
 	item := room.master[0]
 	room.current = &playback{
@@ -827,77 +925,59 @@ func (m *Manager) beginLocked(room *room) {
 		anchor:     0,
 		atMs:       m.nowMsLocked(),
 		durationMs: item.DurationMs,
-		paused:     true,
+		started:    true,
 	}
 	m.publishLocked(room, EventPlayback, m.playbackDataLocked(room))
+	return true
 }
 
-func (m *Manager) advanceLocked(room *room, reason, by string) {
-	if room.current == nil {
+// startIfListeningLocked begins the room's first song when it has one to play,
+// nothing on, and somebody listening. The tick does the same every beat; doing
+// it here too keeps a room that was just filled from waiting a second for its
+// own answer.
+func (m *Manager) startIfListeningLocked(room *room) {
+	if room.current != nil || len(room.master) == 0 {
 		return
 	}
-	m.logger.Info("room: advance requested", "room", room.id, "reason", reason, "by", by,
-		"track", room.current.item.TrackID, "position_ms", room.current.positionMs(m.nowMsLocked()))
-	dropItemLocked(room, room.current.item)
-	room.current = nil
+	if !m.anyoneListeningLocked(room) {
+		return
+	}
 	m.beginLocked(room)
-	if room.current == nil {
-		m.publishLocked(room, EventPlayback, m.playbackDataLocked(room))
-	}
 }
 
-// reticLocked re-reads a room's clock after a change: who drives it, when the
-// song the server is driving ends, and whether the room has stopped making
-// progress. Every deadline is re-armed from scratch rather than adjusted, so one
-// place decides what is scheduled.
-//
-// It publishes when the driver changes, and that publish comes back here, so the
-// guard is what keeps one re-read from arming two sets of deadlines and
-// orphaning the first.
-func (m *Manager) reticLocked(room *room) {
-	if room.closed || room.retic {
+// advanceLocked drops the current item as played and starts the next one. The
+// item leaves its owner's queue and the play order, and that queue is marked
+// for the next tick to republish: the advance is the server's own change, so
+// the beat is where it is announced. It reports whether a playback view was
+// published for the new state.
+func (m *Manager) advanceLocked(room *room, reason, by string) bool {
+	if room.current == nil {
+		return false
+	}
+	current := room.current.item
+	m.logger.Info("room: advance requested", "room", room.id, "reason", reason, "by", by,
+		"track", current.TrackID, "position_ms", room.current.positionMs(m.nowMsLocked()))
+	dropItemLocked(room, current)
+	room.current = nil
+	m.markQueueDirtyLocked(room, current.AddedBy)
+	if m.beginLocked(room) {
+		return true
+	}
+	m.publishLocked(room, EventPlayback, m.playbackDataLocked(room))
+	return true
+}
+
+// markQueueDirtyLocked remembers a queue the tick must republish. Only the
+// server's own queue change goes this way; a member's edit announces itself the
+// moment it is made.
+func (m *Manager) markQueueDirtyLocked(room *room, memberID string) {
+	if memberID == "" {
 		return
 	}
-	room.retic = true
-	defer func() { room.retic = false }()
-	m.stopTimer(&room.endTimer)
-	m.stopTimer(&room.idleTimer)
-
-	driven := !m.hostPresentLocked(room)
-	if driven != room.serverDriven {
-		room.serverDriven = driven
-		// Whose clock it is is part of what a client needs: a follower stops
-		// waiting for a host that is not there.
-		m.publishLocked(room, EventPlayback, m.playbackDataLocked(room))
+	if room.queueDirty == nil {
+		room.queueDirty = map[string]bool{}
 	}
-
-	current := room.current
-	playing := current != nil && current.started && !current.paused
-	timed := false
-	if driven && playing && current.durationMs > 0 && m.anyoneListeningLocked(room) {
-		remaining := current.durationMs - current.positionMs(m.nowMsLocked())
-		if remaining < 1 {
-			remaining = 1
-		}
-		timed = true
-		itemID := current.item.ID
-		room.endTimer = m.clock.AfterFunc(time.Duration(remaining)*time.Millisecond, func() {
-			m.endSong(room.id, itemID)
-		})
-	}
-	// A room that is not playing, or one the server has no way to move on
-	// (nothing listening, or a length it never learned), is going nowhere: it
-	// closes once it has been that way for the idle window.
-	if !playing || (driven && !timed) {
-		room.idleTimer = m.clock.AfterFunc(m.idleAfter, func() { m.closeIdle(room.id) })
-	}
-}
-
-// hostPresentLocked reports whether the host has a live event socket. The server
-// drives exactly while it does not: the host's player is the room's clock while
-// the host is there to report it, and the room keeps its own time otherwise.
-func (m *Manager) hostPresentLocked(room *room) bool {
-	return m.connections[room.host] > 0
+	room.queueDirty[memberID] = true
 }
 
 // anyoneListeningLocked reports whether any member of the room has a live event
@@ -910,169 +990,6 @@ func (m *Manager) anyoneListeningLocked(room *room) bool {
 		}
 	}
 	return false
-}
-
-// reticMemberLocked re-reads every room a member is in: their socket opening or
-// closing is what makes a room server-driven, and what stops it being.
-func (m *Manager) reticMemberLocked(memberID string) {
-	for _, id := range m.roomOrder {
-		room, ok := m.rooms[id]
-		if !ok {
-			continue
-		}
-		if _, member := room.members[memberID]; member {
-			m.reticLocked(room)
-		}
-	}
-}
-
-// endSong is the server's clock reaching the end of the song the host last
-// reported. It only acts while the host is still away and the room is still on
-// that song: a host that came back, or a room that already moved on, owns the
-// answer instead.
-func (m *Manager) endSong(roomID, itemID string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	room, err := m.roomLocked(roomID)
-	if err != nil {
-		return
-	}
-	current := room.current
-	if current == nil || current.item.ID != itemID || m.hostPresentLocked(room) {
-		return
-	}
-	m.logger.Info("room: the server is moving the room on", "room", room.id,
-		"track", current.item.TrackID, "reason", "host away")
-	m.advanceLocked(room, "server", "")
-	m.startServerDrivenLocked(room)
-	m.reticLocked(room)
-}
-
-// startServerDrivenLocked begins the song a server-driven room is on: with no
-// host to report a player, the next song starts when the last one ends.
-func (m *Manager) startServerDrivenLocked(room *room) {
-	current := room.current
-	if current == nil || m.hostPresentLocked(room) {
-		return
-	}
-	current.started = true
-	current.paused = false
-	current.anchor = 0
-	current.atMs = m.nowMsLocked()
-	m.publishLocked(room, EventPlayback, m.playbackDataLocked(room))
-}
-
-// closeIdle closes a room that has been going nowhere for the idle window. The
-// room is looked at again here: a song that began since the timer was armed is a
-// room worth keeping.
-func (m *Manager) closeIdle(roomID string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	room, ok := m.rooms[roomID]
-	if !ok {
-		return
-	}
-	current := room.current
-	if current != nil && current.started && !current.paused {
-		return
-	}
-	m.logger.Info("room: closing an idle room", "room", room.id, "name", room.name,
-		"idle_for", m.idleAfter.String())
-	m.closeRoomLocked(room)
-}
-
-// stopTimer cancels a room deadline and clears the field holding it.
-func (m *Manager) stopTimer(timer *Timer) {
-	if *timer == nil {
-		return
-	}
-	(*timer).Stop()
-	*timer = nil
-}
-
-// Sync records the host's current entry, position and pause state. The host's
-// normal queue player advances itself; this mirrors its state to the room and
-// followers. Hosts send one sync per second, and immediately on player changes.
-func (m *Manager) Sync(roomID, memberID string, update SyncState) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	room, err := m.roomLocked(roomID)
-	if err != nil {
-		return err
-	}
-	if _, ok := room.members[memberID]; !ok {
-		return ErrMemberNotFound
-	}
-	if memberID != room.host {
-		return ErrForbidden
-	}
-
-	if update.ItemID == "" {
-		changed := room.current != nil
-		if room.current != nil {
-			dropItemLocked(room, room.current.item)
-			room.current = nil
-		}
-		if len(room.master) > 0 {
-			m.beginLocked(room)
-		} else if changed {
-			m.publishLocked(room, EventPlayback, m.playbackDataLocked(room))
-		}
-		return nil
-	}
-	if update.PositionMs < 0 {
-		update.PositionMs = 0
-	}
-
-	var item QueueItem
-	newItem := room.current == nil || room.current.item.ID != update.ItemID
-	if !newItem {
-		item = room.current.item
-		if update.TrackID != uuid.Nil && item.TrackID != update.TrackID {
-			return ErrInvalidOrder
-		}
-	} else {
-		// Host queue and room mix use the same order: after the old current is
-		// spliced out, the host's new entry must be the first pending item.
-		var pending []QueueItem
-		for _, queued := range room.master {
-			if room.current == nil || queued.ID != room.current.item.ID {
-				pending = append(pending, queued)
-			}
-		}
-		if len(pending) == 0 || pending[0].ID != update.ItemID {
-			m.logger.Warn("room: host sync is not the next mixed item", "room", room.id,
-				"item", update.ItemID, "current", room.current)
-			m.publishLocked(room, EventPlayback, m.playbackDataLocked(room))
-			return nil
-		}
-		item = pending[0]
-		if update.TrackID != uuid.Nil && item.TrackID != update.TrackID {
-			m.logger.Warn("room: host sync track does not match its queue item", "room", room.id,
-				"item", update.ItemID, "track", update.TrackID, "queued_track", item.TrackID)
-			m.publishLocked(room, EventPlayback, m.playbackDataLocked(room))
-			return nil
-		}
-		if room.current != nil {
-			dropItemLocked(room, room.current.item)
-		}
-		room.current = &playback{item: item, votes: map[string]int{}, durationMs: item.DurationMs}
-	}
-
-	current := room.current
-	current.anchor = update.PositionMs
-	current.atMs = m.nowMsLocked()
-	if update.DurationMs > 0 {
-		current.durationMs = update.DurationMs
-	}
-	current.started = current.started || update.Started
-	current.paused = update.Paused
-
-	m.publishLocked(room, EventPlayback, m.playbackDataLocked(room))
-	return nil
 }
 
 // Pause freezes the room position.
@@ -1305,21 +1222,15 @@ func (m *Manager) playbackDataLocked(room *room) map[string]any {
 func (m *Manager) closeRoomLocked(room *room) {
 	delete(m.rooms, room.id)
 	m.roomOrder = removeString(m.roomOrder, room.id)
-	// A closed room schedules nothing: its deadlines are dropped here, and the
-	// publish funnel skips it from now on.
+	// A closed room is one the tick leaves alone from now on.
 	room.closed = true
-	m.stopTimer(&room.endTimer)
-	m.stopTimer(&room.idleTimer)
 	m.publishLocked(room, EventRoomClosed, nil)
 	m.logger.Info("room closed", "room", room.id)
 }
 
-// publishLocked announces a room change, then re-reads the room's clock.
-//
-// The clock depends on state any change can touch - who is connected, what is
-// playing, how long it is - so it is re-read in the one function every change
-// already passes through rather than at each call site, where a new mutation
-// could quietly forget it and leave a room that never closes or never moves on.
+// publishLocked announces a room change. It is the one funnel every change goes
+// through, so a room's seq counts every event and a client can tell a missed one
+// from a stream that is simply quiet.
 func (m *Manager) publishLocked(room *room, eventType EventType, data any) {
 	room.seq++
 	m.bus.Publish(Event{
@@ -1329,7 +1240,6 @@ func (m *Manager) publishLocked(room *room, eventType EventType, data any) {
 		AtMs:   m.nowMsLocked(),
 		Data:   data,
 	})
-	m.reticLocked(room)
 }
 
 // snapshotLocked renders the room for clients.
@@ -1378,10 +1288,6 @@ func (m *Manager) viewLocked(room *room, nowMs int64) *PlaybackView {
 	for memberID, score := range current.votes {
 		votes[memberID] = score
 	}
-	driver := DrivenByHost
-	if room.serverDriven {
-		driver = DrivenByServer
-	}
 	return &PlaybackView{
 		Item:       current.item,
 		PositionMs: current.positionMs(nowMs),
@@ -1389,7 +1295,6 @@ func (m *Manager) viewLocked(room *room, nowMs int64) *PlaybackView {
 		Started:    current.started,
 		Paused:     current.paused,
 		DurationMs: current.durationMs,
-		DrivenBy:   driver,
 		Votes:      votes,
 		MeanScore:  meanScore(current.votes),
 	}

@@ -51,18 +51,6 @@ type voteRequest struct {
 	Score int `json:"score"`
 }
 
-// roomSyncRequest is the host's current queue entry and player state. The host
-// sends it on changes and once per second; the server timestamps it and
-// broadcasts it to the room.
-type roomSyncRequest struct {
-	ItemID     string `json:"itemId"`
-	TrackID    string `json:"trackId"`
-	PositionMs int64  `json:"positionMs"`
-	DurationMs int64  `json:"durationMs"`
-	Started    bool   `json:"started"`
-	Paused     bool   `json:"paused"`
-}
-
 // callerMember builds the member identity for a room command. Authenticated
 // callers are their account; guests carry their member id in a header.
 func (s *Server) callerMember(r *http.Request, allowNew bool) (rooms.Member, bool) {
@@ -327,40 +315,8 @@ func (s *Server) handleRoomVote(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, room)
 }
 
-// handleRoomSync accepts the host's latest queue entry, position and pause
-// state; it timestamps and broadcasts that state to every follower.
-func (s *Server) handleRoomSync(w http.ResponseWriter, r *http.Request) {
-	member, ok := s.callerMember(r, false)
-	if !ok {
-		writeError(w, http.StatusBadRequest, "member identity required")
-		return
-	}
-	var req roomSyncRequest
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	trackID := uuid.Nil
-	if req.TrackID != "" {
-		parsed, err := uuid.Parse(req.TrackID)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid trackId")
-			return
-		}
-		trackID = parsed
-	}
-	err := s.rooms.Sync(r.PathValue("roomId"), member.ID, rooms.SyncState{
-		ItemID: req.ItemID, TrackID: trackID, PositionMs: req.PositionMs,
-		DurationMs: req.DurationMs, Started: req.Started, Paused: req.Paused,
-	})
-	if err != nil {
-		writeRoomError(w, err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
 // handleClock reports the server clock; clients measure their offset from it
-// and keep re-syncing while they follow a room.
+// and keep comparing their player to the room's anchored position.
 func (s *Server) handleClock(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"nowMs": s.rooms.NowMs(),

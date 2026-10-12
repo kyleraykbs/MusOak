@@ -37,7 +37,7 @@ func (c *Client) mediaResponse(ctx context.Context, variantID string) (*http.Res
 // cares which.
 type Sink interface {
 	// Play starts playback and returns when the local file finishes or ctx ends.
-	// The host advances its queue on completion; a follower waits for the room.
+	// The participant advances to the next song itself when it returns.
 	Play(ctx context.Context, track SinkTrack) error
 	Stop(ctx context.Context) error
 }
@@ -53,7 +53,8 @@ type Seeker interface {
 	Seek(ctx context.Context, positionMs int64) error
 }
 
-// Positioner reports the local playhead for drift correction and host sync.
+// Positioner reports the local playhead for drift correction against the room's
+// position.
 type Positioner interface {
 	PositionMs(ctx context.Context) (int64, error)
 }
@@ -85,9 +86,11 @@ const (
 	prefetchAhead = 3
 )
 
-// Participant follows a room on behalf of one member. The host consumes the
-// room's mixed queue and reports its current player state; other members load
-// the room's song and correct drift only when it exceeds two seconds.
+// Participant follows a room on behalf of one member. The server is the room's
+// clock: this client plays the room's current song, corrects itself to the
+// room's position when it drifts more than two seconds, and advances to the
+// next song on its own when its own file ends. It never reports a position; the
+// server's once-a-second state is only ever a correction.
 type Participant struct {
 	room   *RoomClient
 	cache  *Cache
@@ -101,15 +104,22 @@ type Participant struct {
 	OnEvent func(Event)
 	OnTrack func(SinkTrack)
 
-	mu              sync.Mutex
-	offsetMs        int64
-	host            string
-	current         *RoomPlayback
-	master          []QueueItem
+	mu       sync.Mutex
+	offsetMs int64
+	current  *RoomPlayback
+	master   []QueueItem
+	// played names items this client has advanced past locally. A server state
+	// that still names one of them is a beat behind the client, not a
+	// correction to apply.
+	played map[string]bool
+	// loadLatencyMs is the smoothed time a load takes, from asking for the file
+	// to the sink being ready; it is added to the room's position when starting
+	// a load so the audible start lands where the room will be, not where it was.
+	loadLatencyMs int64
+
 	playing         *localPlayback
 	warming         map[string]bool
 	lastSeq         int64
-	lastHostSync    time.Time
 	advancingItemID string
 }
 
@@ -138,6 +148,7 @@ func NewParticipant(room *RoomClient, cache *Cache, sink Sink, logger *slog.Logg
 		clockSamples:   defaultClockSamples,
 		resyncEvery:    defaultResyncEvery,
 		driftTolerance: defaultDriftToleranceMs,
+		played:         map[string]bool{},
 		warming:        map[string]bool{},
 	}
 }
@@ -209,7 +220,6 @@ func (p *Participant) adopt(room *Room) {
 	if room == nil || (p.lastSeq != 0 && room.Seq != 0 && room.Seq < p.lastSeq) {
 		return
 	}
-	p.host = room.Host
 	p.current = room.Current
 	p.master = append([]QueueItem(nil), room.MasterQueue...)
 	p.lastSeq = room.Seq
@@ -267,14 +277,9 @@ func (p *Participant) apply(ctx context.Context, event Event) bool {
 		return true
 
 	case EventHostChanged:
-		var data HostChangedEvent
-		if err := event.DecodeData(&data); err != nil {
-			return false
-		}
-		p.mu.Lock()
-		p.host = data.Host
-		p.mu.Unlock()
-		return true
+		// Who leads decides who may command the room, not what plays: nothing
+		// here follows the host's player any more.
+		return false
 	}
 	return false
 }
@@ -288,20 +293,20 @@ func dropQueueItem(queue []QueueItem, itemID string) []QueueItem {
 	return queue
 }
 
-// reconcile is the playback rule, run on events and once a second.
+// reconcile is the playback rule, run on room events and once a second. It is
+// correction-only: between the server's beats this client's own player runs the
+// room's order, and the server's state is applied only where the two disagree.
 func (p *Participant) reconcile(ctx context.Context) {
 	p.mu.Lock()
 	current := p.current
-	host := p.host
-	if current == nil && host == p.room.MemberID && len(p.master) > 0 {
-		item := p.master[0]
-		current = &RoomPlayback{Item: item, DurationMs: item.DurationMs, Paused: true}
-		p.current = current
-	}
 	local := p.playing
-	var localPlaying, localPaused, localEnded bool
+	var (
+		localPlaying, localPaused, localEnded bool
+		localItemID                           string
+	)
 	if local != nil {
 		localPlaying, localPaused, localEnded = local.playing, local.paused, local.ended
+		localItemID = local.itemID
 	}
 	p.mu.Unlock()
 
@@ -310,9 +315,67 @@ func (p *Participant) reconcile(ctx context.Context) {
 		return
 	}
 	item := current.Item
-	isHost := host == p.room.MemberID
-	expected := current.PositionAt(p.serverNow())
-	if local == nil || local.itemID != item.ID {
+
+	// A paused room holds its file where it is. The next beat after a resume
+	// puts this client back on the room's song and position.
+	if current.Paused {
+		if local != nil && localPlaying && !localPaused {
+			p.pause(ctx, local, true)
+		}
+		return
+	}
+
+	if local == nil || localItemID != item.ID {
+		if p.hasPlayed(item.ID) {
+			// This client ran past that song on its own and the server has not
+			// caught up yet: its state is a beat behind, not a correction.
+			return
+		}
+		p.load(ctx, current, p.startAt(current))
+		return
+	}
+	// Server and client agree on the song: any item this client advanced past
+	// locally is behind both of them now.
+	p.forgetPlayed()
+
+	if localEnded {
+		p.advanceLocal(ctx, item.ID)
+		return
+	}
+	if !localPlaying {
+		p.load(ctx, current, p.startAt(current))
+		return
+	}
+	if localPaused {
+		p.pause(ctx, local, false)
+		return
+	}
+	p.correctDrift(ctx, local, current.PositionAt(p.serverNow()))
+}
+
+// startAt is where a load should start so it lands on the room's position: the
+// place the room will be once the load has taken its smoothed time.
+func (p *Participant) startAt(current *RoomPlayback) int64 {
+	p.mu.Lock()
+	latency := p.loadLatencyMs
+	p.mu.Unlock()
+	return current.PositionAt(p.serverNow() + latency)
+}
+
+// load puts the room's song on the sink at the given position, fetching the file
+// first when this client does not hold one. If a fresh file, the load is timed
+// from issue through to the sink actually playing and the estimate is smoothed,
+// so the next load can be started in time to land on the room's beat.
+func (p *Participant) load(ctx context.Context, current *RoomPlayback, expected int64) {
+	item := current.Item
+	p.mu.Lock()
+	local := p.playing
+	sameFile := local != nil && local.itemID == item.ID
+	p.mu.Unlock()
+
+	var issuedAt time.Time
+	if !sameFile {
+		issuedAt = time.Now()
 		entry, err := p.ensureTrack(ctx, item.TrackID)
 		if err != nil {
 			p.logger.Warn("participant: could not load the room's song", "track", item.TrackID, "error", err)
@@ -320,61 +383,75 @@ func (p *Participant) reconcile(ctx context.Context) {
 		}
 		p.setLocal(&localPlayback{itemID: item.ID, trackID: item.TrackID, entry: entry})
 		local = p.local()
-		localPlaying, localPaused, localEnded = false, false, false
 	}
+	p.play(ctx, local, item, expected, issuedAt)
+}
 
-	if !current.Started {
-		if isHost {
-			switch {
-			case localEnded:
-				p.advanceHost(ctx, item.ID)
-			case localPlaying:
-				p.syncHost(ctx, local, current)
-			default:
-				p.play(ctx, local, current, expected, true)
-			}
+// watchStart times a load through to the sink actually playing: from the moment
+// the load was issued to the first position the sink reports at or past the
+// start. The sink's own start latency is what the room's boundary has to absorb,
+// and it is not observable any other way through the Sink interface.
+func (p *Participant) watchStart(ctx context.Context, issuedAt time.Time, expected int64, local *localPlayback, generation int) {
+	positioner, ok := p.sink.(Positioner)
+	if !ok {
+		return
+	}
+	target := expected + 50
+	if target < 50 {
+		target = 50
+	}
+	// Nothing that has not started in five seconds is going to: the estimate
+	// keeps its old value rather than waiting longer.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		p.mu.Lock()
+		same := p.playing == local && p.playing.generation == generation
+		p.mu.Unlock()
+		if !same {
+			return
 		}
-		return
-	}
-	if current.Paused {
-		if localPlaying && !localPaused {
-			if pauser, ok := p.sink.(Pauser); ok {
-				if err := pauser.Pause(ctx); err != nil {
-					p.logger.Warn("participant: pause", "error", err)
-				}
-			}
-			p.setPaused(local, true)
+		if position, err := positioner.PositionMs(ctx); err == nil && position >= target {
+			p.measureLoad(time.Since(issuedAt))
+			return
 		}
-		return
-	}
-	if localEnded {
-		if isHost {
-			p.advanceHost(ctx, item.ID)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(20 * time.Millisecond):
 		}
-		return
-	}
-	if !localPlaying {
-		p.play(ctx, local, current, expected, isHost)
-		return
-	}
-	if localPaused {
-		if pauser, ok := p.sink.(Pauser); ok {
-			if err := pauser.Resume(ctx); err != nil {
-				p.logger.Warn("participant: resume", "error", err)
-			}
-		}
-		p.setPaused(local, false)
-		return
-	}
-	p.correctDrift(ctx, local, expected)
-	if isHost {
-		p.syncHost(ctx, local, current)
 	}
 }
 
-// play starts the local file. The host's sync turns its ordinary queue item
-// into the room's current song; the other members only follow that state.
-func (p *Participant) play(ctx context.Context, local *localPlayback, current *RoomPlayback, expected int64, isHost bool) {
+// measureLoad folds one load's duration into the smoothed estimate. A load from
+// cache costs only the sink's own start, so the estimate settles on what
+// starting a song from this device actually takes.
+func (p *Participant) measureLoad(took time.Duration) {
+	sample := took.Milliseconds()
+	if sample < 0 || sample > 10_000 {
+		// A wild sample is a stalled fetch, not a load time: leave the estimate
+		// alone rather than skewing it for the next songs.
+		return
+	}
+	p.mu.Lock()
+	if p.loadLatencyMs == 0 {
+		p.loadLatencyMs = sample
+	} else {
+		p.loadLatencyMs = (p.loadLatencyMs*3 + sample) / 4
+	}
+	p.mu.Unlock()
+}
+
+// play starts the local file at the given position. The sink runs it as an
+// ordinary queue entry: when it ends, this client moves on by itself. A fresh
+// load (issuedAt non-zero) is watched through to the sink playing so its cost is
+// measured; an already-loaded file has nothing to measure.
+func (p *Participant) play(ctx context.Context, local *localPlayback, item QueueItem, expected int64, issuedAt time.Time) {
+	if local == nil {
+		return
+	}
+	if expected < 0 {
+		expected = 0
+	}
 	slot := SinkTrack{
 		TrackID: local.trackID, VariantID: local.entry.VariantID, Path: local.entry.Path,
 		DurationMs: local.entry.DurationMs, PositionMs: expected,
@@ -394,20 +471,7 @@ func (p *Participant) play(ctx context.Context, local *localPlayback, current *R
 	local.ended = false
 	local.generation++
 	generation := local.generation
-	item := current.Item
 	p.mu.Unlock()
-
-	if isHost {
-		if err := p.room.Sync(ctx, RoomSync{
-			ItemID: item.ID, TrackID: item.TrackID, PositionMs: expected,
-			DurationMs: local.entry.DurationMs, Started: true, Paused: false,
-		}); err != nil {
-			p.logger.Warn("participant: report host playback", "error", err)
-		}
-		p.mu.Lock()
-		p.lastHostSync = time.Now()
-		p.mu.Unlock()
-	}
 
 	go func() {
 		err := p.sink.Play(playCtx, slot)
@@ -422,85 +486,82 @@ func (p *Participant) play(ctx context.Context, local *localPlayback, current *R
 		if err != nil && finished {
 			p.logger.Warn("participant: playback failed", "variant", slot.VariantID, "error", err)
 		}
-		if finished && same && isHost {
-			p.advanceHost(ctx, item.ID)
+		if finished && same {
+			// The file ran out, so the next song starts here rather than on the
+			// server's next beat. The server's state corrects this client if the
+			// room disagrees.
+			p.advanceLocal(ctx, item.ID)
 		}
 	}()
-}
 
-func (p *Participant) syncHost(ctx context.Context, local *localPlayback, current *RoomPlayback) {
-	now := time.Now()
-	p.mu.Lock()
-	if now.Sub(p.lastHostSync) < time.Second {
-		p.mu.Unlock()
-		return
-	}
-	p.lastHostSync = now
-	paused := local.paused
-	p.mu.Unlock()
-
-	position := current.PositionAt(p.serverNow())
-	if positioner, ok := p.sink.(Positioner); ok {
-		if measured, err := positioner.PositionMs(ctx); err == nil {
-			position = measured
+	if !issuedAt.IsZero() {
+		if _, ok := p.sink.(Positioner); ok {
+			go p.watchStart(playCtx, issuedAt, expected, local, generation)
+		} else {
+			// No playhead to watch: the load's own cost is all there is to time.
+			p.measureLoad(time.Since(issuedAt))
 		}
 	}
-	if position < 0 {
-		position = 0
-	}
-	if err := p.room.Sync(ctx, RoomSync{
-		ItemID: local.itemID, TrackID: local.trackID, PositionMs: position,
-		DurationMs: local.entry.DurationMs, Started: true, Paused: paused,
-	}); err != nil {
-		p.logger.Warn("participant: sync host playback", "error", err)
-	}
 }
 
-func (p *Participant) advanceHost(ctx context.Context, itemID string) {
+// advanceLocal moves to the next item of the room's own play order when this
+// client's file ends, without waiting for the server. The item played is
+// remembered so a server state that still names it is not taken as a correction.
+func (p *Participant) advanceLocal(ctx context.Context, itemID string) {
 	p.mu.Lock()
-	if p.host != p.room.MemberID || p.current == nil || p.current.Item.ID != itemID || p.advancingItemID == itemID {
+	if p.playing == nil || p.playing.itemID != itemID || p.advancingItemID == itemID {
 		p.mu.Unlock()
 		return
 	}
 	p.advancingItemID = itemID
-	p.mu.Unlock()
-
-	snapshot, err := p.room.Snapshot(ctx)
-	if err != nil {
-		p.clearAdvancing(itemID)
-		p.logger.Warn("participant: refresh host queue", "error", err)
-		return
-	}
-	p.adopt(snapshot)
-
-	p.mu.Lock()
-	if p.host != p.room.MemberID || p.current == nil || p.current.Item.ID != itemID {
-		p.mu.Unlock()
-		p.clearAdvancing(itemID)
-		return
-	}
-	var next *QueueItem
-	for _, item := range p.master {
-		if item.ID == itemID {
-			continue
-		}
-		candidate := item
-		next = &candidate
-		break
+	p.played[itemID] = true
+	p.master = dropQueueItem(p.master, itemID)
+	next, found := QueueItem{}, false
+	if len(p.master) > 0 {
+		next, found = p.master[0], true
 	}
 	p.mu.Unlock()
 
-	update := RoomSync{Paused: true}
-	if next != nil {
-		update.ItemID = next.ID
-		update.TrackID = next.TrackID
-		update.DurationMs = next.DurationMs
+	if !found {
+		p.clearAdvancing(itemID)
+		p.stop(ctx)
+		return
 	}
-	err = p.room.Sync(ctx, update)
+	p.load(ctx, &RoomPlayback{Item: next, DurationMs: next.DurationMs, Started: true}, 0)
 	p.clearAdvancing(itemID)
-	if err != nil {
-		p.logger.Warn("participant: advance host queue", "error", err)
+}
+
+func (p *Participant) hasPlayed(itemID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.played[itemID]
+}
+
+// forgetPlayed drops the local-advance memory once the server has caught up.
+func (p *Participant) forgetPlayed() {
+	p.mu.Lock()
+	if len(p.played) > 0 {
+		p.played = map[string]bool{}
 	}
+	p.mu.Unlock()
+}
+
+// pause pauses or resumes the local sink in place.
+func (p *Participant) pause(ctx context.Context, local *localPlayback, paused bool) {
+	pauser, ok := p.sink.(Pauser)
+	if !ok {
+		return
+	}
+	var err error
+	if paused {
+		err = pauser.Pause(ctx)
+	} else {
+		err = pauser.Resume(ctx)
+	}
+	if err != nil {
+		p.logger.Warn("participant: pause", "error", err)
+	}
+	p.setPaused(local, paused)
 }
 
 func (p *Participant) clearAdvancing(itemID string) {

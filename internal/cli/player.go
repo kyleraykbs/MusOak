@@ -42,6 +42,11 @@ type player struct {
 	// drawn serialises whole status lines.
 	drawn sync.Mutex
 
+	// items are the queue entries handed to mpv, in playlist order. position
+	// indexes into them, which is how a landed copy is matched to the track
+	// currently playing.
+	items []playbackItem
+
 	mu          sync.Mutex
 	loaded      int
 	pendingSkip int
@@ -236,24 +241,113 @@ func (p *player) skip(ctx context.Context, direction int) {
 	p.draw()
 }
 
-// startTrack loads the first entry.
-func (p *player) startTrack(ctx context.Context, entry client.CacheEntry) error {
-	if err := p.sink.StartFile(ctx, entry.Path, 0); err != nil {
+// startTrack loads the first entry. When its local copy is not on disk yet it
+// is streamed from its URL, and the copy is swapped in when it lands.
+func (p *player) startTrack(ctx context.Context, item playbackItem) error {
+	if err := p.sink.StartFile(ctx, item.source, 0); err != nil {
 		return err
 	}
+	index := p.addItem(item)
 	p.loaded++
+	p.watchLocal(ctx, index, item.ready)
 	p.applyPendingSkip(ctx)
 	return nil
 }
 
-// appendTrack queues the next entry behind whatever is playing.
-func (p *player) appendTrack(ctx context.Context, entry client.CacheEntry) error {
-	if err := p.sink.AppendFile(ctx, entry.Path); err != nil {
+// appendTrack queues the next entry behind whatever is playing. A copy that
+// landed before its turn is already the local path; otherwise mpv streams the
+// URL and the copy is swapped in once that entry is the one playing.
+func (p *player) appendTrack(ctx context.Context, item playbackItem) error {
+	if err := p.sink.AppendFile(ctx, item.source); err != nil {
 		return err
 	}
+	index := p.addItem(item)
 	p.loaded++
+	p.watchLocal(ctx, index, item.ready)
 	p.applyPendingSkip(ctx)
 	return nil
+}
+
+// addItem records an entry in playlist order and returns its index.
+func (p *player) addItem(item playbackItem) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.items = append(p.items, item)
+	return len(p.items) - 1
+}
+
+// watchLocal hands mpv the local copy of a track once its download lands,
+// resuming from the position the streaming one reached and keeping the pause
+// state. It only swaps when that entry is the one actually playing; a copy
+// that arrives for a queued entry is left for its own turn (refresh picks it
+// up the moment it starts playing).
+func (p *player) watchLocal(ctx context.Context, index int, ready <-chan client.CacheEntry) {
+	if ready == nil {
+		return
+	}
+	go func() {
+		entry, ok := <-ready
+		if !ok {
+			return
+		}
+
+		p.mu.Lock()
+		if index < len(p.items) {
+			p.items[index].localPath = entry.Path
+		}
+		p.mu.Unlock()
+
+		// Only the entry that is playing may be swapped, and it is matched by
+		// variant id: a copy for a different item must never replace the track
+		// the listener is hearing.
+		position, err := p.sink.process.playlistPosition(ctx)
+		if err != nil || position < 0 {
+			return
+		}
+		p.mu.Lock()
+		var playingVariant string
+		if position < len(p.items) {
+			playingVariant = p.items[position].variantID
+		}
+		p.mu.Unlock()
+		if playingVariant == "" || playingVariant != entry.VariantID {
+			return
+		}
+		p.swapToLocal(ctx, position)
+	}()
+}
+
+// swapToLocal replaces whatever mpv is playing with the entry's local copy at
+// the position it had reached, keeping the pause state. The caller has checked
+// that the entry is the one playing.
+func (p *player) swapToLocal(ctx context.Context, index int) {
+	p.mu.Lock()
+	var path string
+	if index < len(p.items) {
+		path = p.items[index].localPath
+	}
+	p.mu.Unlock()
+	if path == "" {
+		return
+	}
+
+	paused, err := p.sink.process.pauseState(ctx)
+	if err != nil {
+		return
+	}
+	where, _ := p.sink.process.positionMs(ctx)
+	if err := p.sink.process.loadReplace(ctx, path, where); err != nil {
+		return
+	}
+	if paused {
+		_ = p.sink.process.setPause(ctx, true)
+	}
+
+	p.mu.Lock()
+	if index < len(p.items) {
+		p.items[index].source = path
+	}
+	p.mu.Unlock()
 }
 
 // applyPendingSkip honours an earlier "next track is still downloading".
@@ -284,7 +378,6 @@ func (p *player) refresh(ctx context.Context) {
 	paused, _ := p.sink.process.pauseState(readCtx)
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if positionErr == nil {
 		p.position = position
 	}
@@ -303,6 +396,15 @@ func (p *player) refresh(ctx context.Context) {
 	p.paused = paused
 	if position >= 0 && position < len(p.queue) {
 		p.title = p.queue[position].Title
+	}
+	// A local copy that landed while its entry was still queued behind another
+	// track is handed over now, the moment that entry is the one playing.
+	swap := positionErr == nil && position >= 0 && position < len(p.items) &&
+		p.items[position].localPath != "" && p.items[position].source != p.items[position].localPath
+	p.mu.Unlock()
+
+	if swap {
+		p.swapToLocal(ctx, position)
 	}
 }
 

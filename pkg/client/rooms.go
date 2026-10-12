@@ -29,21 +29,18 @@ type QueueItem struct {
 	ArtistIDs  []string `json:"artistIds,omitempty"`
 }
 
-// RoomPlayback is the current song and where the host last said it was. The
-// host sends this state on changes and once a second; PositionMs is at AtMs on
-// the server clock, so clients can extrapolate between updates.
+// RoomPlayback is the room's current song and where the server says it is.
+// PositionMs is at AtMs on the server clock, so a client can extrapolate
+// between the once-a-second updates.
 type RoomPlayback struct {
-	Item       QueueItem `json:"item"`
-	PositionMs int64     `json:"positionMs"`
-	AtMs       int64     `json:"atMs"`
-	Started    bool      `json:"started"`
-	Paused     bool      `json:"paused"`
-	DurationMs int64     `json:"durationMs"`
-	// DrivenBy is "host" while the host's player is the room's clock, and
-	// "server" while the server keeps time because the host is away.
-	DrivenBy  string         `json:"drivenBy"`
-	Votes     map[string]int `json:"votes"`
-	MeanScore float64        `json:"meanScore"`
+	Item       QueueItem      `json:"item"`
+	PositionMs int64          `json:"positionMs"`
+	AtMs       int64          `json:"atMs"`
+	Started    bool           `json:"started"`
+	Paused     bool           `json:"paused"`
+	DurationMs int64          `json:"durationMs"`
+	Votes      map[string]int `json:"votes"`
+	MeanScore  float64        `json:"meanScore"`
 }
 
 // PositionAt is where the room should be at serverNowMs.
@@ -253,22 +250,6 @@ func (r *RoomClient) Vote(ctx context.Context, score int) (*Room, error) {
 		return nil, err
 	}
 	return &out, nil
-}
-
-// RoomSync is the host's queue player state sent immediately on changes and
-// once per second. ItemID distinguishes two queued copies of the same track.
-type RoomSync struct {
-	ItemID     string `json:"itemId"`
-	TrackID    string `json:"trackId"`
-	PositionMs int64  `json:"positionMs"`
-	DurationMs int64  `json:"durationMs"`
-	Started    bool   `json:"started"`
-	Paused     bool   `json:"paused"`
-}
-
-// Sync reports the host's current song and player position to the room.
-func (r *RoomClient) Sync(ctx context.Context, sync RoomSync) error {
-	return r.client.do(ctx, http.MethodPost, r.path("/sync"), sync, nil)
 }
 
 // Leave removes this member from the room.

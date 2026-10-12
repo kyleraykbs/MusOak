@@ -1,13 +1,16 @@
 // Package rooms implements Listen Together around a simple contract: each
-// member has a queue, the room mixes those queues, and the host's ordinary
-// player drives the mixed order.
+// member has a queue, the room mixes those queues, and the server holds the
+// song and the time.
 //
-// The host reports its current queue item, position and pause state on `/sync`.
-// The server timestamps that state and broadcasts it; it does not run its own
-// song-end timer. Votes and explicit transport commands may still skip a song.
+// The Manager runs one clock for every room: it advances past finished songs
+// and republishes the anchored position about once a second, so any client can
+// compare its own player to the room's time and correct itself. Clients follow
+// that signal rather than a host's player; the host keeps only its authority
+// over playback commands. Votes and explicit transport commands still skip a
+// song.
 //
-// Followers load a different song and seek the same song only when drift is
-// greater than two seconds.
+// Clients load a different song on change and seek the same song only when
+// drift is greater than two seconds.
 package rooms
 
 import (
@@ -40,11 +43,13 @@ const (
 //     {memberId, gone: true} when they left. A client replaces that queue and
 //     derives the play order itself (round-robin across members in join order).
 //   - playback carries {current}, the whole current-state view or null when the
-//     room is idle. When the current item changes or goes away, the client also
-//     removes the previous item from its queue mirror and from its derived play
-//     order — the server dropped it too, and does not resend the queue for it.
-//     This is what keeps the derived order's round-robin phase identical to the
-//     server's.
+//     room is idle. The Manager publishes it on every change and once a second
+//     as the room's heartbeat, so a client that missed an event is corrected by
+//     the next one.
+//   - when the room advances off a song, the played item leaves its owner's
+//     queue and the play order, so that queue is republished too and the client
+//     splices the order the same way the server did. That is what keeps the
+//     derived order's round-robin phase identical to the server's.
 type Event struct {
 	Type   EventType `json:"type"`
 	RoomID string    `json:"roomId"`
@@ -100,20 +105,12 @@ func (b *Bus) Publish(e Event) {
 	}
 }
 
-// Clock stamps room state and arms a room's own deadlines; it is replaceable in
-// tests, which have to fire a two-hour idle close rather than wait for one.
+// Clock stamps room state. It is replaceable in tests, which hold time still
+// and call tick directly rather than wait for a real second to pass.
 type Clock interface {
 	Now() time.Time
-	AfterFunc(d time.Duration, fn func()) Timer
-}
-
-// Timer is one scheduled callback.
-type Timer interface {
-	Stop() bool
 }
 
 type realClock struct{}
 
 func (realClock) Now() time.Time { return time.Now() }
-
-func (realClock) AfterFunc(d time.Duration, fn func()) Timer { return time.AfterFunc(d, fn) }

@@ -66,6 +66,14 @@ func New(baseURL string, opts ...Option) *Client {
 // BaseURL is the server this client talks to.
 func (c *Client) BaseURL() string { return c.baseURL }
 
+// MediaURL is the URL a variant's bytes are served from, the same URL the
+// media GET uses. A player that speaks HTTP (mpv does) can be handed it
+// directly, so playback of a rendition the server is still preparing can begin
+// before the download has finished.
+func (c *Client) MediaURL(variantID string) string {
+	return c.baseURL + "/api/v1/media/" + variantID
+}
+
 // Token returns the current bearer token, empty for a guest.
 func (c *Client) Token() string { return c.token }
 

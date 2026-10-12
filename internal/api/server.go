@@ -94,6 +94,9 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 	s.auth = auth.New(cfg, db, logger)
 	s.ranking = ranking.New(db, cfg.DefaultProviderOrder, logger)
 	s.rooms = rooms.NewManager(cfg, db, logger)
+	// The server is the room's clock: the manager advances and republishes
+	// every room once a second until the server closes.
+	s.rooms.Start()
 	s.radio = radio.New(db, s.providers, s.matcher, logger)
 	s.library = library.New(db, s.providers, s.matcher, logger)
 	s.artwork = artwork.New(filepath.Join(cfg.StorageDir, "artwork"), db, logger)

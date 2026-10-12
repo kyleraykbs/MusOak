@@ -276,10 +276,10 @@ func runParticipants(t *testing.T, ctx context.Context, clients []*participantCl
 	}
 }
 
-// TestTheHostStartsAndFollowersFollow is the whole contract: the room holds a
-// song until the host's player begins it, everybody plays the same song at the
-// same position, and a room seek pulls a follower that has drifted back.
-func TestTheHostStartsAndFollowersFollow(t *testing.T) {
+// TestTheServerStartsAndFollowersFollow is the whole contract: the server starts
+// the room's queue by itself, everybody plays the same song at the same
+// position, and a room seek pulls a follower that has drifted back.
+func TestTheServerStartsAndFollowersFollow(t *testing.T) {
 	apiClient := newServer(t, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
@@ -327,9 +327,10 @@ func TestTheHostStartsAndFollowersFollow(t *testing.T) {
 	if snapshot.Current == nil || !snapshot.Current.Started {
 		t.Fatalf("the room never started: %+v", snapshot.Current)
 	}
-	if snapshot.Current.DurationMs != slots[0].DurationMs {
-		t.Errorf("room length = %d, want the host's file %d",
-			snapshot.Current.DurationMs, slots[0].DurationMs)
+	// The room's length comes from the queue, which the server holds; every
+	// client plays its own rendition of it.
+	if snapshot.Current.DurationMs <= 0 {
+		t.Errorf("room length = %d, want the queued track's length", snapshot.Current.DurationMs)
 	}
 
 	// A seek four seconds in is more than the two-second tolerance: the
@@ -355,10 +356,10 @@ func TestTheHostStartsAndFollowersFollow(t *testing.T) {
 	})
 }
 
-// TestTheHostsFileEndingMovesTheSongOn: the host's participant plays the room's
-// queue to the end, reporting each file running out, and the room advances with
-// it while followers follow.
-func TestTheHostsFileEndingMovesTheSongOn(t *testing.T) {
+// TestTheRoomPlaysThroughItsQueue: the server advances the room's queue on its
+// own when each song's length elapses, both participants move with it, and the
+// room goes idle when the queue runs out.
+func TestTheRoomPlaysThroughItsQueue(t *testing.T) {
 	apiClient := newServer(t, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -393,9 +394,10 @@ func TestTheHostsFileEndingMovesTheSongOn(t *testing.T) {
 	}
 }
 
-// TestAShortFollowersFileDoesNotEndTheSong: a follower whose own copy is
-// shorter than the host's goes quiet when its file ends and the song plays on.
-func TestAShortFollowersFileDoesNotEndTheSong(t *testing.T) {
+// TestAShortFollowersFileEndsLocallyWithoutMovingTheRoom: a follower whose own
+// copy is shorter than the room's runs out and stops on its own; that is a local
+// ending, and it does not move the room, which the server still controls.
+func TestAShortFollowersFileEndsLocallyWithoutMovingTheRoom(t *testing.T) {
 	apiClient := newServer(t, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()

@@ -44,7 +44,7 @@ match/             ISRC and title/artist/album/duration scoring -> canonical tra
 media/             download (singleflight, retries) -> ffmpeg -> sha256 -> media/<variant>.opus
      |              local imports, quota + LRU eviction, Range serving with ETag
      v
-rooms/             per-member queues, mixed play order, host-sampled playback state
+rooms/             per-member queues, mixed play order, server-held clock
 api/               REST + WebSocket, auth, ranking, rate limits
 pkg/client         the public Go SDK: the CLI and any bot are clients of it
 ```
@@ -55,15 +55,18 @@ track; the provider ranking decides which variant is played.
 
 Listen Together details worth knowing before you rely on it:
 
-* The host plays the room's mixed queue in its ordinary player. Its current
-  queue item, position and pause state are reported on `/sync` when they change
-  and once per second; the host player advances naturally to the next song.
-* Everyone else follows one rule: a different song is loaded; the same song
-  within two seconds of the room's position is left alone; a larger drift is
-  corrected with a seek. Each member plays the version it can, so a shorter
-  local file may end before the host's and stay silent until the room moves on.
-* The server timestamps the host's position; clients estimate the server clock
-  offset from WebSocket pings. The room does not advance on a server-side timer.
+* The server holds the room: it plays the mixed queue of the members' own
+  queues, advances past a song when its length elapses, and republishes the
+  anchored position about once a second.
+* A client is correction-only and self-advancing. It loads a different song on
+  change; the same song within two seconds of the room's position is left alone;
+  a larger drift is corrected with a seek. When its own file ends it moves to
+  the next item of the room's order by itself, and the next beat corrects it if
+  the room disagrees. Each member plays the version it can.
+* The host is only a permission: it may pause, skip or seek when the room's
+  controls keep that to the host. It is not the clock, and there is no host
+  report to send.
+* Clients estimate the server clock offset from WebSocket pings.
 * Votes are 1 (bad) to 5 (great), one per member per track, changeable while the
   track plays. A skip fires when enough members have voted
   (`minVotersForSkip`), they are enough of the room (`voterFractionForSkip`) and

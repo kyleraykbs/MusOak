@@ -80,6 +80,7 @@ func (p *Provider) Capabilities() provider.Caps {
 	return provider.Caps{
 		Search:        configured,
 		Download:      false,
+		Stream:        false,
 		SearchAlbums:  configured,
 		SearchArtists: configured,
 		Radio:         configured,

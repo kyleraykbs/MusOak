@@ -9,8 +9,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"codeberg.org/kyleraykbs/musoak/pkg/client"
 )
 
 func decodeAll(t *testing.T, input string) []key {
@@ -222,7 +220,7 @@ func TestPlayerPauseKey(t *testing.T) {
 	defer cancel()
 	ctx := context.Background()
 
-	if err := p.startTrack(ctx, client.CacheEntry{Path: p.queue[0].TrackID}); err != nil {
+	if err := p.startTrack(ctx, localItem(p.queue[0].TrackID)); err != nil {
 		t.Fatalf("startTrack: %v", err)
 	}
 
@@ -245,7 +243,7 @@ func TestPlayerNextAndPreviousKeys(t *testing.T) {
 	defer cancel()
 	ctx := context.Background()
 
-	if err := p.startTrack(ctx, client.CacheEntry{Path: first}); err != nil {
+	if err := p.startTrack(ctx, localItem(first)); err != nil {
 		t.Fatalf("startTrack: %v", err)
 	}
 
@@ -262,7 +260,7 @@ func TestPlayerNextAndPreviousKeys(t *testing.T) {
 	}
 
 	// When that track lands, the earlier key press takes effect.
-	if err := p.appendTrack(ctx, client.CacheEntry{Path: second}); err != nil {
+	if err := p.appendTrack(ctx, localItem(second)); err != nil {
 		t.Fatalf("appendTrack: %v", err)
 	}
 	waitForCondition(t, ctx, "the queued skip to fire", func() bool {
@@ -293,7 +291,7 @@ func TestPlayerQuitKeyStopsPlayback(t *testing.T) {
 	defer cancel()
 	ctx := context.Background()
 
-	if err := p.startTrack(ctx, client.CacheEntry{Path: p.queue[0].TrackID}); err != nil {
+	if err := p.startTrack(ctx, localItem(p.queue[0].TrackID)); err != nil {
 		t.Fatalf("startTrack: %v", err)
 	}
 
@@ -317,10 +315,10 @@ func TestPlayerStatusLineReflectsMpv(t *testing.T) {
 	defer cancel()
 	ctx := context.Background()
 
-	if err := p.startTrack(ctx, client.CacheEntry{Path: first}); err != nil {
+	if err := p.startTrack(ctx, localItem(first)); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.appendTrack(ctx, client.CacheEntry{Path: second}); err != nil {
+	if err := p.appendTrack(ctx, localItem(second)); err != nil {
 		t.Fatal(err)
 	}
 

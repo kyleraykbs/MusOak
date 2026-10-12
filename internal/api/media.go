@@ -27,8 +27,12 @@ func variantIDFromPath(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool)
 	return id, true
 }
 
-// handleMediaFile serves a finished rendition with Range support. It never
-// starts a download; use the status endpoint to watch for readiness.
+// handleMediaFile serves a rendition, finished or still arriving. A finished
+// file is served from disk with Range support and an ETag. One that is still
+// downloading is played from its source - the bytes exist upstream, and waiting
+// for the whole song to land is a silence nobody asked for - while the download
+// carries on in the background, so the next request is answered from disk. Use
+// the status endpoint to watch for readiness.
 func (s *Server) handleMediaFile(w http.ResponseWriter, r *http.Request) {
 	id, ok := variantIDFromPath(w, r)
 	if !ok {
@@ -42,6 +46,9 @@ func (s *Server) handleMediaFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", mime.FormatMediaType("inline", map[string]string{
 		"filename": s.mediaFileName(r.Context(), id),
 	}))
+	if s.media.Stream(w, r, id) {
+		return
+	}
 	s.media.ServeFile(w, r, id)
 }
 

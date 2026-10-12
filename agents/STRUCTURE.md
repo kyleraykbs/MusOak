@@ -36,9 +36,10 @@ Go module `codeberg.org/kyleraykbs/musoak`.
   policy.
 - `internal/ranking` — per-user provider order, cached mean-position aggregate,
   `Pick` for variant selection.
-- `internal/rooms` — per-member queues mixed round-robin, a host-reported current
-  queue item/position/pause anchor, votes and skip rules, the event bus, and
-  socket-presence grace. Only host sync advances natural queue playback.
+- `internal/rooms` — per-member queues mixed round-robin, a server-held clock
+  that advances past finished songs and republishes the anchored position once a
+  second, votes and skip rules, the event bus, and socket-presence grace. The
+  server is the room's only clock; the host keeps only its command authority.
 - `internal/api` — REST + WebSocket surface, OpenAPI document (embedded and
   served), rate limits, auth middleware. `routeTable` is the single list of
   routes and is checked against the spec by a test.

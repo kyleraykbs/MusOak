@@ -13,8 +13,9 @@ info:
       it never starts a download. Ask for one with
       `POST /api/v1/media/{variantId}/download` first.
     * Room commands are REST calls; room state changes arrive on
-      `GET /api/v1/ws` as events. The host reports its mixed-queue player state
-      through `/sync`; every other client follows that position.
+      `GET /api/v1/ws` as events. The server holds the room's song and time:
+      it advances the queue and republishes the anchored position about once a
+      second, and every client compares its own player to that.
 servers:
   - url: /
     description: the same host and port this document came from
@@ -240,19 +241,36 @@ paths:
   /api/v1/media/{variantId}:
     get:
       tags: [media]
-      summary: Stream a finished rendition
+      summary: Play a rendition, finished or still arriving
       description: |
-        Returns the stored Ogg/Opus file with Range support and an ETag of its
-        sha256. Only complete files are ever served.
+        A finished rendition is the stored Ogg/Opus file, with Range support and
+        an ETag of its sha256.
+
+        One that is still downloading is played from its source instead: the
+        bytes exist upstream, and waiting for the whole song to land is a silence
+        nobody asked for. Those bytes come from the provider's own fetch, handed
+        on as they arrive, so this answer has no `Content-Length`, cannot be
+        ranged, and must never be stored as the rendition - it is a copy of the
+        source, not the file this URL names. It is marked `X-Musoak-Stream: 1`
+        and carries no ETag. The container is the source's own (`audio/mp4`,
+        `audio/webm`, `audio/ogg`), not the stored Ogg/Opus. The download carries
+        on in the background, so a later request is answered from disk.
       operationId: getMedia
       parameters: [{ $ref: "#/components/parameters/VariantID" }]
       responses:
         "200":
-          description: The whole file.
+          description: The whole file, or a stream of it while it downloads.
           headers:
             ETag: { $ref: "#/components/headers/ETag" }
+            X-Musoak-Stream:
+              description: Present, and `1`, when this is a stream of a variant that has not finished downloading.
+              schema: { type: string }
           content:
             audio/ogg:
+              schema: { type: string, format: binary }
+            audio/mp4:
+              schema: { type: string, format: binary }
+            audio/webm:
               schema: { type: string, format: binary }
         "206":
           description: The requested byte range.
@@ -2308,41 +2326,6 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
-  /api/v1/rooms/{roomId}/sync:
-    post:
-      tags: [rooms]
-      summary: Report the host's current queue player state
-      description: |
-        The host reports its current mixed-queue entry, position and pause
-        state when they change and once per second. The server timestamps the
-        position and broadcasts it to the room. Send an empty `itemId` when
-        the host queue has no current song. Only the host may report state.
-      operationId: syncRoomPlayback
-      parameters: [{ $ref: "#/components/parameters/RoomID" }]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [itemId, positionMs, started, paused]
-              properties:
-                itemId:
-                  type: string
-                  description: The room queue entry, empty when idle.
-                trackId:
-                  type: string
-                  format: uuid
-                  description: The canonical track for the queue entry.
-                positionMs: { type: integer, format: int64, minimum: 0 }
-                durationMs: { type: integer, format: int64, minimum: 0 }
-                started: { type: boolean }
-                paused: { type: boolean }
-      responses:
-        "204": { description: The host state was accepted. }
-        "400": { $ref: "#/components/responses/BadRequest" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "404": { $ref: "#/components/responses/NotFound" }
   /api/v1/rooms/{roomId}/seek:
     post:
       tags: [rooms]
@@ -2549,12 +2532,18 @@ components:
 
     Capabilities:
       type: object
-      required: [search, download]
+      required: [search, download, stream]
       properties:
         search: { type: boolean }
         download:
           type: boolean
           description: False for metadata-only providers such as Spotify.
+        stream:
+          type: boolean
+          description: |
+            True when the provider can resolve a directly playable URL without
+            downloading the whole track first; the media endpoint streams from
+            it while a rendition is still arriving.
 
     Track:
       type: object
@@ -3057,21 +3046,14 @@ components:
         started:
           type: boolean
           description: |
-            Whether the host's player has begun the song. Until it has, every
-            client loads the song and holds it at the position.
+            Whether the room has begun the song. The server starts it as soon
+            as it is the room's current item, so this is true whenever there is
+            a current.
         paused: { type: boolean }
         durationMs:
           type: integer
           format: int64
-          description: The host's file length; the room's clock moves on when it reaches this.
-        drivenBy:
-          type: string
-          enum: [host, server]
-          description: |
-            Whose player is the room's clock. `host` while the host has a live
-            socket and reports its player state; `server` while the host is
-            away, when the server keeps time and moves the room on by itself
-            until the host comes back.
+          description: The room's song length; the server moves on when it reaches this.
         votes:
           type: object
           additionalProperties: { type: integer }

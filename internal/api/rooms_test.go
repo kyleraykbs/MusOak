@@ -90,7 +90,10 @@ func TestRoomPasswordOverHTTP(t *testing.T) {
 	}
 }
 
-func TestRoomSyncDrivesCurrentPlaybackOverHTTP(t *testing.T) {
+// TestServerClockDrivesPlaybackOverHTTP walks the room's playback commands: the
+// server starts the queue itself, pause/resume/seek move the anchored position,
+// a seek to the end advances, and the old host-sync endpoint is gone.
+func TestServerClockDrivesPlaybackOverHTTP(t *testing.T) {
 	c := newHTTPTestServer(t, nil)
 	alice := c.register("alice", "hunter2hunter2")
 	bob := c.register("bob", "hunter2hunter2")
@@ -98,6 +101,11 @@ func TestRoomSyncDrivesCurrentPlaybackOverHTTP(t *testing.T) {
 	var created roomResponse
 	c.decode(createdRec, &created)
 	roomID := created.Room.ID
+	// Somebody is listening, so the room plays to a listener and starts its
+	// queue. The socket is what a real client would hold open.
+	c.rooms.Connect(created.MemberID)
+	t.Cleanup(func() { c.rooms.Disconnect(created.MemberID) })
+
 	if joined := c.do(http.MethodPost, "/api/v1/rooms/"+roomID+"/join", bob, nil); joined.Code != http.StatusOK {
 		t.Fatalf("join: %d %s", joined.Code, joined.Body.String())
 	}
@@ -124,36 +132,45 @@ func TestRoomSyncDrivesCurrentPlaybackOverHTTP(t *testing.T) {
 		return room
 	}
 	state := get()
-	firstItem := state.MasterQueue[0]
+	if state.Current == nil || state.Current.Item.TrackID != first.ID || !state.Current.Started || state.Current.Paused {
+		t.Fatalf("the server did not start the room: %+v", state.Current)
+	}
+	if state.Current.PositionMs > 1000 {
+		t.Fatalf("the room started somewhere in the song: %d", state.Current.PositionMs)
+	}
 
-	body := map[string]any{
-		"itemId": firstItem.ID, "trackId": first.ID.String(), "positionMs": int64(4200),
-		"durationMs": int64(59000), "started": true, "paused": false,
+	// The host-sync endpoint is gone.
+	if gone := c.do(http.MethodPost, "/api/v1/rooms/"+roomID+"/sync", alice, map[string]any{}); gone.Code != http.StatusNotFound {
+		t.Fatalf("sync endpoint = %d, want 404", gone.Code)
 	}
-	if follower := c.do(http.MethodPost, "/api/v1/rooms/"+roomID+"/sync", bob, body); follower.Code != http.StatusForbidden {
-		t.Fatalf("follower sync: %d %s", follower.Code, follower.Body.String())
+
+	// Pausing holds the position, resuming carries on from it.
+	if paused := c.do(http.MethodPost, "/api/v1/rooms/"+roomID+"/pause", alice, nil); paused.Code != http.StatusOK {
+		t.Fatalf("pause: %d %s", paused.Code, paused.Body.String())
 	}
-	if host := c.do(http.MethodPost, "/api/v1/rooms/"+roomID+"/sync", alice, body); host.Code != http.StatusNoContent {
-		t.Fatalf("host sync: %d %s", host.Code, host.Body.String())
+	var pausedSnap rooms.Snapshot
+	c.decode(c.do(http.MethodGet, "/api/v1/rooms/"+roomID, "", nil), &pausedSnap)
+	if pausedSnap.Current == nil || !pausedSnap.Current.Paused {
+		t.Fatalf("paused room = %+v", pausedSnap.Current)
+	}
+	held := pausedSnap.Current.PositionMs
+	if resumed := c.do(http.MethodPost, "/api/v1/rooms/"+roomID+"/resume", alice, nil); resumed.Code != http.StatusOK {
+		t.Fatalf("resume: %d %s", resumed.Code, resumed.Body.String())
+	}
+
+	// Seeking to the end asks for the next song.
+	if seek := c.do(http.MethodPost, "/api/v1/rooms/"+roomID+"/seek", alice,
+		map[string]int64{"positionMs": held + 60_000}); seek.Code != http.StatusOK {
+		t.Fatalf("seek: %d %s", seek.Code, seek.Body.String())
 	}
 	state = get()
-	if state.Current == nil || state.Current.Item.ID != firstItem.ID || !state.Current.Started || state.Current.PositionMs != 4200 {
-		t.Fatalf("host state = %+v", state.Current)
+	if state.Current == nil || state.Current.Item.TrackID != second.ID {
+		t.Fatalf("seek past end = %+v", state.Current)
 	}
 
-	secondItem := state.MasterQueue[1]
-	next := map[string]any{"itemId": secondItem.ID, "trackId": second.ID.String(), "positionMs": int64(0), "durationMs": int64(60000), "started": false, "paused": true}
-	if host := c.do(http.MethodPost, "/api/v1/rooms/"+roomID+"/sync", alice, next); host.Code != http.StatusNoContent {
-		t.Fatalf("advance sync: %d %s", host.Code, host.Body.String())
-	}
-	state = get()
-	if state.Current == nil || state.Current.Item.ID != secondItem.ID || state.Current.Started || !state.Current.Paused {
-		t.Fatalf("advanced state = %+v", state.Current)
-	}
-
-	idle := map[string]any{"itemId": "", "positionMs": int64(0), "started": false, "paused": true}
-	if host := c.do(http.MethodPost, "/api/v1/rooms/"+roomID+"/sync", alice, idle); host.Code != http.StatusNoContent {
-		t.Fatalf("idle sync: %d %s", host.Code, host.Body.String())
+	// An empty queue leaves the room with nothing playing.
+	if skip := c.do(http.MethodPost, "/api/v1/rooms/"+roomID+"/skip", alice, nil); skip.Code != http.StatusOK {
+		t.Fatalf("skip: %d %s", skip.Code, skip.Body.String())
 	}
 	if state = get(); state.Current != nil || len(state.MasterQueue) != 0 {
 		t.Fatalf("idle room = %+v", state)

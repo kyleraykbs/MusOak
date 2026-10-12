@@ -198,6 +198,14 @@ func (c *Cache) download(ctx context.Context, api *Client, variantID, path strin
 	}
 	defer resp.Body.Close()
 
+	// Only the finished, stored rendition may be cached. A variant that is
+	// still downloading is served as a progressive stream (X-Musoak-Stream),
+	// and nothing on that path names its own sha256, so a stream must never be
+	// renamed into place as if it were the whole file.
+	if resp.Header.Get("X-Musoak-Stream") != "" {
+		return "", 0, fmt.Errorf("musoak: variant %s came back as a stream, not the stored rendition", variantID)
+	}
+
 	file, err := os.Create(path)
 	if err != nil {
 		return "", 0, fmt.Errorf("musoak: create %s: %w", path, err)
@@ -211,7 +219,11 @@ func (c *Cache) download(ctx context.Context, api *Client, variantID, path strin
 	}
 	sum := hex.EncodeToString(hash.Sum(nil))
 
-	if advertised := strings.Trim(resp.Header.Get("ETag"), `"`); advertised != "" && advertised != sum {
+	advertised := strings.Trim(resp.Header.Get("ETag"), `"`)
+	if advertised == "" {
+		return "", 0, fmt.Errorf("musoak: variant %s came back without a checksum", variantID)
+	}
+	if advertised != sum {
 		return "", 0, fmt.Errorf("musoak: variant %s failed its checksum (%s != %s)", variantID, sum, advertised)
 	}
 	return sum, size, nil

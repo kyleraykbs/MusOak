@@ -16,6 +16,7 @@ type providerResponse struct {
 type providerCaps struct {
 	Search   bool `json:"search"`
 	Download bool `json:"download"`
+	Stream   bool `json:"stream"`
 }
 
 // handleProviders lists the enabled providers and what they can do. Clients
@@ -28,7 +29,7 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request) {
 		caps := p.Capabilities()
 		entry := providerResponse{
 			Name:         p.Name(),
-			Capabilities: providerCaps{Search: caps.Search, Download: caps.Download},
+			Capabilities: providerCaps{Search: caps.Search, Download: caps.Download, Stream: caps.Stream},
 		}
 		if deps := missing[p.Name()]; len(deps) > 0 {
 			entry.MissingDeps = append([]string(nil), deps...)

@@ -141,7 +141,6 @@ func (s *Server) routeTable() []route {
 		{"POST /api/v1/rooms/{roomId}/skip", s.handleRoomSkip},
 		{"POST /api/v1/rooms/{roomId}/seek", s.handleRoomSeek},
 		{"POST /api/v1/rooms/{roomId}/vote", s.handleRoomVote},
-		{"POST /api/v1/rooms/{roomId}/sync", s.handleRoomSync},
 	}
 }
 

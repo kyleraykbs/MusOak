@@ -627,7 +627,7 @@ func (a *App) printRoom(room *client.Room) {
 	}
 	current := room.Current
 	if !current.Started {
-		a.printf("  up next: %s (waiting for the host to start it)\n", current.Item.Title)
+		a.printf("  up next: %s (waiting for the room to start it)\n", current.Item.Title)
 		return
 	}
 	a.printf("  playing: %s  %s / %s%s\n", current.Item.Title,

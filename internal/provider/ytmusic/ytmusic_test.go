@@ -3,11 +3,15 @@ package ytmusic
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"codeberg.org/kyleraykbs/musoak/internal/provider"
 )
@@ -38,6 +42,199 @@ func stubYtdlp(t *testing.T, record string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// stubStreamYtdlp writes an executable that records its arguments, answers the
+// --print-to-file request with the given container, and streams some audio, the
+// way a real yt-dlp fetch would.
+func stubStreamYtdlp(t *testing.T, record, ext string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "yt-dlp")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + record + `
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--print-to-file" ]; then printf '` + ext + `\n' > "$3"; fi
+  shift
+done
+printf 'streamed-audio-bytes'
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// stubSilentYtdlp exits cleanly without reporting a container.
+func stubSilentYtdlp(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "yt-dlp")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// Stream must build the same command Download builds - same format, same
+// cookies, same extractor args - but with -o - sending the audio to stdout and
+// --print-to-file recording the container.
+func TestStreamPipesAudioWithDownloadFlags(t *testing.T) {
+	record := filepath.Join(t.TempDir(), "args")
+	p := testProvider(t, stubPython(t, `exit 0`))
+	p.ytdlp = stubStreamYtdlp(t, record, "webm")
+	p.cookiesFile = "/home/you/cookies.txt"
+
+	body, mimeType, err := p.Stream(context.Background(), "abc")
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	defer body.Close()
+	if mimeType != "audio/webm" {
+		t.Errorf("mimeType = %q, want audio/webm", mimeType)
+	}
+	got, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatalf("read stream: %v", err)
+	}
+	if string(got) != "streamed-audio-bytes" {
+		t.Errorf("audio = %q", got)
+	}
+
+	args, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("yt-dlp was not run: %v", err)
+	}
+	for _, want := range []string{
+		"--no-playlist\n",
+		"-f\nbestaudio\n",
+		"-o\n-\n",
+		"--print-to-file\n%(ext)s\n",
+		"--cookies\n/home/you/cookies.txt\n",
+		"https://music.youtube.com/watch?v=abc\n",
+	} {
+		if !strings.Contains(string(args), want) {
+			t.Errorf("yt-dlp was not given %q:\n%s", strings.TrimSpace(want), args)
+		}
+	}
+	// The embedded client is the fallback: the first attempt - the one that works
+	// in the common case - leaves yt-dlp on its own defaults, which measure at
+	// half the wall time.
+	if strings.Contains(string(args), "youtube:player_client=web_embedded") {
+		t.Errorf("the first attempt used the web_embedded client:\n%s", args)
+	}
+}
+
+// The container yt-dlp reports maps to the MIME type the listener is told.
+func TestStreamMapsContainerToMIME(t *testing.T) {
+	for _, tc := range []struct{ ext, want string }{
+		{"m4a", "audio/mp4"},
+		{"opus", "audio/ogg"},
+		{"ogg", "audio/ogg"},
+	} {
+		p := testProvider(t, stubPython(t, `exit 0`))
+		p.ytdlp = stubStreamYtdlp(t, filepath.Join(t.TempDir(), "args"), tc.ext)
+		body, mimeType, err := p.Stream(context.Background(), "abc")
+		if err != nil {
+			t.Fatalf("Stream(%s): %v", tc.ext, err)
+		}
+		body.Close()
+		if mimeType != tc.want {
+			t.Errorf("container %s: mimeType = %q, want %q", tc.ext, mimeType, tc.want)
+		}
+	}
+}
+
+// A container we cannot map is an error, never a guess.
+func TestStreamRejectsUnknownContainer(t *testing.T) {
+	p := testProvider(t, stubPython(t, `exit 0`))
+	p.ytdlp = stubStreamYtdlp(t, filepath.Join(t.TempDir(), "args"), "flv")
+
+	body, _, err := p.Stream(context.Background(), "abc")
+	if err == nil {
+		if body != nil {
+			body.Close()
+		}
+		t.Fatal("want an error for an unknown container, got nil")
+	}
+	if body != nil {
+		t.Errorf("body = %v, want nil alongside the error", body)
+	}
+}
+
+// A fetch that ends before reporting its container is an error, not an empty
+// stream.
+func TestStreamFailsWhenContainerIsNeverReported(t *testing.T) {
+	p := testProvider(t, stubPython(t, `exit 0`))
+	p.ytdlp = stubSilentYtdlp(t)
+	if body, _, err := p.Stream(context.Background(), "abc"); err == nil {
+		if body != nil {
+			body.Close()
+		}
+		t.Fatal("want an error when the container is never reported")
+	} else if !strings.Contains(err.Error(), "container") {
+		t.Errorf("error should mention the container, got %v", err)
+	}
+}
+
+func TestStreamFailsCleanlyWithoutYtdlp(t *testing.T) {
+	p := testProvider(t, stubPython(t, `exit 0`))
+	p.ytdlp = filepath.Join(t.TempDir(), "missing-yt-dlp")
+	if body, _, err := p.Stream(context.Background(), "abc"); err == nil {
+		body.Close()
+		t.Fatal("want error, got nil")
+	}
+}
+
+// The reader owns the fetch: Close stops a stream that is still running and
+// reaps the process, so nothing is left behind.
+func TestStreamCloseEndsAndReapsTheProcess(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "pid")
+	script := "#!/bin/sh\n" + `
+echo $$ > ` + pidFile + `
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--print-to-file" ]; then printf 'webm\n' > "$3"; fi
+  shift
+done
+printf 'audio-bytes'
+exec sleep 60
+`
+	path := filepath.Join(t.TempDir(), "yt-dlp")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := testProvider(t, stubPython(t, `exit 0`))
+	p.ytdlp = path
+
+	body, _, err := p.Stream(context.Background(), "abc")
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	buf := make([]byte, len("audio-bytes"))
+	if _, err := io.ReadFull(body, buf); err != nil {
+		t.Fatalf("read stream: %v", err)
+	}
+
+	start := time.Now()
+	if err := body.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("Close took %v; it did not stop the fetch", elapsed)
+	}
+
+	raw, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("read pid: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		t.Fatalf("parse pid %q: %v", raw, err)
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return
+	}
+	if err := proc.Signal(syscall.Signal(0)); err == nil {
+		t.Errorf("process %d is still alive after Close", pid)
+	}
 }
 
 // YouTube answers yt-dlp with "Sign in to confirm you're not a bot" and there is
@@ -199,8 +396,8 @@ func TestMissingDepsListsBinaries(t *testing.T) {
 
 func TestCapabilities(t *testing.T) {
 	caps := New(nil, Options{}).Capabilities()
-	if !caps.Search || !caps.Download {
-		t.Errorf("caps = %+v, want search and download", caps)
+	if !caps.Search || !caps.Download || !caps.Stream {
+		t.Errorf("caps = %+v, want search, download and stream", caps)
 	}
 	if New(nil, Options{}).Name() != Name {
 		t.Errorf("name = %q", New(nil, Options{}).Name())
@@ -237,6 +434,7 @@ func contains(haystack []string, needle string) bool {
 }
 
 var _ provider.Provider = (*Provider)(nil)
+var _ provider.Streamer = (*Provider)(nil)
 var _ provider.DependencyChecker = (*Provider)(nil)
 
 var errUnused = errors.New("")

@@ -14,20 +14,12 @@ import (
 	"codeberg.org/kyleraykbs/musoak/internal/store"
 )
 
-// manualClock holds time still so positions are arithmetic, not waits, and
-// fires a room's deadlines only when Advance passes them.
+// manualClock holds time still so positions are arithmetic, not waits; the
+// Manager reads it for every stamp. A test moves it with Advance and then calls
+// tick, which is what the real loop does once a second.
 type manualClock struct {
-	mu     sync.Mutex
-	now    time.Time
-	timers []*manualTimer
-}
-
-type manualTimer struct {
-	mu      sync.Mutex
-	at      time.Time
-	fn      func()
-	stopped bool
-	done    bool
+	mu  sync.Mutex
+	now time.Time
 }
 
 func newManualClock() *manualClock {
@@ -40,63 +32,11 @@ func (c *manualClock) Now() time.Time {
 	return c.now
 }
 
-func (c *manualClock) AfterFunc(d time.Duration, fn func()) Timer {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	timer := &manualTimer{at: c.now.Add(d), fn: fn}
-	c.timers = append(c.timers, timer)
-	return timer
-}
-
-// Advance moves time forward and runs everything that became due, outside the
-// clock's own lock so a callback can take the manager's.
+// Advance moves the clock forward without running a beat.
 func (c *manualClock) Advance(d time.Duration) {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.now = c.now.Add(d)
-	now := c.now
-	var due []func()
-	live := c.timers[:0]
-	for _, timer := range c.timers {
-		if fn, ok := timer.alarm(now); ok {
-			due = append(due, fn)
-			continue
-		}
-		if timer.live() {
-			live = append(live, timer)
-		}
-	}
-	c.timers = live
-	c.mu.Unlock()
-
-	for _, fn := range due {
-		fn()
-	}
-}
-
-func (t *manualTimer) Stop() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.stopped || t.done {
-		return false
-	}
-	t.stopped = true
-	return true
-}
-
-func (t *manualTimer) alarm(now time.Time) (func(), bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.stopped || t.done || t.at.After(now) {
-		return nil, false
-	}
-	t.done = true
-	return t.fn, true
-}
-
-func (t *manualTimer) live() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return !t.stopped && !t.done
 }
 
 type fixture struct {
@@ -161,30 +101,14 @@ func (f *fixture) enqueue(roomID, memberID string, trackIDs ...uuid.UUID) *Snaps
 	return snapshot
 }
 
-func (f *fixture) start(roomID, memberID string, trackID uuid.UUID, positionMs, durationMs int64) *Snapshot {
-	f.t.Helper()
-	room := f.get(roomID)
-	itemID := ""
-	if room.Current != nil && room.Current.Item.TrackID == trackID {
-		itemID = room.Current.Item.ID
-	} else {
-		for _, item := range room.MasterQueue {
-			if item.TrackID == trackID {
-				itemID = item.ID
-				break
-			}
-		}
-	}
-	if itemID == "" {
-		f.t.Fatalf("no queued item for track %s", trackID)
-	}
-	if err := f.m.Sync(roomID, memberID, SyncState{
-		ItemID: itemID, TrackID: trackID, PositionMs: positionMs,
-		DurationMs: durationMs, Started: true,
-	}); err != nil {
-		f.t.Fatalf("host sync: %v", err)
-	}
-	return f.get(roomID)
+// tick runs one beat of every room's clock, which is what the Manager's own
+// loop does once a second.
+func (f *fixture) tick() { f.m.tick(f.clock.Now().UnixMilli()) }
+
+// advance moves the clock forward and runs one beat.
+func (f *fixture) advance(d time.Duration) {
+	f.clock.Advance(d)
+	f.tick()
 }
 
 func (f *fixture) get(roomID string) *Snapshot {
@@ -196,16 +120,16 @@ func (f *fixture) get(roomID string) *Snapshot {
 	return snapshot
 }
 
-// attach gives a member a live event socket: a room is server-driven exactly
-// while its host has none.
+// attach gives a member a live event socket: the room plays to a listener and
+// the tick is willing to move it on.
 func (f *fixture) attach(memberID string) { f.m.Connect(memberID) }
 
-// detach takes a member's last socket away, leaving them a member: a host whose
-// laptop slept, not a host who left.
+// detach takes a member's last socket away, leaving them a member: a listener
+// whose tab closed, not somebody who left.
 func (f *fixture) detach(memberID string) { f.m.Disconnect(memberID) }
 
 // longGrace keeps a detached member from being reaped mid-test, so a test can
-// hold a room in the "host is away" state it is about.
+// hold a room in the "nobody listening" state it is about.
 func (f *fixture) longGrace() { f.m.grace = time.Hour }
 
 // waitEvent reads the next event of the given type, skipping the rest.
@@ -325,18 +249,70 @@ func TestEnqueueMixesQueuesFairly(t *testing.T) {
 	}
 }
 
-func TestHostSyncDrivesMixedQueueAndUsesQueueItemIDs(t *testing.T) {
+// A room with somebody listening starts its first queued song by itself, and
+// the tick moves it on when the song's length elapses.
+func TestTheServerStartsAndAdvancesTheRoom(t *testing.T) {
+	f := newFixture(t, nil)
+	host := guest("host-1")
+	room := f.create("party", ControlsEveryone, "", host)
+	f.attach(host.ID)
+	first := f.track("first", 30_000)
+	second := f.track("second", 30_000)
+	f.enqueue(room.ID, host.ID, first.ID, second.ID)
+
+	state := f.get(room.ID)
+	if state.Current == nil || state.Current.Item.TrackID != first.ID {
+		t.Fatalf("the room did not start its queue: %+v", state.Current)
+	}
+	if !state.Current.Started || state.Current.Paused {
+		t.Fatalf("the current song is not running: %+v", state.Current)
+	}
+	if state.Current.PositionMs != 0 {
+		t.Fatalf("current position = %d, want 0", state.Current.PositionMs)
+	}
+
+	f.advance(29 * time.Second)
+	state = f.get(room.ID)
+	if state.Current.Item.TrackID != first.ID {
+		t.Fatalf("the room moved on before the song was over")
+	}
+	if state.Current.PositionMs != 29_000 {
+		t.Fatalf("position after 29s = %d", state.Current.PositionMs)
+	}
+
+	f.advance(2 * time.Second)
+	state = f.get(room.ID)
+	if state.Current == nil || state.Current.Item.TrackID != second.ID {
+		t.Fatalf("the room did not move on: %+v", state.Current)
+	}
+	if !state.Current.Started || state.Current.Paused {
+		t.Fatalf("the next song is not running: %+v", state.Current)
+	}
+	if len(state.MasterQueue) != 1 || state.MasterQueue[0].TrackID != second.ID {
+		t.Fatalf("queue after an advance = %+v", state.MasterQueue)
+	}
+	// The played item left its owner's queue as well as the play order.
+	if len(state.Queues[host.ID]) != 1 || state.Queues[host.ID][0].TrackID != second.ID {
+		t.Fatalf("played item remained in the queue: %+v", state.Queues[host.ID])
+	}
+}
+
+// The play order keeps its place when an item is dropped: the room plays one
+// track per member per pass, and item ids tell two copies of one track apart.
+func TestAdvanceKeepsRoundRobinPhaseAndDropsFromQueue(t *testing.T) {
 	f := newFixture(t, nil)
 	host := guest("host-1")
 	room := f.create("party", ControlsEveryone, "", host)
 	if _, err := f.m.Join(room.ID, guest("bob"), "", ""); err != nil {
 		t.Fatal(err)
 	}
-	first := f.track("first", 200_000)
-	middle := f.track("middle", 200_000)
-	repeated := f.track("repeated", 200_000)
+	f.attach(host.ID)
+	first := f.track("first", 10_000)
+	repeated := f.track("repeated", 10_000)
+	middle := f.track("middle", 10_000)
 	f.enqueue(room.ID, host.ID, first.ID, repeated.ID, repeated.ID)
 	f.enqueue(room.ID, "bob", middle.ID)
+
 	state := f.get(room.ID)
 	want := []string{"first", "middle", "repeated", "repeated"}
 	if len(state.MasterQueue) != len(want) {
@@ -347,95 +323,89 @@ func TestHostSyncDrivesMixedQueueAndUsesQueueItemIDs(t *testing.T) {
 			t.Fatalf("mixed queue = %+v, want title %q at %d", state.MasterQueue, title, i)
 		}
 	}
-	firstItem := state.MasterQueue[0]
-
-	if err := f.m.Sync(room.ID, "bob", SyncState{ItemID: firstItem.ID, TrackID: first.ID, Started: true}); !errors.Is(err, ErrForbidden) {
-		t.Fatalf("follower sync: %v", err)
-	}
-	// The host cannot skip the next item in the generated mix.
-	if err := f.m.Sync(room.ID, host.ID, SyncState{ItemID: state.MasterQueue[2].ID, TrackID: repeated.ID}); err != nil {
-		t.Fatal(err)
-	}
-	if got := f.get(room.ID).Current; got != nil {
-		t.Fatalf("out-of-order sync changed current to %+v", got)
-	}
-
-	state = f.start(room.ID, host.ID, first.ID, 0, 190_000)
-	f.clock.Advance(5 * time.Second)
-	if err := f.m.Sync(room.ID, host.ID, SyncState{
-		ItemID: firstItem.ID, TrackID: first.ID, PositionMs: 5_000,
-		DurationMs: 190_000, Started: true,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if got := f.get(room.ID).Current.PositionMs; got != 5_000 {
-		t.Fatalf("host position = %d, want 5000", got)
-	}
-
-	// Natural progression is the host's next item, not a server timer or an end
-	// endpoint. The item id also distinguishes two copies of one track.
-	if err := f.m.Sync(room.ID, host.ID, SyncState{ItemID: state.MasterQueue[1].ID, TrackID: middle.ID, Paused: true}); err != nil {
-		t.Fatal(err)
-	}
-	state = f.get(room.ID)
-	if state.Current.Item.TrackID != middle.ID || state.Current.Started || !state.Current.Paused {
-		t.Fatalf("host advanced to %+v", state.Current)
-	}
-	if len(state.Queues[host.ID]) != 2 || state.Queues[host.ID][0].TrackID != repeated.ID {
-		t.Fatalf("played item remained in host queue: %+v", state.Queues[host.ID])
-	}
-	var pending []QueueItem
-	for _, item := range state.MasterQueue {
-		if item.ID != state.Current.Item.ID {
-			pending = append(pending, item)
-		}
-	}
-	if len(pending) != 2 {
-		t.Fatalf("pending entries = %+v", pending)
-	}
-	firstRepeat, secondRepeat := pending[0], pending[1]
+	firstRepeat, secondRepeat := state.MasterQueue[2], state.MasterQueue[3]
 	if firstRepeat.ID == secondRepeat.ID || firstRepeat.TrackID != secondRepeat.TrackID {
 		t.Fatalf("duplicate queue entries = %+v, %+v", firstRepeat, secondRepeat)
 	}
-	if err := f.m.Sync(room.ID, host.ID, SyncState{ItemID: firstRepeat.ID, TrackID: repeated.ID, Started: true}); err != nil {
-		t.Fatal(err)
+
+	f.advance(11 * time.Second)
+	if got := f.get(room.ID).Current.Item.TrackID; got != middle.ID {
+		t.Fatalf("second song = %s", got)
 	}
-	if err := f.m.Sync(room.ID, host.ID, SyncState{ItemID: secondRepeat.ID, TrackID: repeated.ID, Started: true}); err != nil {
-		t.Fatal(err)
+	f.advance(11 * time.Second)
+	if got := f.get(room.ID).Current.Item.ID; got != firstRepeat.ID {
+		t.Fatalf("third song = %s, want the first copy", got)
 	}
+	f.advance(11 * time.Second)
+	if got := f.get(room.ID).Current.Item.ID; got != secondRepeat.ID {
+		t.Fatalf("fourth song = %s, want the second copy", got)
+	}
+	f.advance(11 * time.Second)
 	state = f.get(room.ID)
-	if state.Current.Item.ID != secondRepeat.ID {
-		t.Fatalf("second copy = %+v", state.Current)
-	}
-	if err := f.m.Sync(room.ID, host.ID, SyncState{Paused: true}); err != nil {
-		t.Fatal(err)
-	}
-	if state = f.get(room.ID); state.Current != nil || len(state.MasterQueue) != 0 {
-		t.Fatalf("idle room after final host item = %+v", state)
+	if state.Current != nil || len(state.MasterQueue) != 0 {
+		t.Fatalf("idle room after the last song = %+v", state)
 	}
 }
 
-func TestEmptyHostSyncKeepsPendingQueuePlayable(t *testing.T) {
+// The tick republishes the position every beat, so a client that missed an
+// event is corrected by the next one; the played item's queue rides that beat.
+func TestTickPublishesTheHeartbeatAndTheDroppedQueue(t *testing.T) {
 	f := newFixture(t, nil)
 	host := guest("host-1")
 	room := f.create("party", ControlsEveryone, "", host)
-	first := f.track("first", 30_000)
-	second := f.track("second", 30_000)
+	f.attach(host.ID)
+	first := f.track("first", 10_000)
+	second := f.track("second", 10_000)
 	f.enqueue(room.ID, host.ID, first.ID, second.ID)
-	f.start(room.ID, host.ID, first.ID, 0, 30_000)
 
-	if err := f.m.Sync(room.ID, host.ID, SyncState{}); err != nil {
-		t.Fatal(err)
+	events, cancel := f.m.Subscribe()
+	defer cancel()
+
+	// A beat with nothing to change is still a heartbeat.
+	f.advance(1 * time.Second)
+	beat := waitEvent(t, events, EventPlayback)
+	data := beat.Data.(map[string]any)
+	if view := data["current"].(*PlaybackView); view == nil || view.PositionMs != 1_000 {
+		t.Fatalf("heartbeat view = %+v", data["current"])
 	}
-	state := f.get(room.ID)
-	if state.Current == nil || state.Current.Item.TrackID != second.ID || state.Current.Started {
-		t.Fatalf("pending song after empty host sync = %+v", state.Current)
+
+	// The beat that ends the song carries the queue it dropped.
+	f.advance(10 * time.Second)
+	dropped := waitEvent(t, events, EventQueueUpdated)
+	if qdata := dropped.Data.(map[string]any); qdata["memberId"] != host.ID {
+		t.Fatalf("advance queue event = %+v", qdata)
+	}
+	if view := f.get(room.ID).Current; view == nil || view.Item.TrackID != second.ID {
+		t.Fatalf("the beat did not start the next song: %+v", view)
 	}
 }
 
-// A room the server would have to drive but that nobody is listening to is left
-// alone: the queue belongs to the people in the room, and spending it on an
-// empty room is not playing it to anyone.
+// A song whose length the server never learned still moves the room on, after
+// the fallback window rather than never.
+func TestUnknownDurationUsesTheFallbackWindow(t *testing.T) {
+	f := newFixture(t, nil)
+	host := guest("host-1")
+	room := f.create("party", ControlsEveryone, "", host)
+	f.attach(host.ID)
+	unknown := &store.Track{Title: "no length"}
+	if err := f.db.CreateTrack(context.Background(), unknown); err != nil {
+		t.Fatal(err)
+	}
+	next := f.track("next", 10_000)
+	f.enqueue(room.ID, host.ID, unknown.ID, next.ID)
+
+	f.advance(time.Duration(unknownDurationFallbackMs-1000) * time.Millisecond)
+	if got := f.get(room.ID).Current.Item.TrackID; got != unknown.ID {
+		t.Fatalf("the room moved on early: %s", got)
+	}
+	f.advance(2 * time.Second)
+	if got := f.get(room.ID).Current.Item.TrackID; got != next.ID {
+		t.Fatalf("the fallback window never elapsed: %s", got)
+	}
+}
+
+// A room nobody is listening to is left alone: the queue belongs to the people
+// in the room, and playing it to an empty room would only spend it.
 func TestServerLeavesARoomNobodyIsListeningToAlone(t *testing.T) {
 	f := newFixture(t, nil)
 	host := guest("host-1")
@@ -443,87 +413,14 @@ func TestServerLeavesARoomNobodyIsListeningToAlone(t *testing.T) {
 	first := f.track("first", 1_000)
 	second := f.track("second", 1_000)
 	f.enqueue(room.ID, host.ID, first.ID, second.ID)
-	f.start(room.ID, host.ID, first.ID, 0, 1_000)
-	f.clock.Advance(time.Minute)
+
+	f.advance(time.Minute)
 	state := f.get(room.ID)
-	if state.Current == nil || state.Current.Item.TrackID != first.ID || state.Current.PositionMs != 60_000 {
-		t.Fatalf("the room moved on with nobody listening: %+v", state.Current)
+	if state.Current != nil {
+		t.Fatalf("the room started with nobody listening: %+v", state.Current)
 	}
-}
-
-// A host whose socket goes is a host who cannot report a player any more, so the
-// room keeps its own time: the server moves it on when the song the host last
-// reported reaches its end.
-func TestServerDrivesTheRoomWhileTheHostIsAway(t *testing.T) {
-	f := newFixture(t, nil)
-	f.longGrace()
-	host := guest("host-1")
-	room := f.create("party", ControlsEveryone, "", host)
-	if _, err := f.m.Join(room.ID, guest("bob"), "", ""); err != nil {
-		t.Fatal(err)
-	}
-	first := f.track("first", 30_000)
-	second := f.track("second", 30_000)
-	f.enqueue(room.ID, host.ID, first.ID, second.ID)
-
-	f.attach(host.ID)
-	f.attach("bob")
-	f.start(room.ID, host.ID, first.ID, 0, 30_000)
-	if got := f.get(room.ID).Current.DrivenBy; got != DrivenByHost {
-		t.Fatalf("driver while the host is here = %q", got)
-	}
-
-	// The host's laptop sleeps. Nobody can report its player now.
-	f.detach(host.ID)
-	if got := f.get(room.ID).Current.DrivenBy; got != DrivenByServer {
-		t.Fatalf("driver with the host away = %q", got)
-	}
-
-	f.clock.Advance(29 * time.Second)
-	if got := f.get(room.ID).Current.Item.TrackID; got != first.ID {
-		t.Fatalf("the room moved on before the song was over")
-	}
-	f.clock.Advance(2 * time.Second)
-	state := f.get(room.ID)
-	if state.Current == nil || state.Current.Item.TrackID != second.ID {
-		t.Fatalf("the room did not move on without its host: %+v", state.Current)
-	}
-	if !state.Current.Started || state.Current.Paused {
-		t.Fatalf("the next song is not running for the listeners: %+v", state.Current)
-	}
-	if state.Current.DrivenBy != DrivenByServer {
-		t.Fatalf("driver after a server advance = %q", state.Current.DrivenBy)
-	}
-	if len(state.MasterQueue) != 1 || state.MasterQueue[0].TrackID != second.ID {
-		t.Fatalf("queue after a server advance = %+v", state.MasterQueue)
-	}
-}
-
-// The host coming back is the room's clock again, and the server stops moving
-// the room on: two clocks would each think the other was behind.
-func TestHostReturningTakesTheClockBack(t *testing.T) {
-	f := newFixture(t, nil)
-	f.longGrace()
-	host := guest("host-1")
-	room := f.create("party", ControlsEveryone, "", host)
-	song := f.track("song", 30_000)
-	next := f.track("next", 30_000)
-	f.enqueue(room.ID, host.ID, song.ID, next.ID)
-
-	f.attach(host.ID)
-	f.start(room.ID, host.ID, song.ID, 0, 30_000)
-	f.detach(host.ID)
-	if got := f.get(room.ID).Current.DrivenBy; got != DrivenByServer {
-		t.Fatalf("driver with the host away = %q", got)
-	}
-
-	f.attach(host.ID)
-	if got := f.get(room.ID).Current.DrivenBy; got != DrivenByHost {
-		t.Fatalf("driver after the host came back = %q", got)
-	}
-	f.clock.Advance(time.Minute)
-	if got := f.get(room.ID).Current.Item.TrackID; got != song.ID {
-		t.Fatalf("the server kept driving after the host returned: %+v", f.get(room.ID).Current)
+	if len(state.MasterQueue) != 2 {
+		t.Fatalf("the queue was spent on an empty room: %+v", state.MasterQueue)
 	}
 }
 
@@ -536,11 +433,11 @@ func TestIdleRoomClosesItself(t *testing.T) {
 	room := f.create("party", ControlsEveryone, "", host)
 	f.attach(host.ID)
 
-	f.clock.Advance(30 * time.Second)
+	f.advance(30 * time.Second)
 	if _, err := f.m.Get(room.ID); err != nil {
 		t.Fatalf("the room closed early: %v", err)
 	}
-	f.clock.Advance(31 * time.Second)
+	f.advance(31 * time.Second)
 	if _, err := f.m.Get(room.ID); !errors.Is(err, ErrRoomNotFound) {
 		t.Fatalf("an idle room did not close itself: %v", err)
 	}
@@ -554,11 +451,10 @@ func TestPlayingRoomIsNotIdleButAPausedOneIs(t *testing.T) {
 	host := guest("host-1")
 	room := f.create("party", ControlsEveryone, "", host)
 	song := f.track("song", 600_000)
-	f.enqueue(room.ID, host.ID, song.ID)
 	f.attach(host.ID)
-	f.start(room.ID, host.ID, song.ID, 0, 600_000)
+	f.enqueue(room.ID, host.ID, song.ID)
 
-	f.clock.Advance(2 * time.Minute)
+	f.advance(2 * time.Minute)
 	if _, err := f.m.Get(room.ID); err != nil {
 		t.Fatalf("a playing room closed itself: %v", err)
 	}
@@ -566,11 +462,11 @@ func TestPlayingRoomIsNotIdleButAPausedOneIs(t *testing.T) {
 	if _, err := f.m.Pause(room.ID, host.ID); err != nil {
 		t.Fatal(err)
 	}
-	f.clock.Advance(59 * time.Second)
+	f.advance(59 * time.Second)
 	if _, err := f.m.Get(room.ID); err != nil {
 		t.Fatalf("a paused room closed early: %v", err)
 	}
-	f.clock.Advance(2 * time.Second)
+	f.advance(2 * time.Second)
 	if _, err := f.m.Get(room.ID); !errors.Is(err, ErrRoomNotFound) {
 		t.Fatalf("a paused room did not close itself: %v", err)
 	}
@@ -586,13 +482,13 @@ func TestUsingARoomPutsTheIdleClockBack(t *testing.T) {
 	f.attach(host.ID)
 	song := f.track("song", 30_000)
 
-	f.clock.Advance(50 * time.Second)
+	f.advance(50 * time.Second)
 	f.enqueue(room.ID, host.ID, song.ID)
-	f.clock.Advance(50 * time.Second)
+	f.advance(50 * time.Second)
 	if _, err := f.m.Get(room.ID); err != nil {
 		t.Fatalf("the room closed although somebody was still queueing: %v", err)
 	}
-	f.clock.Advance(time.Minute)
+	f.advance(time.Minute)
 	if _, err := f.m.Get(room.ID); !errors.Is(err, ErrRoomNotFound) {
 		t.Fatalf("the room never closed after the idle window: %v", err)
 	}
@@ -603,13 +499,13 @@ func TestPausedRoomPositionDoesNotAdvance(t *testing.T) {
 	host := guest("host-1")
 	room := f.create("party", ControlsEveryone, "", host)
 	song := f.track("song", 30_000)
+	f.attach(host.ID)
 	f.enqueue(room.ID, host.ID, song.ID)
-	f.start(room.ID, host.ID, song.ID, 0, 30_000)
-	f.clock.Advance(5 * time.Second)
+	f.advance(5 * time.Second)
 	if _, err := f.m.Pause(room.ID, host.ID); err != nil {
 		t.Fatal(err)
 	}
-	f.clock.Advance(10 * time.Minute)
+	f.advance(10 * time.Minute)
 	state := f.get(room.ID)
 	if state.Current == nil || !state.Current.Paused || state.Current.PositionMs != 5_000 {
 		t.Fatalf("paused room moved: %+v", state.Current)
@@ -617,7 +513,7 @@ func TestPausedRoomPositionDoesNotAdvance(t *testing.T) {
 	if _, err := f.m.Resume(room.ID, host.ID); err != nil {
 		t.Fatal(err)
 	}
-	f.clock.Advance(2 * time.Second)
+	f.advance(2 * time.Second)
 	state = f.get(room.ID)
 	if state.Current == nil || state.Current.PositionMs != 7_000 {
 		t.Fatalf("resumed room position = %+v", state.Current)
@@ -632,8 +528,8 @@ func TestControlPolicyGovernsTransport(t *testing.T) {
 		t.Fatal(err)
 	}
 	track := f.track("only", 100_000)
+	f.attach(host.ID)
 	f.enqueue(room.ID, host.ID, track.ID)
-	f.start(room.ID, host.ID, track.ID, 0, 0)
 
 	if _, err := f.m.Pause(room.ID, "bob"); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("follower pause under host control: %v", err)
@@ -648,8 +544,8 @@ func TestControlPolicyGovernsTransport(t *testing.T) {
 		t.Fatal(err)
 	}
 	track2 := f.track("open song", 100_000)
+	f.attach("carol")
 	f.enqueue(open.ID, "carol", track2.ID)
-	f.start(open.ID, "carol", track2.ID, 0, 0)
 	if _, err := f.m.Pause(open.ID, "dave"); err != nil {
 		t.Fatalf("follower pause under open control: %v", err)
 	}
@@ -661,8 +557,8 @@ func TestPauseResumeSeekAndSeekPastEnd(t *testing.T) {
 	room := f.create("party", ControlsEveryone, "", host)
 	track := f.track("song", 100_000)
 	other := f.track("other", 100_000)
+	f.attach(host.ID)
 	f.enqueue(room.ID, host.ID, track.ID, other.ID)
-	f.start(room.ID, host.ID, track.ID, 0, 100_000)
 
 	f.clock.Advance(10 * time.Second)
 	snap, err := f.m.Pause(room.ID, host.ID)
@@ -724,8 +620,8 @@ func TestVotesAndAutoSkip(t *testing.T) {
 	}
 	bad := f.track("bad", 100_000)
 	good := f.track("good", 100_000)
+	f.attach(host.ID)
 	f.enqueue(room.ID, host.ID, bad.ID, good.ID)
-	f.start(room.ID, host.ID, bad.ID, 0, 0)
 
 	snap, err := f.m.Vote(context.Background(), room.ID, host.ID, 1)
 	if err != nil {
@@ -743,17 +639,15 @@ func TestVotesAndAutoSkip(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Two voters under the threshold: the song is dropped and the next one is
-	// waiting for the host as usual.
+	// running in its place.
 	snap = f.get(room.ID)
-	if snap.Current == nil || snap.Current.Item.TrackID != good.ID || snap.Current.Started {
+	if snap.Current == nil || snap.Current.Item.TrackID != good.ID || snap.Current.Paused {
 		t.Fatalf("after auto-skip = %+v", snap.Current)
 	}
 
 	// A vote on nothing playing is refused.
-	if err := f.m.Sync(room.ID, host.ID, SyncState{}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.m.Vote(context.Background(), room.ID, host.ID, 3); !errors.Is(err, ErrNoPlayback) {
+	empty := f.create("empty", ControlsEveryone, "", guest("eve"))
+	if _, err := f.m.Vote(context.Background(), empty.ID, "eve", 3); !errors.Is(err, ErrNoPlayback) {
 		t.Fatalf("vote with nothing playing: %v", err)
 	}
 	// Votes are kept for stats.
@@ -832,8 +726,8 @@ func TestLeavePromotesHostAndDropsQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 	track := f.track("song", 100_000)
+	f.attach(host.ID)
 	f.enqueue(room.ID, host.ID, track.ID)
-	f.start(room.ID, host.ID, track.ID, 0, 0)
 	if _, err := f.m.Vote(context.Background(), room.ID, host.ID, 5); err != nil {
 		t.Fatal(err)
 	}
@@ -897,7 +791,8 @@ func TestSeqCountsEveryEvent(t *testing.T) {
 
 	events, cancel := f.m.Subscribe()
 	defer cancel()
-	f.start(room.ID, host.ID, track.ID, 0, 0)
+	f.attach(host.ID)
+	f.tick()
 	event := waitEvent(t, events, EventPlayback)
 	if event.Seq != f.get(room.ID).Seq {
 		t.Fatalf("event seq %d, snapshot seq %d", event.Seq, f.get(room.ID).Seq)
