@@ -222,3 +222,8 @@
 - Why: that gate is what a real deployment fell over. With `requireLogin` set, a browser whose socket never registered left a room with a full queue sitting at "nothing playing" indefinitely - observed on amanita: 41 queued, 1 member, no current, and the room began the instant a socket registered as that member. A socket blinking (a reload, a sleep, a proxy hanging up, a browser that cannot hold a websocket) must not be the thing that stops the music; membership is the durable fact, since the grace after a socket closes is what removes a member and that same path closes an empty room.
 - Also: the "do not spend the queue on an empty room" intent is kept - an empty room does not exist, it is closed when its last member leaves.
 - Reversible: yes
+
+## [2026-10-12] The order holds what comes next; the song on is held apart
+- Decision: the room's `master` no longer contains the current item. `beginLocked` splices it off the head as it becomes current, and `recomputeMasterLocked` excludes it while interleaving the pending queues by a fairness ledger (least songs heard first, then longest waiting, then join order) instead of the old fixed pass-per-member round robin.
+- Why: the old rebuild ran around the in-flight song, so a queue edit mid-song placed fresh items ahead of the song on — one member's songs showed (and prefetched) wrongly and played twice in a row after it ended ("two of my songs before my friend's"). The ledger reproduces the old order in the no-edit case and alternates correctly after a mid-song edit.
+- Reversible: yes (clients tolerate both shapes: the web slices/filters at the current id, the SDK's Pending filters it out).

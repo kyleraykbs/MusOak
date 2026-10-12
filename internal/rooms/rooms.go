@@ -113,13 +113,21 @@ type room struct {
 	members map[string]*Member
 	order   []string
 
-	// queues holds each member's own queue, including the item in flight until
-	// it finishes; master is the fair play order derived from it. The current
-	// item keeps its place in both until the room moves off it, so the
-	// round-robin phase survives while the room works through the mix.
+	// queues holds each member's own queue, including the song in flight until
+	// the advance drops it. master is the play order YET TO COME: the song on
+	// lives in current and not in the order, so an edit made while it plays
+	// can never shove a fresh song ahead of it - which is how played and
+	// unplayed items used to end up in front of the song that was on.
 	queues  map[string][]QueueItem
 	master  []QueueItem
 	current *playback
+
+	// The fairness ledger: how many songs each member has had on, and when the
+	// last one began. The pending order interleaves by these - least heard
+	// first, then longest waiting, then join order - so a queue edit mid-song
+	// cannot hand one member two songs in a row after the song on ends.
+	playedCounts   map[string]int
+	lastPlayedAtMs map[string]int64
 
 	// queueDirty names the member queues that changed since the last tick. The
 	// tick republishes those queues, so a client that missed the immediate
@@ -480,19 +488,21 @@ func (m *Manager) Create(name string, controls Controls, password string, host M
 	}
 	host.JoinedAtMs = m.nowMsLocked()
 	room := &room{
-		id:          id,
-		name:        name,
-		host:        host.ID,
-		owner:       ownerIdentity(host),
-		ownerName:   host.Name,
-		controls:    controls,
-		password:    password,
-		createdAtMs: m.nowMsLocked(),
-		members:     map[string]*Member{host.ID: &host},
-		order:       []string{host.ID},
-		queues:      map[string][]QueueItem{host.ID: {}},
-		queueDirty:  map[string]bool{},
-		idleSinceMs: m.nowMsLocked(),
+		id:             id,
+		name:           name,
+		host:           host.ID,
+		owner:          ownerIdentity(host),
+		ownerName:      host.Name,
+		controls:       controls,
+		password:       password,
+		createdAtMs:    m.nowMsLocked(),
+		members:        map[string]*Member{host.ID: &host},
+		order:          []string{host.ID},
+		queues:         map[string][]QueueItem{host.ID: {}},
+		playedCounts:   map[string]int{},
+		lastPlayedAtMs: map[string]int64{},
+		queueDirty:     map[string]bool{},
+		idleSinceMs:    m.nowMsLocked(),
 	}
 	m.rooms[id] = room
 	m.roomOrder = append(m.roomOrder, id)
@@ -723,31 +733,75 @@ func (m *Manager) queueItemLocked(ctx context.Context, memberID string, track *s
 	}
 }
 
-// recomputeMasterLocked rebuilds the play order: a perfectly fair round-robin
-// across the member queues in join order — one item from each member per pass,
-// each member's own order kept. With A=[a1 a2] and B=[b1 b2] the master queue
-// is [a1 b1 a2 b2].
+// recomputeMasterLocked rebuilds the order yet to come: every queued item the
+// room has not reached, interleaved so the member who has heard least goes
+// first, then whoever has waited longest, then join order.
+//
+// The song on is not part of it — it is playing, charged to its owner when it
+// began — so a queue edit while it plays can only shape what comes after. The
+// old rebuild started every pass at the head of the join order with the
+// in-flight song still taking its owner's slot: somebody queueing in the
+// middle of a song put their songs at the head, and when the song on ended
+// they played twice before the next member's turn.
 func recomputeMasterLocked(room *room) {
-	total := 0
-	for _, memberID := range room.order {
-		total += len(room.queues[memberID])
+	inflight := ""
+	if room.current != nil {
+		inflight = room.current.item.ID
 	}
-	master := make([]QueueItem, 0, total)
-	for pass := 0; len(master) < total; pass++ {
-		for _, memberID := range room.order {
-			items := room.queues[memberID]
-			if pass < len(items) {
-				master = append(master, items[pass])
+
+	// The picks below simulate the plays to come, so they move working copies
+	// of the ledger; the room's own counts move only when a song begins.
+	heard := make(map[string]int, len(room.playedCounts))
+	for member, n := range room.playedCounts {
+		heard[member] = n
+	}
+	waited := make(map[string]int64, len(room.lastPlayedAtMs))
+	for member, at := range room.lastPlayedAtMs {
+		waited[member] = at
+	}
+	head := map[string]int{}
+
+	master := make([]QueueItem, 0, 64)
+	for {
+		best, bestSlot := "", -1
+		for slot, member := range room.order {
+			if head[member] >= len(room.queues[member]) {
+				continue
+			}
+			if best == "" || fairerLocked(room.order, member, slot, best, bestSlot, heard, waited) {
+				best, bestSlot = member, slot
 			}
 		}
+		if best == "" {
+			break
+		}
+		item := room.queues[best][head[best]]
+		head[best]++
+		if item.ID == inflight {
+			continue // the song on: already counted, already not in the order
+		}
+		master = append(master, item)
+		heard[best]++
+		// A picked song counts as the most recent, so the next tie goes to
+		// whoever has waited rather than falling back to join order.
+		waited[best] = 1 << 62
 	}
 	room.master = master
 }
 
-// dropItemLocked removes one played item from its owner's queue and from the
-// play order. The remaining order keeps its round-robin phase — the master is
-// only recomputed when members edit their queues, so the room plays one track
-// per member per pass even as queues change.
+// fairerLocked reports whether member a takes the next slot over member b.
+func fairerLocked(order []string, a string, aSlot int, b string, bSlot int, heard map[string]int, waited map[string]int64) bool {
+	if heard[a] != heard[b] {
+		return heard[a] < heard[b]
+	}
+	if waited[a] != waited[b] {
+		return waited[a] < waited[b]
+	}
+	return aSlot < bSlot
+}
+
+// dropItemLocked removes one played item from its owner's queue. The play
+// order needs no touch: the song on is not in it (see recomputeMasterLocked).
 func dropItemLocked(room *room, item QueueItem) {
 	if items, ok := room.queues[item.AddedBy]; ok {
 		for i, queued := range items {
@@ -755,12 +809,6 @@ func dropItemLocked(room *room, item QueueItem) {
 				room.queues[item.AddedBy] = append(items[:i], items[i+1:]...)
 				break
 			}
-		}
-	}
-	for i, queued := range room.master {
-		if queued.ID == item.ID {
-			room.master = append(room.master[:i], room.master[i+1:]...)
-			break
 		}
 	}
 }
@@ -918,15 +966,20 @@ func (m *Manager) Clear(roomID, memberID, targetMemberID string) (*Snapshot, err
 	return m.snapshotLocked(room), nil
 }
 
-// beginLocked puts the first item of the play order on, running: the server is
+// beginLocked puts the next item of the play order on, running: the server is
 // the room's clock, so a song starts when the room has one to play and stops
 // only when somebody pauses it or the room runs out. Explicit skips and votes
-// also use this path. It reports whether it published the new current.
+// also use this path. The song leaves the order as it becomes the current one,
+// and its member is charged for it in the fairness ledger. It reports whether
+// it published the new current.
 func (m *Manager) beginLocked(room *room) bool {
 	if room.current != nil || len(room.master) == 0 {
 		return false
 	}
 	item := room.master[0]
+	room.master = room.master[1:]
+	room.playedCounts[item.AddedBy]++
+	room.lastPlayedAtMs[item.AddedBy] = m.nowMsLocked()
 	room.current = &playback{
 		item:       item,
 		votes:      map[string]int{},

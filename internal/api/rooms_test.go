@@ -285,7 +285,9 @@ func TestRoomQueuesOverHTTP(t *testing.T) {
 	enqueue(bob, "B2")
 
 	state := get()
-	if got, want := roomTitles(state.MasterQueue), []string{"A1", "B1", "A2", "B2"}; !slices.Equal(got, want) {
+	// A1 started on the first enqueue, so it is the song on: the order holds
+	// what comes next, led by the member who has heard nothing yet.
+	if got, want := roomTitles(state.MasterQueue), []string{"B1", "A2", "B2"}; !slices.Equal(got, want) {
 		t.Errorf("masterQueue = %v, want %v", got, want)
 	}
 	if got, want := roomTitles(state.Queues[aliceID]), []string{"A1", "A2"}; !slices.Equal(got, want) {
@@ -337,8 +339,8 @@ func TestRoomQueuesOverHTTP(t *testing.T) {
 	if got, want := roomTitles(state.Queues[aliceID]), []string{"A1", "A2"}; !slices.Equal(got, want) {
 		t.Errorf("alice's queue after bob's clear = %v, want %v", got, want)
 	}
-	if got, want := roomTitles(state.MasterQueue), []string{"A1", "A2"}; !slices.Equal(got, want) {
-		t.Errorf("masterQueue after clear = %v, want %v", got, want)
+	if got, want := roomTitles(state.MasterQueue), []string{"A2"}; !slices.Equal(got, want) {
+		t.Errorf("masterQueue after clear = %v, want %v (the song on is not in it)", got, want)
 	}
 
 	// The host may clear anyone's queue; anyone else may not.

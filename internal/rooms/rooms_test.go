@@ -232,11 +232,13 @@ func TestEnqueueMixesQueuesFairly(t *testing.T) {
 	// Enqueue starts the room: the server is the clock now, so a room with a
 	// queue and somebody in it plays - there is no host sync to wait for.
 	state := f.get(room.ID)
-	if state.Current == nil {
-		t.Fatal("the room did not start on its own enqueue")
+	if state.Current == nil || state.Current.Item.Title != "a1" {
+		t.Fatalf("the room did not start on its own enqueue: %+v", state.Current)
 	}
-	if state.Current.Item.ID != state.MasterQueue[0].ID {
-		t.Fatalf("the room started on something other than the first queued item: %+v", state.Current.Item)
+	for _, item := range state.MasterQueue {
+		if item.ID == state.Current.Item.ID {
+			t.Fatalf("the song on is still in the order: %+v", state.MasterQueue)
+		}
 	}
 
 	f.enqueue(room.ID, "bob", b1.ID, b2.ID)
@@ -245,7 +247,9 @@ func TestEnqueueMixesQueuesFairly(t *testing.T) {
 	for _, item := range snapshot.MasterQueue {
 		got = append(got, item.Title)
 	}
-	want := []string{"a1", "b1", "a2", "b2"}
+	// The song on has charged its member a turn, so the fresh mix starts with
+	// the member who has heard nothing yet.
+	want := []string{"b1", "a2", "b2"}
 	for i := range want {
 		if i >= len(got) || got[i] != want[i] {
 			t.Fatalf("play order = %v, want %v", got, want)
@@ -292,8 +296,8 @@ func TestTheServerStartsAndAdvancesTheRoom(t *testing.T) {
 	if !state.Current.Started || state.Current.Paused {
 		t.Fatalf("the next song is not running: %+v", state.Current)
 	}
-	if len(state.MasterQueue) != 1 || state.MasterQueue[0].TrackID != second.ID {
-		t.Fatalf("queue after an advance = %+v", state.MasterQueue)
+	if len(state.MasterQueue) != 0 {
+		t.Fatalf("the song on is in the order after an advance: %+v", state.MasterQueue)
 	}
 	// The played item left its owner's queue as well as the play order.
 	if len(state.Queues[host.ID]) != 1 || state.Queues[host.ID][0].TrackID != second.ID {
@@ -318,7 +322,10 @@ func TestAdvanceKeepsRoundRobinPhaseAndDropsFromQueue(t *testing.T) {
 	f.enqueue(room.ID, "bob", middle.ID)
 
 	state := f.get(room.ID)
-	want := []string{"first", "middle", "repeated", "repeated"}
+	if state.Current == nil || state.Current.Item.Title != "first" {
+		t.Fatalf("the room did not start on the first song: %+v", state.Current)
+	}
+	want := []string{"middle", "repeated", "repeated"}
 	if len(state.MasterQueue) != len(want) {
 		t.Fatalf("mixed queue size = %d, want %d", len(state.MasterQueue), len(want))
 	}
@@ -327,7 +334,7 @@ func TestAdvanceKeepsRoundRobinPhaseAndDropsFromQueue(t *testing.T) {
 			t.Fatalf("mixed queue = %+v, want title %q at %d", state.MasterQueue, title, i)
 		}
 	}
-	firstRepeat, secondRepeat := state.MasterQueue[2], state.MasterQueue[3]
+	firstRepeat, secondRepeat := state.MasterQueue[1], state.MasterQueue[2]
 	if firstRepeat.ID == secondRepeat.ID || firstRepeat.TrackID != secondRepeat.TrackID {
 		t.Fatalf("duplicate queue entries = %+v, %+v", firstRepeat, secondRepeat)
 	}
@@ -911,5 +918,61 @@ func TestAQueuedItemCarriesTheArtistNames(t *testing.T) {
 	}
 	if len(got.ArtistIDs) != 1 {
 		t.Errorf("artistIds = %v, want the id the menu opens", got.ArtistIDs)
+	}
+}
+
+// Queueing in the middle of a song must not put the fresh songs in front of
+// the song on, and when it ends the room owes the member who has heard
+// nothing their turn first. This is the reported "two of my songs before my
+// friend's" bug: a mid-song rebuild used to slot the new songs around the
+// in-flight song, so after it ended one member played twice in a row.
+func TestQueueingMidSongKeepsTheOrderFairAndAhead(t *testing.T) {
+	f := newFixture(t, nil)
+	kyle := guest("kyle")
+	room := f.create("party", ControlsEveryone, "", kyle)
+	if _, err := f.m.Join(room.ID, guest("sage"), "", ""); err != nil {
+		t.Fatal(err)
+	}
+	f.attach(kyle.ID)
+	sageSong := f.track("sage song", 60_000)
+	first := f.track("window", 10_000)
+	second := f.track("on your mind", 10_000)
+	sageMore := f.track("magic", 10_000)
+
+	// Sage queues while Kyle has nothing queued: the room starts on it.
+	f.enqueue(room.ID, "sage", sageSong.ID)
+	if state := f.get(room.ID); state.Current == nil || state.Current.Item.Title != "sage song" {
+		t.Fatalf("the room did not start on sage's song: %+v", state.Current)
+	}
+
+	// Kyle queues mid-song; sage queues another behind his.
+	f.enqueue(room.ID, "kyle", first.ID, second.ID)
+	f.enqueue(room.ID, "sage", sageMore.ID)
+
+	state := f.get(room.ID)
+	for _, item := range state.MasterQueue {
+		if item.ID == state.Current.Item.ID {
+			t.Fatalf("the song on is in the order: %+v", state.MasterQueue)
+		}
+	}
+	want := []string{"window", "magic", "on your mind"}
+	if len(state.MasterQueue) != len(want) {
+		t.Fatalf("order = %+v, want %v", state.MasterQueue, want)
+	}
+	for i, title := range want {
+		if state.MasterQueue[i].Title != title {
+			t.Fatalf("order = %+v, want %q at %d", state.MasterQueue, title, i)
+		}
+	}
+
+	// And when the song on ends: window, then magic — never two of one
+	// member's back to back.
+	f.advance(61 * time.Second)
+	if state := f.get(room.ID); state.Current == nil || state.Current.Item.Title != "window" {
+		t.Fatalf("after the song on: %+v", state.Current)
+	}
+	f.advance(11 * time.Second)
+	if state := f.get(room.ID); state.Current == nil || state.Current.Item.Title != "magic" {
+		t.Fatalf("second song = %+v, want sage's turn", state.Current)
 	}
 }
