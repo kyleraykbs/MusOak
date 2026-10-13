@@ -51,7 +51,11 @@ pkg/client         the public Go SDK: the CLI and any bot are clients of it
 
 A **track** is the recording; a **variant** is one provider's (or one local
 file's) rendition of it. Matching decides which variants belong to the same
-track; the provider ranking decides which variant is played.
+track; the provider ranking decides which variant is played. A song attached
+from a search is answered with the rendition that was picked, and the other
+platforms are looked for behind that answer: a song with one source has nothing
+to fall back to when that one file will not fetch, and finding the rest is not
+worth making somebody wait for.
 
 Listen Together details worth knowing before you rely on it:
 

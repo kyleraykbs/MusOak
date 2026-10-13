@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,6 +25,18 @@ type fakeProvider struct {
 	// query it does not name gets nothing back.
 	byQuery map[string][]provider.Track
 	err     error
+
+	// mu guards searches: the background match asks providers from its own
+	// goroutine while the test reads the count.
+	mu       sync.Mutex
+	searches int
+}
+
+// searchCount is how many searches this provider has been asked for.
+func (f *fakeProvider) searchCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.searches
 }
 
 func (f *fakeProvider) Name() string { return f.name }
@@ -32,6 +45,9 @@ func (f *fakeProvider) Capabilities() provider.Caps {
 }
 
 func (f *fakeProvider) Search(ctx context.Context, q string, opts provider.SearchOpts) ([]provider.Track, error) {
+	f.mu.Lock()
+	f.searches++
+	f.mu.Unlock()
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -646,5 +662,83 @@ func TestResolveAsksAgainWithTheTitleAlone(t *testing.T) {
 	}
 	if !hasDownloadable(variants) {
 		t.Fatalf("nothing matched, but the title alone finds it: %+v", variants)
+	}
+}
+
+// A song attached from a search is answered with the rendition that was picked,
+// and the other platforms are looked for behind that answer. Those renditions
+// are what a second attempt plays from when the first one will not fetch.
+func TestAttachMatchesTheOtherPlatformsInTheBackground(t *testing.T) {
+	yt := &fakeProvider{name: "ytmusic", caps: provider.Caps{Search: true, Download: true}}
+	sp := &fakeProvider{
+		name: "spotify",
+		caps: provider.Caps{Search: true, Download: true},
+		hits: []provider.Track{{
+			ProviderTrackID: "sp-1",
+			Title:           "Song",
+			Artists:         []string{"Artist"},
+			Album:           "Album",
+			DurationMs:      180_000,
+		}},
+	}
+	m, db := newTestMatcher(t, yt, sp)
+	ctx := context.Background()
+
+	track, variant, err := m.Attach(ctx, "ytmusic", ytHit("Song", "Artist", "Album", 180_000))
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	if variant.Provider != "ytmusic" {
+		t.Fatalf("variant provider = %q, want the rendition that was attached", variant.Provider)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		variants, err := db.VariantsForTrack(ctx, track.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(variants) > 1 {
+			found := false
+			for _, each := range variants {
+				if each.Provider == "spotify" && each.Downloadable {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("the background match attached something unusable: %+v", variants)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("variants = %d, want the other platform attached in the background", len(variants))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// The background pass is not a reason to search platforms that cannot hand a
+// file over: they add a row nobody can play.
+func TestBackgroundMatchSkipsPlatformsThatCannotDownload(t *testing.T) {
+	yt := &fakeProvider{name: "ytmusic", caps: provider.Caps{Search: true, Download: true}}
+	sp := &fakeProvider{name: "spotify", caps: provider.Caps{Search: true, Download: false}}
+	m, db := newTestMatcher(t, yt, sp)
+	ctx := context.Background()
+
+	track, _, err := m.Attach(ctx, "ytmusic", ytHit("Song", "Artist", "Album", 180_000))
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	if sp.searchCount() != 0 {
+		t.Errorf("a platform that cannot download was searched %d times", sp.searchCount())
+	}
+	variants, err := db.VariantsForTrack(ctx, track.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(variants) != 1 {
+		t.Errorf("variants = %d, want only the one that was attached", len(variants))
 	}
 }

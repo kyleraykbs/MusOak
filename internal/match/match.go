@@ -45,6 +45,13 @@ const SearchTimeout = 15 * time.Second
 // resolveLimit is how many provider hits a resolution step considers.
 const resolveLimit = 10
 
+// backgroundSlots is how many songs are matched against the other platforms at
+// once, and BackgroundMatchTimeout how long one song's match may take.
+const (
+	backgroundSlots        = 2
+	BackgroundMatchTimeout = 2 * time.Minute
+)
+
 // ErrNoPlayableVariant means the track still has no downloadable rendition
 // after resolution: nothing matched.
 var ErrNoPlayableVariant = errors.New("no downloadable variant available")
@@ -228,6 +235,11 @@ type Matcher struct {
 	// mu serialises attach operations so two simultaneous hits for one
 	// recording cannot create two canonical tracks.
 	mu sync.Mutex
+
+	// background bounds how many songs are being matched against the other
+	// platforms at once, so attaching a playlist cannot become a hundred
+	// simultaneous provider searches.
+	background chan struct{}
 }
 
 // New returns a matcher using the given score threshold.
@@ -235,15 +247,33 @@ func New(db Store, providers *provider.Registry, threshold float64, logger *slog
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Matcher{db: db, providers: providers, threshold: threshold, logger: logger}
+	return &Matcher{
+		db:         db,
+		providers:  providers,
+		threshold:  threshold,
+		logger:     logger,
+		background: make(chan struct{}, backgroundSlots),
+	}
 }
 
 // Attach finds or creates the canonical track for a provider hit and stores
 // the hit as a variant of it.
+//
+// The caller is answered with that one rendition and the other platforms are
+// looked for behind the answer: attaching is a person waiting on the song they
+// picked, and a search result that costs a dozen provider round trips is a
+// search result that feels broken.
 func (m *Matcher) Attach(ctx context.Context, providerName string, hit provider.Track) (*store.Track, *store.Variant, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.attachLocked(ctx, providerName, hit)
+	track, variant, err := m.attachLocked(ctx, providerName, hit)
+	m.mu.Unlock()
+	if err != nil {
+		return nil, nil, err
+	}
+	if track != nil {
+		m.matchTheRest(ctx, track.ID)
+	}
+	return track, variant, nil
 }
 
 // attachLocked is Attach without the lock, so Resolve can call it while it
@@ -339,7 +369,18 @@ func (m *Matcher) learnLocked(ctx context.Context, track *store.Track, variant *
 // track deliberately. The write is idempotent for the same (provider,
 // providerTrackId), so posting the same pick twice returns the variant already
 // stored. An unregistered provider is ErrUnknownProvider.
+// AttachToTrack stores a provider hit as a variant of an existing track, and
+// looks for the other platforms behind the answer, as Attach does.
 func (m *Matcher) AttachToTrack(ctx context.Context, trackID uuid.UUID, providerName string, hit provider.Track) (*store.Track, *store.Variant, error) {
+	track, variant, err := m.attachToTrack(ctx, trackID, providerName, hit)
+	if err != nil {
+		return nil, nil, err
+	}
+	m.matchTheRest(ctx, trackID)
+	return track, variant, nil
+}
+
+func (m *Matcher) attachToTrack(ctx context.Context, trackID uuid.UUID, providerName string, hit provider.Track) (*store.Track, *store.Variant, error) {
 	p, ok := m.providers.Get(providerName)
 	if !ok {
 		return nil, nil, ErrUnknownProvider
@@ -426,6 +467,125 @@ func (m *Matcher) AttachToTrack(ctx context.Context, trackID uuid.UUID, provider
 
 	m.learnLocked(ctx, track, variant, hit)
 	return track, variant, nil
+}
+
+// matchTheRest looks for a track on the providers that have no rendition of it
+// yet, and attaches what it finds, without the caller waiting for it.
+//
+// What this is for: a song attached from a search has one rendition - the one
+// the provider it was found on gave - so when that file will not fetch there is
+// nothing else to play and the song is skipped. The other platforms' renditions
+// are what make the second attempt possible, and finding them is not worth
+// making somebody wait for.
+func (m *Matcher) matchTheRest(ctx context.Context, trackID uuid.UUID) {
+	if m.background == nil {
+		return
+	}
+	go func() {
+		// The request that attached this song is answered the moment it
+		// returns, so its cancellation must not reach this work.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), BackgroundMatchTimeout)
+		defer cancel()
+		select {
+		case m.background <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
+		defer func() { <-m.background }()
+		m.matchRest(ctx, trackID)
+	}()
+}
+
+// matchRest is the body of matchTheRest, with the slot already held.
+func (m *Matcher) matchRest(ctx context.Context, trackID uuid.UUID) {
+	track, err := m.db.Track(ctx, trackID)
+	if err != nil {
+		m.logger.Warn("match: background match found no track", "track", trackID, "error", err)
+		return
+	}
+	variants, err := m.db.VariantsForTrack(ctx, trackID)
+	if err != nil {
+		return
+	}
+	artists, err := m.db.TrackArtists(ctx, trackID)
+	if err != nil {
+		return
+	}
+	albums, err := m.db.TrackAlbums(ctx, trackID)
+	if err != nil {
+		return
+	}
+
+	known := make(map[string]bool, len(variants))
+	want := Candidate{Title: track.Title, Artists: artistNames(artists), DurationMs: track.DurationMs}
+	if len(albums) > 0 {
+		want.Album = albums[0].Title
+	}
+	for _, variant := range variants {
+		known[variant.Provider] = true
+		if want.ISRC == "" && variant.ISRC != "" {
+			want.ISRC = variant.ISRC
+		}
+	}
+	query := strings.TrimSpace(track.Title + " " + strings.Join(want.Artists, " "))
+	if query == "" {
+		return
+	}
+
+	for _, p := range m.providers.All() {
+		if ctx.Err() != nil {
+			return
+		}
+		// A platform that already has a rendition of this song has nothing to
+		// add, and one that cannot hand a file over has nothing to play from.
+		if known[p.Name()] || !p.Capabilities().Download {
+			continue
+		}
+		best, score := m.searchFor(ctx, p, want, query, trackID)
+		if best == nil || score < m.threshold {
+			m.logger.Debug("match: no background candidate above threshold",
+				"provider", p.Name(), "track", trackID, "score", score)
+			continue
+		}
+		if _, _, err := m.attachToTrack(ctx, trackID, p.Name(), *best); err != nil {
+			m.logger.Warn("match: could not attach a background rendition",
+				"provider", p.Name(), "track", trackID, "error", err)
+			continue
+		}
+		m.logger.Info("matched another rendition in the background",
+			"track", trackID, "provider", p.Name(), "match_score", score)
+	}
+}
+
+// searchFor asks one provider for a recording and returns its best candidate,
+// with the title alone as the second half of the search.
+func (m *Matcher) searchFor(ctx context.Context, p provider.Provider, want Candidate, query string, trackID uuid.UUID) (*provider.Track, float64) {
+	searchCtx, cancel := context.WithTimeout(ctx, SearchTimeout)
+	hits, err := p.Search(searchCtx, query, provider.SearchOpts{Limit: resolveLimit})
+	cancel()
+	if err != nil {
+		m.logger.Warn("match: search failed", "provider", p.Name(), "track", trackID, "error", err)
+		return nil, 0
+	}
+	best, bestScore := bestHit(want, hits)
+	if best == nil || bestScore < m.threshold {
+		// One query can miss what another finds. The title alone is the other
+		// half of this search: credits are what providers spell differently,
+		// and a query carrying them can push the right answer out of the ten
+		// hits entirely. Asked only when the first found nothing, so a search
+		// that works costs exactly what it did.
+		if plain := strings.TrimSpace(want.Title); plain != "" && plain != query {
+			moreCtx, moreCancel := context.WithTimeout(ctx, SearchTimeout)
+			more, moreErr := p.Search(moreCtx, plain, provider.SearchOpts{Limit: resolveLimit})
+			moreCancel()
+			if moreErr != nil {
+				m.logger.Warn("match: search failed", "provider", p.Name(), "track", trackID, "error", moreErr)
+			} else if better, betterScore := bestHit(want, more); better != nil && betterScore > bestScore {
+				best, bestScore = better, betterScore
+			}
+		}
+	}
+	return best, bestScore
 }
 
 // findTrack looks for the canonical track a hit belongs to, or nil.
@@ -649,31 +809,7 @@ func (m *Matcher) Resolve(ctx context.Context, trackID uuid.UUID) ([]store.Varia
 		}
 		// Searching is slow: it happens without the lock so other matches are
 		// not blocked behind a network round trip.
-		searchCtx, cancel := context.WithTimeout(ctx, SearchTimeout)
-		hits, err := p.Search(searchCtx, query, provider.SearchOpts{Limit: resolveLimit})
-		cancel()
-		if err != nil {
-			m.logger.Warn("match: resolution search failed", "provider", p.Name(), "track", trackID, "error", err)
-			continue
-		}
-		best, bestScore := bestHit(want, hits)
-		if best == nil || bestScore < m.threshold {
-			// One query can miss what another finds. The title alone is the
-			// other half of this search: credits are what providers spell
-			// differently, and a query carrying them can push the right answer
-			// out of the ten hits entirely. Asked only when the first found
-			// nothing, so a resolve that works costs exactly what it did.
-			if plain := strings.TrimSpace(track.Title); plain != "" && plain != query {
-				moreCtx, moreCancel := context.WithTimeout(ctx, SearchTimeout)
-				more, moreErr := p.Search(moreCtx, plain, provider.SearchOpts{Limit: resolveLimit})
-				moreCancel()
-				if moreErr != nil {
-					m.logger.Warn("match: resolution search failed", "provider", p.Name(), "track", trackID, "error", moreErr)
-				} else if better, betterScore := bestHit(want, more); better != nil && betterScore > bestScore {
-					best, bestScore = better, betterScore
-				}
-			}
-		}
+		best, bestScore := m.searchFor(ctx, p, want, query, trackID)
 		if best == nil || bestScore < m.threshold {
 			m.logger.Debug("match: no resolution candidate above threshold",
 				"provider", p.Name(), "track", trackID, "score", bestScore)
