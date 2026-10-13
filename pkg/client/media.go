@@ -84,6 +84,9 @@ const (
 	// songs itself is what makes an advance cost only the time to switch
 	// files.
 	prefetchAhead = 3
+
+	// warmConcurrency is how many prefetches may run at once.
+	warmConcurrency = 2
 )
 
 // Participant follows a room on behalf of one member. The server is the room's
@@ -125,8 +128,13 @@ type Participant struct {
 	// the song playing.
 	absurdSaid bool
 
-	playing         *localPlayback
-	warming         map[string]bool
+	playing *localPlayback
+	warming map[string]bool
+	// warmSlots bounds how many prefetches run at once: a queue burst —
+	// somebody shuffling a playlist into the room — is one warm request per
+	// event, and letting them all fetch together starves the event loop that
+	// has to keep reading the socket.
+	warmSlots       chan struct{}
 	lastSeq         int64
 	advancingItemID string
 }
@@ -158,6 +166,7 @@ func NewParticipant(room *RoomClient, cache *Cache, sink Sink, logger *slog.Logg
 		driftTolerance: defaultDriftToleranceMs,
 		played:         map[string]bool{},
 		warming:        map[string]bool{},
+		warmSlots:      make(chan struct{}, warmConcurrency),
 	}
 }
 
@@ -747,6 +756,12 @@ func (p *Participant) warm(ctx context.Context, trackID string) {
 	}
 	go func() {
 		defer p.releaseWarm(trackID)
+		select {
+		case p.warmSlots <- struct{}{}:
+			defer func() { <-p.warmSlots }()
+		case <-ctx.Done():
+			return
+		}
 		if _, err := p.ensureTrack(ctx, trackID); err != nil {
 			p.logger.Debug("participant: could not warm an upcoming song", "track", trackID, "error", err)
 		}
