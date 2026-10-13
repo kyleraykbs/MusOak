@@ -49,10 +49,26 @@
         let
           version = "2.0.0";
 
+          # ytmusicapi's parser for the watch-next response broke under a
+          # YouTube change: it read `tabRenderer.endpoint` directly and raised
+          # KeyError when a tab has none - which is every radio, since that is
+          # the one call that walks the tabs. 1.12.3 is the release that fixed
+          # it (it skips unselectable tabs and reads the endpoint safely), and
+          # nixpkgs can be older than that: a radio that cannot be built is not
+          # something to wait for.
+          ytmusicapi = pkgs.python3Packages.ytmusicapi.overridePythonAttrs (old: {
+            version = "1.12.3";
+            src = pkgs.fetchPypi {
+              pname = "ytmusicapi";
+              version = "1.12.3";
+              hash = "sha256-voFRGvdJTuyOWXDFahDlGq2mJTJGZJ5OpnFP1q62VO4=";
+            };
+          });
+
           # Things every running piece of musoak needs on PATH: the python
           # helper that talks to YT Music, the downloader and its transcoders.
           providerRuntime = [
-            (pkgs.python3.withPackages (ps: [ ps.ytmusicapi ]))
+            (pkgs.python3.withPackages (_: [ ytmusicapi ]))
             pkgs.yt-dlp
             pkgs.ffmpeg
           ];
@@ -146,11 +162,7 @@
               mpv
 
               # For fetching songs with python libs
-              (python3.withPackages (
-                ps: with ps; [
-                  ytmusicapi
-                ]
-              ))
+              (python3.withPackages (_: [ ytmusicapi ]))
             ];
 
             shellHook = ''
