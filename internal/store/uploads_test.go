@@ -259,8 +259,29 @@ func TestSearchUploads(t *testing.T) {
 		}
 	}
 
+	// Words are looked for wherever they are, so an artist and a title in one
+	// query still finds the song: no single field holds both, and saying them
+	// in an order no field uses must not hide it.
+	for _, query := range []string{"Horizon Blue", "Blue The", "The Blue Horizon opus"} {
+		found, err := db.SearchUploads(ctx, query, 10)
+		if err != nil {
+			t.Fatalf("SearchUploads(%q): %v", query, err)
+		}
+		if len(found) != 1 || found[0].ID != blue.ID {
+			t.Errorf("SearchUploads(%q) = %+v", query, found)
+		}
+	}
+
 	if found, _ := db.SearchUploads(ctx, "nothing here", 10); len(found) != 0 {
 		t.Errorf("unmatched search returned %+v", found)
+	}
+	// One word that is nowhere in the row is enough to leave it out.
+	if found, _ := db.SearchUploads(ctx, "blue nothing", 10); len(found) != 0 {
+		t.Errorf("a word that matches nothing still matched %+v", found)
+	}
+	// A blank query is not a request for everything.
+	if found, _ := db.SearchUploads(ctx, "   ", 10); len(found) != 0 {
+		t.Errorf("a blank query returned %+v", found)
 	}
 	// Wildcards in the query match literally.
 	if found, _ := db.SearchUploads(ctx, "%", 10); len(found) != 0 {

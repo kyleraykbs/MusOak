@@ -263,17 +263,36 @@ func (d *DB) DuplicateUploads(ctx context.Context, userID uuid.UUID) ([]UploadGr
 
 // SearchUploads finds user uploads whose own metadata mentions the query,
 // newest first. Search surfaces them above provider results.
+//
+// Every word of the query has to be somewhere in the row - the title, an
+// artist, the album, the filename - rather than the whole query being one
+// substring of one field. A search for "Blur Beetlebum" names the artist and
+// the title in the order somebody says them, and no single field holds both,
+// so a local song was found only if the whole phrase happened to sit inside
+// one of them.
 func (d *DB) SearchUploads(ctx context.Context, query string, limit int) ([]Upload, error) {
 	if limit <= 0 {
 		limit = defaultUploadSearchLimit
 	}
-	pattern := "%" + escapeLike(strings.TrimSpace(query)) + "%"
+	words := strings.Fields(query)
+	if len(words) == 0 {
+		return nil, nil
+	}
+	conditions := make([]string, 0, len(words))
+	args := make([]any, 0, len(words)*4+1)
+	for _, word := range words {
+		pattern := "%" + escapeLike(word) + "%"
+		conditions = append(conditions, `(v.title LIKE ? ESCAPE '\'
+			OR v.artists_json LIKE ? ESCAPE '\' OR v.album LIKE ? ESCAPE '\'
+			OR u.filename LIKE ? ESCAPE '\')`)
+		args = append(args, pattern, pattern, pattern, pattern)
+	}
+	args = append(args, limit)
 	return d.queryUploads(ctx, `
 		SELECT `+uploadColumns+` `+uploadFrom+`
-		WHERE v.title LIKE ? ESCAPE '\' OR v.artists_json LIKE ? ESCAPE '\'
-			OR v.album LIKE ? ESCAPE '\' OR u.filename LIKE ? ESCAPE '\'
+		WHERE `+strings.Join(conditions, " AND ")+`
 		ORDER BY u.created_at DESC
-		LIMIT ?`, pattern, pattern, pattern, pattern, limit)
+		LIMIT ?`, args...)
 }
 
 // defaultUploadSearchLimit bounds a search whose caller gives no limit.
