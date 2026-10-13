@@ -127,6 +127,12 @@ type Participant struct {
 	// absurdSaid is whether the too-large-to-correct warning has been said for
 	// the song playing.
 	absurdSaid bool
+	// lastExpected and lastItemID are the room's position and song at the
+	// previous correction check: a jump in the room's own position between two
+	// of them is the room being seeked, which is to be followed however far,
+	// while a standing disagreement is what the guard is for.
+	lastExpected int64
+	lastItemID   string
 
 	playing *localPlayback
 	warming map[string]bool
@@ -636,6 +642,23 @@ func (p *Participant) correctDrift(ctx context.Context, local *localPlayback, ex
 	if !ok || !canSeek {
 		return
 	}
+	// Was the room's own position jumped between this check and the last one?
+	// The room advances about a second per check, so anything more is somebody
+	// seeking it — the web's bar, another listener — and that is followed
+	// however far it went. Recorded before any early return, because the check
+	// that saw the room at its old position is exactly the one to compare
+	// against. Without this, a seek looks like the broken position the guard
+	// below exists for, and the bot ignores it.
+	p.mu.Lock()
+	previous, previousItem := p.lastExpected, p.lastItemID
+	p.lastExpected, p.lastItemID = expected, local.itemID
+	p.mu.Unlock()
+	roomJumped := previousItem == local.itemID && expected-previous > roomSeekJumpMs
+	if roomJumped {
+		p.logger.Info("participant: the room was seeked; following it",
+			"from_ms", previous, "to_ms", expected)
+	}
+
 	if local.entry.DurationMs > 0 && expected >= local.entry.DurationMs {
 		// This client's file is over; the room is still on it. Wait for the
 		// room to move, which is what "a song ends slightly early" means.
@@ -657,7 +680,7 @@ func (p *Participant) correctDrift(ctx context.Context, local *localPlayback, ex
 	// clock that moved under both of them. Seeking to it moves the audio
 	// somewhere worse and the next beat seeks again, so say it once and wait
 	// for the room to move instead of tearing the song apart every second.
-	if drift > absurdDriftMs {
+	if drift > absurdDriftMs && !roomJumped {
 		p.sayAbsurdDrift(got, expected)
 		return
 	}
@@ -671,6 +694,10 @@ func (p *Participant) correctDrift(ctx context.Context, local *localPlayback, ex
 // absurdDriftMs is how far apart two positions have to be before correcting
 // them stops being about playback and starts being about a broken comparison.
 const absurdDriftMs = 60_000
+
+// roomSeekJumpMs is how far the room's own position may move between two
+// correction checks before it is somebody seeking rather than time passing.
+const roomSeekJumpMs = 2_000
 
 // sayAbsurdDrift reports a drift too large to be a drift, once per song: a
 // warning every beat for a condition that is not going away is noise, and the
