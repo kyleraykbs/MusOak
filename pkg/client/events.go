@@ -18,7 +18,7 @@ func (c *Client) streamEvents(ctx context.Context, path string) (<-chan Event, e
 		return nil, err
 	}
 
-	events := make(chan Event, 64)
+	events := make(chan Event, socketBuffer)
 	go func() {
 		defer close(events)
 		defer conn.CloseNow()
@@ -31,11 +31,43 @@ func (c *Client) streamEvents(ctx context.Context, path string) (<-chan Event, e
 			case events <- event:
 			case <-ctx.Done():
 				return
+			default:
+				// The consumer is behind, and this loop must not wait for it: a
+				// client that stops reading makes the server's own write time
+				// out and the socket close, which from the room looks like the
+				// member walking out and back in later - with their queue gone.
+				// Nothing is lost by dropping the oldest waiting event: the
+				// counter in the next one shows the gap, and a client that sees
+				// a gap refetches the room.
+				select {
+				case <-events:
+				default:
+				}
+				select {
+				case events <- event:
+				default:
+				}
 			}
 		}
 	}()
 	return events, nil
 }
+
+const (
+	// socketBuffer is how many events may wait for a client before the oldest
+	// is dropped to keep the socket being read.
+	socketBuffer = 64
+
+	// socketReadLimit is how large a message from the server may be.
+	//
+	// A room event carries the room's whole queue - every member's items, in
+	// the order the room plays them - and the websocket library's own limit is
+	// 32 KiB, which a room with a few listeners passes. Going over it does not
+	// report a large message: the connection is closed with 1009, which from
+	// the room is the member leaving. This is set where a queue is not a reason
+	// to lose a socket.
+	socketReadLimit = 8 << 20
+)
 
 // dialSocket opens a WebSocket, carrying the client's credentials.
 func (c *Client) dialSocket(ctx context.Context, path string) (*websocket.Conn, error) {
@@ -51,6 +83,7 @@ func (c *Client) dialSocket(ctx context.Context, path string) (*websocket.Conn, 
 	if err != nil {
 		return nil, fmt.Errorf("musoak: websocket %s: %w", path, err)
 	}
+	conn.SetReadLimit(socketReadLimit)
 	return conn, nil
 }
 
