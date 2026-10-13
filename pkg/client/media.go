@@ -230,7 +230,12 @@ func (p *Participant) Run(ctx context.Context) error {
 			return ctx.Err()
 		case event, ok := <-events:
 			if !ok {
-				p.stop(ctx)
+				// The connection to the room dropped; the room did not. What
+				// this client is playing keeps playing - the socket is how the
+				// room talks to it, not what it is listening to - and the
+				// caller reconnects and follows again. Stopping the sink here
+				// is what turned a blink into a hole in the music: a second of
+				// song, then silence until the follower came back.
 				return nil
 			}
 			if event.Type == EventRoomClosed {
