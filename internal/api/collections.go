@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"strings"
 
 	"github.com/google/uuid"
 
@@ -155,86 +154,86 @@ func (s *Server) buildArtist(ctx context.Context, artist *library.Artist, withAl
 // handleAlbumSearch fans out to the album-capable providers and returns the
 // canonical albums the hits matched.
 func (s *Server) handleAlbumSearch(w http.ResponseWriter, r *http.Request) {
-	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	if query == "" {
-		writeError(w, http.StatusBadRequest, "q is required")
+	query, limit, providers, ok := s.searchRequest(w, r)
+	if !ok {
 		return
 	}
-	limit := clampLimit(intParam(r, "limit", defaultSearchLimit))
-
-	providers, err := s.providerNames(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	albums, problems, err := s.library.SearchAlbums(r.Context(), query, limit, providers)
+	value, err := s.searches.do(searchKey("albums", query, providers, limit), func() (any, error) {
+		// Detached: one caller hanging up must not take a shared answer with it.
+		return s.albumSearchAnswer(context.WithoutCancel(r.Context()), query, limit, providers)
+	})
 	if err != nil {
 		writeStoreError(w, err, "album search failed")
 		return
 	}
+	writeJSON(w, http.StatusOK, value)
+}
 
+// albumSearchAnswer is the album search itself: the same shape, the same
+// caching and the same sharing the track search has.
+func (s *Server) albumSearchAnswer(ctx context.Context, query string, limit int, providers []string) (any, error) {
+	albums, problems, err := s.library.SearchAlbums(ctx, query, limit, providers)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]albumResponse, 0, len(albums))
 	for i := range albums {
-		detailed, err := s.library.GetAlbum(r.Context(), albums[i].ID)
+		detailed, err := s.library.GetAlbum(ctx, albums[i].ID)
 		if err != nil {
-			writeStoreError(w, err, "album search failed")
-			return
+			return nil, err
 		}
-		response, err := s.buildAlbum(r.Context(), detailed, false)
+		response, err := s.buildAlbum(ctx, detailed, false)
 		if err != nil {
-			writeStoreError(w, err, "album search failed")
-			return
+			return nil, err
 		}
 		out = append(out, response)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	return map[string]any{
 		"query":          query,
 		"albums":         out,
 		"providerErrors": problemsJSON(problems),
-	})
+	}, nil
 }
 
 // handleArtistSearch does the same for artists.
 func (s *Server) handleArtistSearch(w http.ResponseWriter, r *http.Request) {
-	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	if query == "" {
-		writeError(w, http.StatusBadRequest, "q is required")
+	query, limit, providers, ok := s.searchRequest(w, r)
+	if !ok {
 		return
 	}
-	limit := clampLimit(intParam(r, "limit", defaultSearchLimit))
-
-	providers, err := s.providerNames(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	artists, problems, err := s.library.SearchArtists(r.Context(), query, limit, providers)
+	value, err := s.searches.do(searchKey("artists", query, providers, limit), func() (any, error) {
+		return s.artistSearchAnswer(context.WithoutCancel(r.Context()), query, limit, providers)
+	})
 	if err != nil {
 		writeStoreError(w, err, "artist search failed")
 		return
 	}
+	writeJSON(w, http.StatusOK, value)
+}
 
+// artistSearchAnswer is the artist search itself.
+func (s *Server) artistSearchAnswer(ctx context.Context, query string, limit int, providers []string) (any, error) {
+	artists, problems, err := s.library.SearchArtists(ctx, query, limit, providers)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]artistResponse, 0, len(artists))
 	for i := range artists {
-		detailed, err := s.library.GetArtist(r.Context(), artists[i].ID)
+		detailed, err := s.library.GetArtist(ctx, artists[i].ID)
 		if err != nil {
-			writeStoreError(w, err, "artist search failed")
-			return
+			return nil, err
 		}
-		response, err := s.buildArtist(r.Context(), detailed, false)
+		response, err := s.buildArtist(ctx, detailed, false)
 		if err != nil {
-			writeStoreError(w, err, "artist search failed")
-			return
+			return nil, err
 		}
 		out = append(out, response)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	return map[string]any{
 		"query":          query,
 		"artists":        out,
 		"providerErrors": problemsJSON(problems),
-	})
+	}, nil
 }
 
 // problemsJSON renders collection provider failures with the same keys the

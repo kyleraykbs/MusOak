@@ -132,8 +132,8 @@ func (s *Server) handleMediaDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if waitParam(r) {
-		if _, err := s.ensureMedia(r.Context(), id, priorityParam(r)); err != nil {
+	if boolParam(r, "wait") {
+		if _, err := s.ensureMedia(r.Context(), id, boolParam(r, "priority")); err != nil {
 			writeError(w, http.StatusBadGateway, err.Error())
 			return
 		}
@@ -144,7 +144,7 @@ func (s *Server) handleMediaDownload(w http.ResponseWriter, r *http.Request) {
 	// Detached so the download survives the client hanging up: the manager
 	// deduplicates it with every other requester anyway.
 	ctx := context.WithoutCancel(r.Context())
-	priority := priorityParam(r)
+	priority := boolParam(r, "priority")
 	go func() {
 		if _, err := s.ensureMedia(ctx, id, priority); err != nil {
 			s.logger.Warn("media download failed", "variant", id, "error", err)
@@ -164,20 +164,12 @@ func (s *Server) ensureMedia(ctx context.Context, variantID uuid.UUID, priority 
 	return s.media.Ensure(ctx, variantID)
 }
 
-// priorityParam reports whether a request is the primary song. The player sends
-// it for the song it is loading, and for nothing else: the songs after it are
-// background fetches, which is what leaves the pipe free for the one being
-// waited on.
-func priorityParam(r *http.Request) bool {
-	switch r.URL.Query().Get("priority") {
-	case "1", "true", "yes":
-		return true
-	}
-	return false
-}
-
-func waitParam(r *http.Request) bool {
-	switch r.URL.Query().Get("wait") {
+// boolParam reads a flag the way the media routes are asked for one: absent is
+// false, and every spelling a client or a person might reach for is true.
+// `wait` (answer once the file is here) and `priority` (this is the song
+// somebody is waiting to hear) are the two, and neither deserves its own parser.
+func boolParam(r *http.Request, name string) bool {
+	switch r.URL.Query().Get(name) {
 	case "1", "true", "yes":
 		return true
 	}

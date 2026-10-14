@@ -59,6 +59,11 @@ type Server struct {
 	searchLimiter *limiter
 	loginLimiter  *limiter
 
+	// searches holds the last few answers to the same question and shares the
+	// one on its way, so typing, tab-switching and two people asking at once
+	// cost one provider call between them.
+	searches *searchAnswers
+
 	// imports and archives are the long jobs a client watches: playlists being
 	// imported, and playlists being written out as zips.
 	imports  *jobRegistry[playlistImport]
@@ -87,6 +92,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		mux:       http.NewServeMux(),
 		store:     db,
 		providers: provider.NewRegistry(logger, ProviderTimeout),
+		searches:  newSearchAnswers(SearchAnswerTTL, 256),
 	}
 	quotaBytes := int64(cfg.Media.QuotaMB) * 1024 * 1024
 	s.media = media.New(filepath.Join(cfg.StorageDir, "media"), quotaBytes, db, s.providers, logger)

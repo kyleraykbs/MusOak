@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"net/http"
-	"strings"
 
 	"github.com/google/uuid"
 
@@ -38,39 +37,41 @@ type providerPlaylistSyncResponse struct {
 
 // handlePlaylistSearch searches the providers that can browse playlists.
 func (s *Server) handlePlaylistSearch(w http.ResponseWriter, r *http.Request) {
-	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	if query == "" {
-		writeError(w, http.StatusBadRequest, "q is required")
+	query, limit, providers, ok := s.searchRequest(w, r)
+	if !ok {
 		return
 	}
-	limit := clampLimit(intParam(r, "limit", defaultSearchLimit))
-
-	providers, err := s.providerNames(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	playlists, problems, err := s.library.SearchPlaylists(r.Context(), query, limit, providers)
+	value, err := s.searches.do(searchKey("playlists", query, providers, limit), func() (any, error) {
+		// Detached: one caller hanging up must not take a shared answer with it.
+		return s.playlistSearchAnswer(context.WithoutCancel(r.Context()), query, limit, providers)
+	})
 	if err != nil {
 		writeStoreError(w, err, "playlist search failed")
 		return
 	}
+	writeJSON(w, http.StatusOK, value)
+}
 
+// playlistSearchAnswer is the playlist search itself, with the shape, the
+// caching and the sharing the other three searches have.
+func (s *Server) playlistSearchAnswer(ctx context.Context, query string, limit int, providers []string) (any, error) {
+	playlists, problems, err := s.library.SearchPlaylists(ctx, query, limit, providers)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]providerPlaylistResponse, 0, len(playlists))
 	for i := range playlists {
-		response, err := s.buildPlaylist(r.Context(), &playlists[i])
+		response, err := s.buildPlaylist(ctx, &playlists[i])
 		if err != nil {
-			writeStoreError(w, err, "playlist search failed")
-			return
+			return nil, err
 		}
 		out = append(out, response)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	return map[string]any{
 		"query":          query,
 		"playlists":      out,
 		"providerErrors": problemsJSON(problems),
-	})
+	}, nil
 }
 
 // handlePlaylistSync pulls a provider playlist's tracks into the library, so

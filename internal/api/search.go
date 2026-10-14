@@ -39,67 +39,89 @@ type providerProblem struct {
 // handleSearch fans out to every enabled provider, merges the hits into
 // canonical tracks and reports provider failures alongside the results.
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
-	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	if query == "" {
-		writeError(w, http.StatusBadRequest, "q is required")
+	query, limit, providers, ok := s.searchRequest(w, r)
+	if !ok {
 		return
 	}
-	limit := intParam(r, "limit", defaultSearchLimit)
-	if limit < 1 {
-		limit = 1
-	}
-	if limit > maxSearchLimit {
-		limit = maxSearchLimit
-	}
-
-	providers, err := s.providerNames(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	results := s.providers.SearchSome(r.Context(), providers, query, provider.SearchOpts{Limit: limit})
-
-	groups, err := s.matcher.Group(r.Context(), results)
+	response, err := s.searchTracksAnswer(r, query, limit, providers)
 	if err != nil {
 		writeStoreError(w, err, "search failed")
 		return
 	}
+	writeJSON(w, http.StatusOK, response)
+}
 
-	response := searchResponse{Query: query, Groups: make([]searchGroup, 0, len(groups))}
-	// Matching user uploads surface above provider results: what the
-	// household uploaded itself comes first.
-	uploads, err := s.userUploadGroups(r.Context(), query, limit)
-	if err != nil {
-		writeStoreError(w, err, "search failed")
-		return
-	}
-	response.Groups = append(response.Groups, uploads...)
-	for _, group := range groups {
-		track, err := s.buildTrack(r.Context(), group.Track)
+// searchTracksAnswer is the tracks search, held under the same caching and
+// sharing every other search is: the same question, asked again inside the
+// window, is answered from here rather than from the providers.
+func (s *Server) searchTracksAnswer(r *http.Request, query string, limit int, providers []string) (searchResponse, error) {
+	value, err := s.searches.do(searchKey("tracks", query, providers, limit), func() (any, error) {
+		// Detached: one caller hanging up must not take a shared answer with it.
+		ctx := context.WithoutCancel(r.Context())
+		results := s.providers.SearchSome(ctx, providers, query, provider.SearchOpts{Limit: limit})
+		groups, err := s.matcher.Group(ctx, results)
 		if err != nil {
-			writeStoreError(w, err, "search failed")
-			return
+			return nil, err
 		}
-		response.Groups = append(response.Groups, searchGroup{
-			Track:    track,
-			Variants: s.buildVariants(r.Context(), group.Variants),
-		})
-	}
-	for _, result := range results {
-		if result.Err != nil && result.IsSearchable() {
-			response.ProviderErrors = append(response.ProviderErrors, providerProblem{
-				Provider: result.Provider,
-				Error:    result.Err.Error(),
+		response := searchResponse{Query: query, Groups: make([]searchGroup, 0, len(groups))}
+		// Matching user uploads surface above provider results: what the
+		// household uploaded itself comes first.
+		uploads, err := s.userUploadGroups(ctx, query, limit)
+		if err != nil {
+			return nil, err
+		}
+		response.Groups = append(response.Groups, uploads...)
+		for _, group := range groups {
+			track, err := s.buildTrack(ctx, group.Track)
+			if err != nil {
+				return nil, err
+			}
+			response.Groups = append(response.Groups, searchGroup{
+				Track:    track,
+				Variants: s.buildVariants(ctx, group.Variants),
 			})
 		}
+		for _, result := range results {
+			if result.Err != nil && result.IsSearchable() {
+				response.ProviderErrors = append(response.ProviderErrors, providerProblem{
+					Provider: result.Provider,
+					Error:    result.Err.Error(),
+				})
+			}
+		}
+		return response, nil
+	})
+	if err != nil {
+		return searchResponse{}, err
 	}
+	response := value.(searchResponse)
+	// The cached answer is shared by everyone who asked the same thing, so the
+	// groups are copied before this account's own counts are written into them.
+	response.Groups = append([]searchGroup(nil), response.Groups...)
 	refs := make([]*trackResponse, 0, len(response.Groups))
 	for i := range response.Groups {
 		refs = append(refs, &response.Groups[i].Track)
 	}
 	s.withPlays(r.Context(), s.currentUser(r), refs)
-	writeJSON(w, http.StatusOK, response)
+	return response, nil
+}
+
+// searchRequest is the shape every search shares: the words, how many, and
+// which providers to ask - read, checked and clamped in one place, so the four
+// search endpoints cannot drift apart in what they accept.
+func (s *Server) searchRequest(w http.ResponseWriter, r *http.Request) (string, int, []string, bool) {
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	if query == "" {
+		writeError(w, http.StatusBadRequest, "q is required")
+		return "", 0, nil, false
+	}
+	limit := clampLimit(intParam(r, "limit", defaultSearchLimit))
+	providers, err := s.providerNames(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return "", 0, nil, false
+	}
+	return query, limit, providers, true
 }
 
 // userUploadGroups shapes the matching user uploads into search groups, one
