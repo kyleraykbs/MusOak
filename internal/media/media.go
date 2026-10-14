@@ -87,9 +87,19 @@ type Manager struct {
 
 	mu               sync.Mutex
 	status           map[uuid.UUID]Status
-	background       map[uuid.UUID]context.CancelFunc
+	background       map[uuid.UUID]backgroundFetch
+	paused           []uuid.UUID
 	downloadAttempts int
 	downloadBackoff  time.Duration
+}
+
+// backgroundFetch is a download nobody is waiting on: how to stop it, and when
+// it started - a play leaves the ones that are nearly done alone, because they
+// free the pipe themselves in a moment and cancelling one would throw the work
+// away for nothing.
+type backgroundFetch struct {
+	cancel    context.CancelFunc
+	startedAt time.Time
 }
 
 // syncgroup is the singleflight surface the manager uses.
@@ -151,9 +161,8 @@ func (m *Manager) ensure(ctx context.Context, variantID uuid.UUID, primary bool)
 	if primary {
 		// Marked before the fetch starts, so a background download that was
 		// about to begin waits instead of competing with it.
-		m.primary.enter()
-		m.cancelBackground(variantID)
-		defer m.primary.leave()
+		m.enterPrimary(variantID)
+		defer m.leavePrimary()
 	}
 
 	// The download outlives whichever caller started it: a client hanging up
@@ -526,14 +535,17 @@ func (g *primaryGate) enter() {
 	g.n++
 }
 
-func (g *primaryGate) leave() {
+// leave lets go of the pipe, and reports whether that was the last hold on it.
+func (g *primaryGate) leave() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.n--
-	if g.n == 0 {
-		close(g.done)
-		g.done = nil
+	if g.n > 0 {
+		return false
 	}
+	close(g.done)
+	g.done = nil
+	return true
 }
 
 // wait blocks until no play is downloading, or the context ends first.
@@ -554,15 +566,20 @@ func (g *primaryGate) wait(ctx context.Context) error {
 	}
 }
 
+// resumeWindow is how long a background download must have been running before
+// a play leaves it alone. What is nearly done frees the pipe by itself; what
+// has just started is stopped, and started again when the play is over.
+const resumeWindow = 20 * time.Second
+
 // registerBackground makes a background download cancellable and remembers it,
 // so a play arriving can stop it. The returned function forgets it again.
 func (m *Manager) registerBackground(ctx context.Context, variantID uuid.UUID) (context.Context, func()) {
 	ctx, cancel := context.WithCancel(ctx)
 	m.mu.Lock()
 	if m.background == nil {
-		m.background = make(map[uuid.UUID]context.CancelFunc)
+		m.background = make(map[uuid.UUID]backgroundFetch)
 	}
-	m.background[variantID] = cancel
+	m.background[variantID] = backgroundFetch{cancel: cancel, startedAt: time.Now()}
 	m.mu.Unlock()
 	return ctx, func() {
 		m.mu.Lock()
@@ -572,20 +589,52 @@ func (m *Manager) registerBackground(ctx context.Context, variantID uuid.UUID) (
 	}
 }
 
-// cancelBackground stops the downloads running for anything other than the
-// variant a person is waiting on, so nothing shares the provider's bandwidth
-// with it.
-func (m *Manager) cancelBackground(except uuid.UUID) {
+// enterPrimary takes the pipe for the song somebody is waiting to hear: the
+// background downloads that have just started are stopped so nothing shares the
+// provider's bandwidth with it, and what was stopped is remembered.
+//
+// It is a pause, not a killing: the fetch of the very variant the play is
+// waiting on is left running (it is the file this call wants, and it is shared),
+// a background download past the window is left to finish on its own, and
+// everything stopped here is put back when the play is over - see leavePrimary.
+// Cancelling the downloads that keep the room's next songs on disk is how a
+// room ends up with nothing warmed and every transition paying for a fetch.
+func (m *Manager) enterPrimary(variantID uuid.UUID) {
+	m.primary.enter()
 	m.mu.Lock()
-	cancels := make([]context.CancelFunc, 0, len(m.background))
-	for id, cancel := range m.background {
-		if id != except {
-			cancels = append(cancels, cancel)
+	now := time.Now()
+	var stop []context.CancelFunc
+	for id, fetch := range m.background {
+		if id == variantID || now.Sub(fetch.startedAt) >= resumeWindow {
+			continue
 		}
+		stop = append(stop, fetch.cancel)
+		delete(m.background, id)
+		m.paused = append(m.paused, id)
 	}
 	m.mu.Unlock()
-	for _, cancel := range cancels {
+	for _, cancel := range stop {
 		cancel()
+	}
+}
+
+// leavePrimary gives the pipe back, and puts back what the play paused: those
+// downloads are asked for again now that nothing is waiting on one.
+func (m *Manager) leavePrimary() {
+	if !m.primary.leave() {
+		// Another play is still downloading; it will put them back.
+		return
+	}
+	m.mu.Lock()
+	paused := m.paused
+	m.paused = nil
+	m.mu.Unlock()
+	for _, variantID := range paused {
+		go func(id uuid.UUID) {
+			if _, err := m.Ensure(context.Background(), id); err != nil {
+				m.logger.Debug("media: a paused download could not be put back", "variant", id, "error", err)
+			}
+		}(variantID)
 	}
 }
 

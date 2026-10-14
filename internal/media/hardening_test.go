@@ -280,3 +280,50 @@ func TestEnsurePrimaryTakesThePipe(t *testing.T) {
 		t.Fatalf("the fetch that waited failed: %v", err)
 	}
 }
+
+// A play pauses the background downloads it interrupts and puts them back when
+// it is over. Killing them is what leaves a room's next songs cold: the fetch
+// that was warming the queue is thrown away, nothing re-issues it, and every
+// transition pays for a download nobody expected.
+func TestEnsurePrimaryPausesAndPutsBack(t *testing.T) {
+	dir := t.TempDir()
+	fixture := tone(t, dir, "fixture.opus", 1.0)
+	fake := &fakeProvider{name: "ytmusic", fixture: fixture, delay: 300 * time.Millisecond}
+	m, db := newTestManager(t, fake)
+
+	warming := seedVariant(t, db, true, "ytmusic")
+	playing := seedVariant(t, db, true, "ytmusic")
+
+	// A background download, as the prefetcher starts one.
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := m.Ensure(context.Background(), warming.ID)
+		firstDone <- err
+	}()
+	waitForCalls(t, fake, 1)
+
+	// Somebody plays something: the warming fetch is stopped for it.
+	if _, err := m.EnsurePrimary(context.Background(), playing.ID); err != nil {
+		t.Fatalf("the play failed: %v", err)
+	}
+	if err := <-firstDone; !errors.Is(err, context.Canceled) {
+		t.Errorf("the warming download = %v, want it paused for the play", err)
+	}
+
+	// And it is put back afterwards, without anybody asking again.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ready := m.Status(context.Background(), warming.ID).State == StateReady
+		if ready {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the paused download was not put back (status %s, downloads %d)",
+				m.Status(context.Background(), warming.ID).State, fake.calls.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := fake.calls.Load(); got < 3 {
+		t.Errorf("downloads = %d, want the paused one asked for again (1 warming, 1 play, 1 put back)", got)
+	}
+}
