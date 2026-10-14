@@ -12,8 +12,8 @@ import (
 	"github.com/dhowden/tag"
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/musoak/internal/ffmpeg"
-	"codeberg.org/kyleraykbs/musoak/internal/store"
+	"github.com/kyleraykbs/MusOak/internal/ffmpeg"
+	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
 // audioExtensions are the file types ScanDir picks up.

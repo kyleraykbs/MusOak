@@ -11,7 +11,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 
-	"codeberg.org/kyleraykbs/musoak/pkg/client"
+	"github.com/kyleraykbs/MusOak/pkg/client"
 )
 
 // socketServer serves one event socket, writing with whatever the test does.

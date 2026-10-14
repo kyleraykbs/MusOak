@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strings"
 
-	"codeberg.org/kyleraykbs/musoak/internal/auth"
+	"github.com/kyleraykbs/MusOak/internal/auth"
 )
 
 type credentialsRequest struct {

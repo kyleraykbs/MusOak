@@ -11,8 +11,8 @@ import (
 	"strconv"
 	"strings"
 
-	"codeberg.org/kyleraykbs/musoak/internal/api"
-	"codeberg.org/kyleraykbs/musoak/pkg/client"
+	"github.com/kyleraykbs/MusOak/internal/api"
+	"github.com/kyleraykbs/MusOak/pkg/client"
 )
 
 func parseIndex(raw string) (int, error) {

@@ -1,6 +1,6 @@
 # Structure
 
-Go module `codeberg.org/kyleraykbs/musoak`.
+Go module `github.com/kyleraykbs/MusOak`.
 
 ## Binaries
 

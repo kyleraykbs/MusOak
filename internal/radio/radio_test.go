@@ -9,9 +9,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/musoak/internal/match"
-	"codeberg.org/kyleraykbs/musoak/internal/provider"
-	"codeberg.org/kyleraykbs/musoak/internal/store"
+	"github.com/kyleraykbs/MusOak/internal/match"
+	"github.com/kyleraykbs/MusOak/internal/provider"
+	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
 // fakeRadio is a provider that returns a canned station and records the seed it

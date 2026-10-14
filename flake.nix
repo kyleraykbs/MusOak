@@ -98,7 +98,7 @@
             '';
             meta = {
               description = "Self-hosted music streaming with cross-provider matching and listen-together";
-              homepage = "https://codeberg.org/kyleraykbs/musoak";
+              homepage = "https://github.com/kyleraykbs/MusOak";
               mainProgram = "musoak";
             };
           };

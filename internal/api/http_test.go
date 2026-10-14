@@ -13,8 +13,8 @@ import (
 	"strings"
 	"testing"
 
-	"codeberg.org/kyleraykbs/musoak/internal/config"
-	"codeberg.org/kyleraykbs/musoak/internal/store"
+	"github.com/kyleraykbs/MusOak/internal/config"
+	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
 type testClient struct {

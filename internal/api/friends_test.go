@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"codeberg.org/kyleraykbs/musoak/internal/store"
+	"github.com/kyleraykbs/MusOak/internal/store"
 	"fmt"
 	"github.com/google/uuid"
 )

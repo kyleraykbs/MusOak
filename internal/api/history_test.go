@@ -10,7 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/musoak/internal/store"
+	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
 // call invokes a handler directly, with the caller already authenticated. The

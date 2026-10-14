@@ -228,7 +228,7 @@ specification and the routes cannot drift apart.
 
 ```nix
 {
-  inputs.musoak.url = "git+https://codeberg.org/kyleraykbs/musoak";
+  inputs.musoak.url = "git+https://github.com/kyleraykbs/MusOak";
 
   # Server
   services.musoakd = {

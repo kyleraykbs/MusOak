@@ -9,7 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/musoak/internal/store"
+	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
 // seedDuplicateUpload writes an upload straight through the store, bypassing

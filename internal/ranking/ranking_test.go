@@ -8,7 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/musoak/internal/store"
+	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
 var defaults = []string{"ytmusic", "spotify"}

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"codeberg.org/kyleraykbs/musoak/internal/config"
+	"github.com/kyleraykbs/MusOak/internal/config"
 )
 
 // A photograph is bigger than the bound the small JSON bodies use. The image

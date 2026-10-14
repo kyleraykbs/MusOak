@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"codeberg.org/kyleraykbs/musoak/internal/config"
-	"codeberg.org/kyleraykbs/musoak/pkg/client"
+	"github.com/kyleraykbs/MusOak/internal/config"
+	"github.com/kyleraykbs/MusOak/pkg/client"
 )
 
 // localItem is the delivery for a rendition already on disk.

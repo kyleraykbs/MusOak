@@ -7,7 +7,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/musoak/internal/store"
+	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
 // providerPlaylistResponse is a provider playlist. Unlike an album it belongs to one

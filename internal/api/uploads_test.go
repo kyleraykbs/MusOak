@@ -10,8 +10,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/musoak/internal/provider"
-	"codeberg.org/kyleraykbs/musoak/internal/store"
+	"github.com/kyleraykbs/MusOak/internal/provider"
+	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
 // unreadableAudio is a payload no probe can read: a create with it pins the

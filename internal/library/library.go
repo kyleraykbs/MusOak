@@ -20,9 +20,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/musoak/internal/match"
-	"codeberg.org/kyleraykbs/musoak/internal/provider"
-	"codeberg.org/kyleraykbs/musoak/internal/store"
+	"github.com/kyleraykbs/MusOak/internal/match"
+	"github.com/kyleraykbs/MusOak/internal/provider"
+	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
 // maxProviderAlbums bounds how many albums one artist sync will pull, so a

@@ -9,8 +9,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"codeberg.org/kyleraykbs/musoak/internal/api"
-	"codeberg.org/kyleraykbs/musoak/internal/config"
+	"github.com/kyleraykbs/MusOak/internal/api"
+	"github.com/kyleraykbs/MusOak/internal/config"
 )
 
 func main() {

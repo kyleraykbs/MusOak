@@ -8,7 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/musoak/internal/store"
+	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
 // lyricsFetchTimeout bounds a lookup. Lyrics are a nicety on top of playing a

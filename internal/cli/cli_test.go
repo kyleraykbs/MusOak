@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"codeberg.org/kyleraykbs/musoak/internal/api"
-	"codeberg.org/kyleraykbs/musoak/internal/config"
+	"github.com/kyleraykbs/MusOak/internal/api"
+	"github.com/kyleraykbs/MusOak/internal/config"
 )
 
 // lockedBuffer collects CLI output from the playback goroutine too.

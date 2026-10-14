@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	"codeberg.org/kyleraykbs/musoak/pkg/client"
+	"github.com/kyleraykbs/MusOak/pkg/client"
 )
 
 // cmdPlay plays the local queue through mpv: the next tracks are prepared

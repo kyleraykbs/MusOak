@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"strings"
 
-	"codeberg.org/kyleraykbs/musoak/internal/store"
+	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
 type importRequest struct {

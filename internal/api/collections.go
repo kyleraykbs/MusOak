@@ -8,8 +8,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/musoak/internal/library"
-	"codeberg.org/kyleraykbs/musoak/internal/store"
+	"github.com/kyleraykbs/MusOak/internal/library"
+	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
 type albumVariantResponse struct {

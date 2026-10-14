@@ -1,4 +1,4 @@
-module codeberg.org/kyleraykbs/musoak
+module github.com/kyleraykbs/MusOak
 
 go 1.26.5
 

@@ -8,7 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/musoak/internal/provider"
+	"github.com/kyleraykbs/MusOak/internal/provider"
 )
 
 const (

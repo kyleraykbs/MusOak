@@ -16,9 +16,9 @@ import (
 	"strings"
 	"time"
 
-	"codeberg.org/kyleraykbs/musoak/internal/ffmpeg"
-	"codeberg.org/kyleraykbs/musoak/internal/provider"
-	"codeberg.org/kyleraykbs/musoak/support"
+	"github.com/kyleraykbs/MusOak/internal/ffmpeg"
+	"github.com/kyleraykbs/MusOak/internal/provider"
+	"github.com/kyleraykbs/MusOak/support"
 )
 
 // Name is the provider id used everywhere (config, database, API).

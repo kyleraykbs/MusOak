@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"codeberg.org/kyleraykbs/musoak/internal/provider"
+	"github.com/kyleraykbs/MusOak/internal/provider"
 )
 
 // fakeSpotify serves the token and search endpoints and counts the calls.

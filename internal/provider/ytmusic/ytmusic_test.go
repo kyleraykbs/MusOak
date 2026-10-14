@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"codeberg.org/kyleraykbs/musoak/internal/provider"
+	"github.com/kyleraykbs/MusOak/internal/provider"
 )
 
 // stubPython writes an executable that ignores its stdin and runs body.

@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"strings"
 
-	"codeberg.org/kyleraykbs/musoak/internal/provider"
+	"github.com/kyleraykbs/MusOak/internal/provider"
 )
 
 // A playlist without credentials.

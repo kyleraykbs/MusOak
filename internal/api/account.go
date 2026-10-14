@@ -7,9 +7,9 @@ import (
 	"regexp"
 	"strings"
 
-	"codeberg.org/kyleraykbs/musoak/internal/artwork"
-	"codeberg.org/kyleraykbs/musoak/internal/auth"
-	"codeberg.org/kyleraykbs/musoak/internal/store"
+	"github.com/kyleraykbs/MusOak/internal/artwork"
+	"github.com/kyleraykbs/MusOak/internal/auth"
+	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
 // accountUserResponse is the account view of a user: the identity plus the

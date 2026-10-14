@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"codeberg.org/kyleraykbs/musoak/pkg/client"
+	"github.com/kyleraykbs/MusOak/pkg/client"
 )
 
 // cmdRadio starts a station from a song and optionally plays it.

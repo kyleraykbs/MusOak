@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"codeberg.org/kyleraykbs/musoak/internal/config"
+	"github.com/kyleraykbs/MusOak/internal/config"
 )
 
 // TestServeAppliesMiddleware guards a real bug: the daemon used to serve the

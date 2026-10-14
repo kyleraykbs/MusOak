@@ -22,7 +22,7 @@ import (
 	"sync"
 	"time"
 
-	"codeberg.org/kyleraykbs/musoak/internal/provider"
+	"github.com/kyleraykbs/MusOak/internal/provider"
 )
 
 // Name is the provider id.

@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"testing"
 
-	"codeberg.org/kyleraykbs/musoak/internal/store"
+	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
 func seedTracks(t *testing.T, c *testClient, titles ...string) []*store.Track {

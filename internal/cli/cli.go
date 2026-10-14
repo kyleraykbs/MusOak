@@ -20,9 +20,9 @@ import (
 	"strings"
 	"time"
 
-	"codeberg.org/kyleraykbs/musoak/internal/api"
-	"codeberg.org/kyleraykbs/musoak/internal/config"
-	"codeberg.org/kyleraykbs/musoak/pkg/client"
+	"github.com/kyleraykbs/MusOak/internal/api"
+	"github.com/kyleraykbs/MusOak/internal/config"
+	"github.com/kyleraykbs/MusOak/pkg/client"
 )
 
 // App is the CLI's runtime.

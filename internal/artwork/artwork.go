@@ -23,7 +23,7 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/sync/singleflight"
 
-	"codeberg.org/kyleraykbs/musoak/internal/store"
+	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
 // maxImageBytes bounds one download. Covers are a few hundred kilobytes; a
@@ -43,7 +43,7 @@ var (
 
 // UserAgent identifies this client to the provider CDNs; some of them refuse
 // requests without one.
-const userAgent = "musoak/2 (+https://codeberg.org/kyleraykbs/musoak)"
+const userAgent = "musoak/2 (+https://github.com/kyleraykbs/MusOak)"
 
 // Item is a cached image.
 type Item struct {

@@ -8,8 +8,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/musoak/internal/provider"
-	"codeberg.org/kyleraykbs/musoak/internal/store"
+	"github.com/kyleraykbs/MusOak/internal/provider"
+	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
 // Album signal weights for the non-exact score; they sum to one before the

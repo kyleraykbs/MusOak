@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"codeberg.org/kyleraykbs/musoak/pkg/client"
+	"github.com/kyleraykbs/MusOak/pkg/client"
 )
 
 // --- albums ----------------------------------------------------------------

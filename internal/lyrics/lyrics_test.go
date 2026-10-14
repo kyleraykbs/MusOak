@@ -10,7 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/musoak/internal/store"
+	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
 // fakeStore is the LyricsRepo plus the metadata a query is built from, held in

@@ -6,7 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"codeberg.org/kyleraykbs/musoak/internal/config"
+	"github.com/kyleraykbs/MusOak/internal/config"
 )
 
 // mustCIDRs parses trusted-proxy networks for the resolution tests.

@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"codeberg.org/kyleraykbs/musoak/pkg/client"
+	"github.com/kyleraykbs/MusOak/pkg/client"
 )
 
 // mpvSocketTimeout bounds how long we wait for mpv to create its IPC socket.

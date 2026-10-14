@@ -1,7 +1,7 @@
 # Decisions
 
 ## [2026-09-30] Module path
-- Decision: `codeberg.org/kyleraykbs/musoak`, renamed from the v1 path along with the rest of the project.
+- Decision: `github.com/kyleraykbs/MusOak`, renamed from the v1 path along with the rest of the project.
 - Why: the project is called MusOak now, and the SDK import path follows it.
 - Reversible: no (touches every import)
 

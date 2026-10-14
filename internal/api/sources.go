@@ -6,8 +6,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/musoak/internal/ranking"
-	"codeberg.org/kyleraykbs/musoak/internal/store"
+	"github.com/kyleraykbs/MusOak/internal/ranking"
+	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
 // rather than a rendition found on a service.

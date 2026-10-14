@@ -5,8 +5,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/musoak/internal/media"
-	"codeberg.org/kyleraykbs/musoak/internal/prefetch"
+	"github.com/kyleraykbs/MusOak/internal/media"
+	"github.com/kyleraykbs/MusOak/internal/prefetch"
 )
 
 // Keeping the playlists downloaded.

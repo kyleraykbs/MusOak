@@ -12,7 +12,7 @@ import (
 
 	"golang.org/x/term"
 
-	"codeberg.org/kyleraykbs/musoak/pkg/client"
+	"github.com/kyleraykbs/MusOak/pkg/client"
 )
 
 const (

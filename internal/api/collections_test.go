@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"testing"
 
-	"codeberg.org/kyleraykbs/musoak/internal/provider"
+	"github.com/kyleraykbs/MusOak/internal/provider"
 )
 
 // fakeCollectionsProvider serves album and artist browsing.

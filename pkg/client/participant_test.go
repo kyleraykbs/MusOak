@@ -15,9 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"codeberg.org/kyleraykbs/musoak/internal/api"
-	"codeberg.org/kyleraykbs/musoak/internal/config"
-	"codeberg.org/kyleraykbs/musoak/pkg/client"
+	"github.com/kyleraykbs/MusOak/internal/api"
+	"github.com/kyleraykbs/MusOak/internal/config"
+	"github.com/kyleraykbs/MusOak/pkg/client"
 )
 
 // newServer boots a real server (in-memory transport, on-disk store in a temp
