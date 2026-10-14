@@ -89,8 +89,11 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			if !s.writeSocket(ctx, conn, pong) {
-				return
+			if writeCtx, err := s.writeSocket(ctx, conn, pong); err != nil {
+				if writeCtx.Err() == nil {
+					return
+				}
+				// The client is behind rather than gone: another ping will do.
 			}
 		case event, ok := <-events:
 			if !ok {
@@ -106,8 +109,17 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 				AtMs:   event.AtMs,
 				Data:   event.Data,
 			}
-			if !s.writeSocket(ctx, conn, message) {
-				return
+			if writeCtx, err := s.writeSocket(ctx, conn, message); err != nil {
+				if writeCtx.Err() == nil {
+					return
+				}
+				// Too slow to take this event: it is skipped rather than costing
+				// the connection. The counter in the next event shows the gap,
+				// and a client that sees a gap refetches the room - which is
+				// better than a member appearing to leave and come back, taking
+				// their queue with them.
+				s.logger.Debug("ws: event skipped, the client is behind",
+					"room", event.RoomID, "seq", event.Seq)
 			}
 		}
 	}
@@ -138,12 +150,20 @@ func (s *Server) readSocket(ctx context.Context, conn *websocket.Conn, pongs cha
 	}
 }
 
-func (s *Server) writeSocket(ctx context.Context, conn *websocket.Conn, message serverMessage) bool {
+// writeSocket writes one message and says what went wrong.
+//
+// A write that runs out of time is a client that is not taking its messages
+// fast enough, not one that has gone - the difference matters because the
+// caller closes the socket on an error, and closing it here is what made a slow
+// moment look like a disconnect. The client sees the gap in the event counter
+// and refetches the room. The context is handed back so the caller can tell
+// which of the two it was.
+func (s *Server) writeSocket(ctx context.Context, conn *websocket.Conn, message serverMessage) (context.Context, error) {
 	writeCtx, cancel := context.WithTimeout(ctx, wsWriteTimeout)
 	defer cancel()
 	if err := wsjson.Write(writeCtx, conn, message); err != nil {
 		s.logger.Debug("ws: write failed", "error", err)
-		return false
+		return writeCtx, err
 	}
-	return true
+	return writeCtx, nil
 }
