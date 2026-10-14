@@ -113,12 +113,19 @@ func providerTracksJSON(tracks []provider.Track) []providerTrackResponse {
 // with `provider` - the platform's own id, which the library may never have
 // seen. Either way the tracks are read live.
 func (s *Server) handleProviderPlaylist(w http.ResponseWriter, r *http.Request) {
-	if providerName := strings.TrimSpace(r.URL.Query().Get("provider")); providerName != "" {
-		id := strings.TrimSpace(r.PathValue("playlistId"))
-		if id == "" {
-			writeError(w, http.StatusBadRequest, "a playlist id is required")
-			return
+	// A row id is a row id whatever else the request says. `provider` marks the
+	// id as the platform's own, and a caller that sends both by mistake - a
+	// click carrying the row it came from - would otherwise have a UUID read as
+	// a playlist id on the platform, which is a provider error rather than an
+	// answer. The library's own ids are uuids; the platforms' never are.
+	id := strings.TrimSpace(r.PathValue("playlistId"))
+	providerName := strings.TrimSpace(r.URL.Query().Get("provider"))
+	if providerName != "" {
+		if _, err := uuid.Parse(id); err == nil {
+			providerName = ""
 		}
+	}
+	if providerName != "" {
 		tracks, err := s.library.ProviderPlaylistByPlatform(r.Context(), providerName, id)
 		if err != nil {
 			writeLibraryError(w, err)
