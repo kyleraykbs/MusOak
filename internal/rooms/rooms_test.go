@@ -976,3 +976,66 @@ func TestQueueingMidSongKeepsTheOrderFairAndAhead(t *testing.T) {
 		t.Fatalf("second song = %+v, want sage's turn", state.Current)
 	}
 }
+
+// blockingStore holds every Track read until it is released, so a test can keep
+// one enqueue inside the store and watch what the manager's own lock does while
+// it is there. Everything else delegates to the real store.
+type blockingStore struct {
+	Store
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingStore) Track(ctx context.Context, id uuid.UUID) (*store.Track, error) {
+	s.entered <- struct{}{}
+	<-s.release
+	return s.Store.Track(ctx, id)
+}
+
+// TestEnqueueDoesNotBlockOtherRoomsOnTheStore pins the critical-section fix: a
+// store read held under the manager's mutex is every room waiting on it, so an
+// enqueue that is inside the store must not stop another room from answering.
+func TestEnqueueDoesNotBlockOtherRoomsOnTheStore(t *testing.T) {
+	f := newFixture(t, nil)
+	track := f.track("held", 10_000)
+
+	blocked := &blockingStore{
+		Store:   f.m.store,
+		entered: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	m := NewManager(f.cfg, blocked, slog.New(slog.DiscardHandler))
+	m.SetClock(newManualClock())
+	t.Cleanup(m.Close)
+
+	room, err := m.Create("room", ControlsEveryone, "", guest("host"))
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.EnqueueMany(context.Background(), room.ID, "host", []uuid.UUID{track.ID})
+		done <- err
+	}()
+	<-blocked.entered // the enqueue is inside the store now
+
+	answered := make(chan struct{}, 1)
+	go func() {
+		if _, err := m.Get(room.ID); err != nil {
+			t.Errorf("get: %v", err)
+		}
+		answered <- struct{}{}
+	}()
+	select {
+	case <-answered:
+	case <-time.After(2 * time.Second):
+		close(blocked.release)
+		t.Fatal("a room read stalled behind an enqueue's store read")
+	}
+
+	close(blocked.release)
+	if err := <-done; err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+}

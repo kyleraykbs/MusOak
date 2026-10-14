@@ -701,35 +701,58 @@ func (m *Manager) leaveLocked(room *room, memberID string) *Snapshot {
 	return m.snapshotLocked(room)
 }
 
-// queueItemLocked builds the row a track takes in a member's queue: the title,
-// length and artwork the list shows, and the artist ids its menu opens.
-func (m *Manager) queueItemLocked(ctx context.Context, memberID string, track *store.Track) QueueItem {
-	artwork := track.ArtworkURL
-	if artwork == "" {
-		if url, err := m.store.TrackArtwork(ctx, track.ID); err == nil {
-			artwork = url
+// queueSource is everything a queue row shows about one track, read before the
+// manager's lock is taken: the store is its own lock, and holding the manager's
+// while querying it lets one slow read stall every room.
+type queueSource struct {
+	track       *store.Track
+	artwork     string
+	artistIDs   []string
+	artistNames []string
+}
+
+// loadQueueTracks reads what each of trackIDs contributes to a queue row. It
+// touches no room state and takes no lock.
+func (m *Manager) loadQueueTracks(ctx context.Context, trackIDs []uuid.UUID) ([]queueSource, error) {
+	sources := make([]queueSource, 0, len(trackIDs))
+	for _, trackID := range trackIDs {
+		track, err := m.store.Track(ctx, trackID)
+		if err != nil {
+			return nil, err
 		}
-	}
-	var artistIDs []string
-	var artistNames []string
-	if artists, err := m.store.TrackArtists(ctx, track.ID); err == nil {
-		artistIDs = make([]string, 0, len(artists))
-		artistNames = make([]string, 0, len(artists))
-		for _, artist := range artists {
-			artistIDs = append(artistIDs, artist.ID.String())
-			artistNames = append(artistNames, artist.Name)
+		src := queueSource{track: track, artwork: track.ArtworkURL}
+		if src.artwork == "" {
+			if url, err := m.store.TrackArtwork(ctx, track.ID); err == nil {
+				src.artwork = url
+			}
 		}
+		if artists, err := m.store.TrackArtists(ctx, track.ID); err == nil {
+			src.artistIDs = make([]string, 0, len(artists))
+			src.artistNames = make([]string, 0, len(artists))
+			for _, artist := range artists {
+				src.artistIDs = append(src.artistIDs, artist.ID.String())
+				src.artistNames = append(src.artistNames, artist.Name)
+			}
+		}
+		sources = append(sources, src)
 	}
+	return sources, nil
+}
+
+// queueItemLocked builds the row a track takes in a member's queue from a
+// source loadQueueTracks already read: the title, length and artwork the list
+// shows, and the artist ids its menu opens.
+func (m *Manager) queueItemLocked(memberID string, src queueSource) QueueItem {
 	return QueueItem{
 		ID:         uuid.NewString(),
-		TrackID:    track.ID,
-		Title:      track.Title,
+		TrackID:    src.track.ID,
+		Title:      src.track.Title,
 		AddedBy:    memberID,
 		AddedAtMs:  m.nowMsLocked(),
-		DurationMs: track.DurationMs,
-		ArtworkURL: artwork,
-		ArtistIDs:  artistIDs,
-		Artists:    artistNames,
+		DurationMs: src.track.DurationMs,
+		ArtworkURL: src.artwork,
+		ArtistIDs:  src.artistIDs,
+		Artists:    src.artistNames,
 	}
 }
 
@@ -825,6 +848,11 @@ func (m *Manager) Enqueue(ctx context.Context, roomID, memberID string, trackID 
 // back. The batch is all or nothing - an unknown track leaves the queue
 // untouched.
 func (m *Manager) EnqueueMany(ctx context.Context, roomID, memberID string, trackIDs []uuid.UUID) (*Snapshot, error) {
+	// The rows are read before the lock is taken: a database read held under
+	// the manager's mutex is every room waiting on it, and a queue of a dozen
+	// songs was a dozen of them back to back.
+	sources, readErr := m.loadQueueTracks(ctx, trackIDs)
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -835,16 +863,15 @@ func (m *Manager) EnqueueMany(ctx context.Context, roomID, memberID string, trac
 	if _, ok := room.members[memberID]; !ok {
 		return nil, ErrMemberNotFound
 	}
-	if len(trackIDs) == 0 {
+	if readErr != nil {
+		return nil, readErr
+	}
+	if len(sources) == 0 {
 		return m.snapshotLocked(room), nil
 	}
-	items := make([]QueueItem, 0, len(trackIDs))
-	for _, trackID := range trackIDs {
-		track, err := m.store.Track(ctx, trackID)
-		if err != nil {
-			return nil, err
-		}
-		items = append(items, m.queueItemLocked(ctx, memberID, track))
+	items := make([]QueueItem, 0, len(sources))
+	for _, src := range sources {
+		items = append(items, m.queueItemLocked(memberID, src))
 	}
 	room.queues[memberID] = append(room.queues[memberID], items...)
 	recomputeMasterLocked(room)
