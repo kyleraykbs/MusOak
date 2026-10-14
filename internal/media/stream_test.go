@@ -7,14 +7,16 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
-	"codeberg.org/kyleraykbs/musoak/internal/provider"
-	"codeberg.org/kyleraykbs/musoak/internal/store"
+	"github.com/kyleraykbs/MusOak/internal/provider"
+	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
 // streamProvider serves a source as a pipe the test drives, and can hold its
@@ -305,5 +307,82 @@ func TestStreamKeepsTheDownloadAfterTheListenerLeaves(t *testing.T) {
 	defer p.mu.Unlock()
 	if p.heldErr != nil {
 		t.Fatalf("the download was cancelled with the listener: %v", p.heldErr)
+	}
+}
+
+// A player that starts part-way in - a session picked up where it was left, or a
+// room whose song is already a minute gone - asks for a byte range. What a
+// source hands out starts at zero, so answering the range from the source means
+// the element buffers from the beginning to reach that position, which on a
+// three minute song is most of it. The file the download is being written to
+// holds the bytes from the start, so a range it covers is answered from there.
+func TestStreamAnswersARangeFromTheDownloadedPart(t *testing.T) {
+	pr, pw := io.Pipe()
+	go func() {
+		_, _ = pw.Write([]byte("from the source"))
+		_ = pw.Close()
+	}()
+	// The download is held: this test is about what is already written, and a
+	// download that fails would clean its part file up underneath it.
+	p := &streamProvider{
+		fakeProvider: &fakeProvider{name: "ytmusic"},
+		contentType:  "audio/webm",
+		pipe:         pr,
+		hold:         true,
+		started:      make(chan struct{}, 1),
+		release:      make(chan struct{}),
+	}
+	m, db := newTestManager(t, p)
+	m.SetDownloadRetry(1, time.Millisecond)
+	variant := seedVariant(t, db, true, "ytmusic")
+
+	// What the download has written so far: sixty-four bytes from the start. The
+	// manager makes its directory when it downloads something, so the test makes
+	// it for what it is pretending was downloaded.
+	part := bytes.Repeat([]byte("abcdefgh"), 8)
+	partPath := m.pathFor(variant.ID) + ".part"
+	if err := os.MkdirAll(filepath.Dir(partPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(partPath, part, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv := serveStream(t, m, variant.ID)
+
+	ask := func(spec string) (*http.Response, []byte) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, srv.URL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Range", spec)
+		response, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(response.Body)
+		response.Body.Close()
+		return response, body
+	}
+
+	response, body := ask("bytes=16-31")
+	if response.StatusCode != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", response.StatusCode)
+	}
+	if !bytes.Equal(body, part[16:32]) {
+		t.Errorf("body = %q, want the bytes the part file holds", body)
+	}
+	if got := response.Header.Get("X-Musoak-Stream"); got != "1" {
+		t.Errorf("X-Musoak-Stream = %q: a part file is not the rendition this URL names", got)
+	}
+
+	// A range the download has not reached is not answered from it: the source
+	// is streamed instead, which is what this path did for every range before.
+	response, body = ask("bytes=400-500")
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want the streamed answer", response.StatusCode)
+	}
+	if string(body) != "from the source" {
+		t.Errorf("body = %q, want the source", body)
 	}
 }
