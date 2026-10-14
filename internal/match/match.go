@@ -68,6 +68,31 @@ type Candidate struct {
 	ISRC       string
 }
 
+// scored is a candidate with its comparison keys worked out once. Normalising
+// is the expensive half of scoring - a title goes through six regular
+// expressions - and a candidate compared against many others (a search hit
+// against every track in the library) would otherwise be reduced again for
+// each of them, on a side that does not change.
+type scored struct {
+	title    string
+	album    string
+	artists  map[string]bool
+	names    []string
+	duration int64
+	isrc     string
+}
+
+func keysOf(c Candidate) scored {
+	return scored{
+		title:    NormalizeTitle(c.Title),
+		album:    NormalizeTitle(c.Album),
+		artists:  artistSet(c.Artists),
+		names:    c.Artists,
+		duration: c.DurationMs,
+		isrc:     c.ISRC,
+	}
+}
+
 // Score returns the similarity of two candidates in [0,1]. Identical ISRCs
 // short-circuit to 1; durations that cannot be the same recording return 0.
 //
@@ -75,23 +100,27 @@ type Candidate struct {
 // file must still be able to match its track on title and duration alone,
 // while two tracks that both name their artist and album are held to them.
 func Score(a, b Candidate) float64 {
-	if a.ISRC != "" && b.ISRC != "" && strings.EqualFold(strings.TrimSpace(a.ISRC), strings.TrimSpace(b.ISRC)) {
+	return keysOf(a).score(keysOf(b))
+}
+
+// score is Score with both sides already reduced to their keys.
+func (a scored) score(b scored) float64 {
+	if a.isrc != "" && b.isrc != "" && strings.EqualFold(strings.TrimSpace(a.isrc), strings.TrimSpace(b.isrc)) {
 		return 1
 	}
-	if a.DurationMs > 0 && b.DurationMs > 0 && absDiff(a.DurationMs, b.DurationMs) > DurationToleranceMs {
+	if a.duration > 0 && b.duration > 0 && absDiff(a.duration, b.duration) > DurationToleranceMs {
 		return 0
 	}
 
-	titleA, titleB := NormalizeTitle(a.Title), NormalizeTitle(b.Title)
 	signals := []struct {
 		weight float64
 		value  float64
 		known  bool
 	}{
-		{weightTitle, titleSimilarity(a.Title, b.Title), titleA != "" && titleB != ""},
-		{weightArtists, artistSimilarity(a.Artists, b.Artists), len(artistSet(a.Artists)) > 0 && len(artistSet(b.Artists)) > 0},
-		{weightAlbum, albumSimilarity(a.Album, b.Album), NormalizeTitle(a.Album) != "" && NormalizeTitle(b.Album) != ""},
-		{weightDuration, durationSimilarity(a.DurationMs, b.DurationMs), a.DurationMs > 0 && b.DurationMs > 0},
+		{weightTitle, titleSimilarityKeys(a.title, b.title), a.title != "" && b.title != ""},
+		{weightArtists, artistSimilaritySets(a.names, a.artists, b.names, b.artists), len(a.artists) > 0 && len(b.artists) > 0},
+		{weightAlbum, albumSimilarityKeys(a.album, b.album), a.album != "" && b.album != ""},
+		{weightDuration, durationSimilarity(a.duration, b.duration), a.duration > 0 && b.duration > 0},
 	}
 
 	var totalWeight, weighted float64
@@ -108,8 +137,8 @@ func Score(a, b Candidate) float64 {
 	return weighted / totalWeight
 }
 
-func titleSimilarity(a, b string) float64 {
-	na, nb := NormalizeTitle(a), NormalizeTitle(b)
+// titleSimilarityKeys compares two titles that are already normalised.
+func titleSimilarityKeys(na, nb string) float64 {
 	switch {
 	case na == "" || nb == "":
 		return 0
@@ -119,8 +148,9 @@ func titleSimilarity(a, b string) float64 {
 	return jaccard(tokens(na), tokens(nb))
 }
 
-func artistSimilarity(a, b []string) float64 {
-	na, nb := artistSet(a), artistSet(b)
+// artistSimilaritySets compares two credits lists from the normalised sets the
+// caller already holds; the raw names are kept for the word fallback below.
+func artistSimilaritySets(a []string, na map[string]bool, b []string, nb map[string]bool) float64 {
 	if len(na) == 0 || len(nb) == 0 {
 		// Unknown credits are neutral rather than disqualifying: an untagged
 		// local file should still be able to join its track.
@@ -153,8 +183,8 @@ func artistWords(names []string) map[string]bool {
 	return out
 }
 
-func albumSimilarity(a, b string) float64 {
-	na, nb := NormalizeTitle(a), NormalizeTitle(b)
+// albumSimilarityKeys compares two albums that are already normalised.
+func albumSimilarityKeys(na, nb string) float64 {
 	switch {
 	case na == "" || nb == "":
 		return 0.5
@@ -605,23 +635,29 @@ func (m *Matcher) findTrack(ctx context.Context, hit provider.Track) (*store.Tra
 		return nil, err
 	}
 
+	shapes, err := m.shapes(ctx, candidates)
+	if err != nil {
+		return nil, err
+	}
+
 	var (
 		best      *store.Track
 		bestScore float64
 	)
+	want := Candidate{
+		Title:      hit.Title,
+		Artists:    hit.Artists,
+		Album:      hit.Album,
+		DurationMs: hit.DurationMs,
+		ISRC:       hit.ISRC,
+	}
+	// The hit is the same for every candidate, so its keys are worked out once.
+	wantKeys := keysOf(want)
 	for i := range candidates {
 		candidate := &candidates[i]
-		shape, err := m.shape(ctx, *candidate)
-		if err != nil {
-			return nil, err
-		}
-		score := Score(shape, Candidate{
-			Title:      hit.Title,
-			Artists:    hit.Artists,
-			Album:      hit.Album,
-			DurationMs: hit.DurationMs,
-			ISRC:       hit.ISRC,
-		})
+		// Score is symmetric; candidate first keeps the comparison the way it
+		// read before.
+		score := keysOf(shapes[candidate.ID]).score(wantKeys)
 		if score > bestScore {
 			best, bestScore = candidate, score
 		}
@@ -636,25 +672,38 @@ func (m *Matcher) findTrack(ctx context.Context, hit provider.Track) (*store.Tra
 	return best, nil
 }
 
-// shape loads a canonical track's comparison signals.
-func (m *Matcher) shape(ctx context.Context, track store.Track) (Candidate, error) {
-	artists, err := m.db.TrackArtists(ctx, track.ID)
+// shapes loads the comparison signals of many canonical tracks at once. It is
+// shape for a whole candidate set: the artists and albums of every candidate in
+// two queries rather than two per candidate, which is what a scorer that walks
+// hundreds of candidates needs.
+func (m *Matcher) shapes(ctx context.Context, tracks []store.Track) (map[uuid.UUID]Candidate, error) {
+	ids := make([]uuid.UUID, 0, len(tracks))
+	for i := range tracks {
+		ids = append(ids, tracks[i].ID)
+	}
+	artists, err := m.db.TrackArtistsFor(ctx, ids)
 	if err != nil {
-		return Candidate{}, err
+		return nil, err
 	}
-	albums, err := m.db.TrackAlbums(ctx, track.ID)
+	albums, err := m.db.TrackAlbumsFor(ctx, ids)
 	if err != nil {
-		return Candidate{}, err
+		return nil, err
 	}
-	shape := Candidate{
-		Title:      track.Title,
-		Artists:    artistNames(artists),
-		DurationMs: track.DurationMs,
+
+	out := make(map[uuid.UUID]Candidate, len(tracks))
+	for i := range tracks {
+		track := &tracks[i]
+		shape := Candidate{
+			Title:      track.Title,
+			Artists:    artistNames(artists[track.ID]),
+			DurationMs: track.DurationMs,
+		}
+		if list := albums[track.ID]; len(list) > 0 {
+			shape.Album = list[0].Title
+		}
+		out[track.ID] = shape
 	}
-	if len(albums) > 0 {
-		shape.Album = albums[0].Title
-	}
-	return shape, nil
+	return out, nil
 }
 
 // Adopt matches a freshly imported rendition against the existing library and
@@ -687,6 +736,12 @@ func (m *Matcher) Adopt(ctx context.Context, variantID uuid.UUID) (*store.Track,
 		ISRC:       variant.ISRC,
 	}
 
+	shapes, err := m.shapes(ctx, candidates)
+	if err != nil {
+		return nil, err
+	}
+
+	wantKeys := keysOf(want)
 	var (
 		best      *store.Track
 		bestScore float64
@@ -696,11 +751,8 @@ func (m *Matcher) Adopt(ctx context.Context, variantID uuid.UUID) (*store.Track,
 		if candidate.ID == track.ID {
 			continue
 		}
-		shape, err := m.shape(ctx, *candidate)
-		if err != nil {
-			return nil, err
-		}
-		if score := Score(shape, want); score > bestScore {
+		score := keysOf(shapes[candidate.ID]).score(wantKeys)
+		if score > bestScore {
 			best, bestScore = candidate, score
 		}
 	}

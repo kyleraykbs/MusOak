@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -101,10 +100,8 @@ func scanUpload(row rowScanner) (*Upload, error) {
 	if u.Variant.TrackID, err = parseUUID(vTrackID); err != nil {
 		return nil, err
 	}
-	if artistsJSON != "" {
-		if err := json.Unmarshal([]byte(artistsJSON), &u.Variant.Artists); err != nil {
-			return nil, fmt.Errorf("store: upload %s artists: %w", id, err)
-		}
+	if err := unmarshalArtists(artistsJSON, "upload", id, &u.Variant.Artists); err != nil {
+		return nil, err
 	}
 	u.Uploader.UserID = u.UserID
 	u.CreatedAt = time.UnixMilli(created).UTC()
@@ -147,13 +144,9 @@ func (d *DB) CreateUpload(ctx context.Context, u *Upload, v *Variant, m *MediaFi
 		m.AccessedAt = m.DownloadedAt
 	}
 
-	artists := v.Artists
-	if artists == nil {
-		artists = []string{}
-	}
-	artistsJSON, err := json.Marshal(artists)
+	artistsJSON, err := marshalArtists(v.Artists, "variant")
 	if err != nil {
-		return fmt.Errorf("store: marshal variant artists: %w", err)
+		return err
 	}
 
 	return d.withTx(ctx, func(tx *sql.Tx) error {
@@ -161,7 +154,7 @@ func (d *DB) CreateUpload(ctx context.Context, u *Upload, v *Variant, m *MediaFi
 			INSERT INTO variants (id, track_id, provider, provider_track_id, title, artists_json, album, duration_ms, downloadable, isrc, created_at, uploader_user_id)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			v.ID.String(), v.TrackID.String(), v.Provider, v.ProviderTrackID, v.Title,
-			string(artistsJSON), v.Album, v.DurationMs, boolInt(v.Downloadable), v.ISRC,
+			artistsJSON, v.Album, v.DurationMs, boolInt(v.Downloadable), v.ISRC,
 			v.CreatedAt.UnixMilli(), u.UserID.String()); err != nil {
 			return mapErr(err)
 		}

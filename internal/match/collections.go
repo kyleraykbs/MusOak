@@ -39,6 +39,7 @@ type AlbumCandidate struct {
 // matches its release.
 func ScoreAlbum(a, b AlbumCandidate) float64 {
 	titleA, titleB := NormalizeTitle(a.Title), NormalizeTitle(b.Title)
+	artistsA, artistsB := artistSet(a.Artists), artistSet(b.Artists)
 
 	signals := []struct {
 		weight float64
@@ -46,7 +47,7 @@ func ScoreAlbum(a, b AlbumCandidate) float64 {
 		known  bool
 	}{
 		{weightAlbumTitle, albumTitleSimilarity(titleA, titleB), titleA != "" && titleB != ""},
-		{weightAlbumArtists, artistSimilarity(a.Artists, b.Artists), len(artistSet(a.Artists)) > 0 && len(artistSet(b.Artists)) > 0},
+		{weightAlbumArtists, artistSimilaritySets(a.Artists, artistsA, b.Artists, artistsB), len(artistsA) > 0 && len(artistsB) > 0},
 		{weightAlbumYear, albumYearSimilarity(a.Year, b.Year), strings.TrimSpace(a.Year) != "" && strings.TrimSpace(b.Year) != ""},
 		{weightAlbumTracks, albumTrackSimilarity(a.TrackCount, b.TrackCount), a.TrackCount > 0 && b.TrackCount > 0},
 	}
@@ -189,20 +190,28 @@ func (m *Matcher) findOrCreateAlbumLocked(ctx context.Context, hit provider.Albu
 		TrackCount: hit.TrackCount,
 	}
 
+	ids := make([]uuid.UUID, 0, len(candidates))
+	for i := range candidates {
+		ids = append(ids, candidates[i].ID)
+	}
+	credits, err := m.db.AlbumArtistsFor(ctx, ids)
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	// The year is a tiebreaker and was always best-effort: an unread year is a
+	// candidate scored without one, not a failed match.
+	years, _ := m.db.AlbumYearsFor(ctx, ids)
+
 	var (
 		best      *store.Album
 		bestScore float64
 	)
 	for i := range candidates {
 		candidate := &candidates[i]
-		artists, err := m.db.AlbumArtists(ctx, candidate.ID)
-		if err != nil {
-			return uuid.Nil, false, err
-		}
-		shape := AlbumCandidate{Title: candidate.Title, Artists: artistNames(artists)}
-		if variant, err := m.albumYear(ctx, candidate.ID); err == nil {
-			shape.Year = variant
-		}
+		// The credits and the year come from the batch reads above: scoring a
+		// candidate on its own costs a query per album per hit.
+		shape := AlbumCandidate{Title: candidate.Title, Artists: artistNames(credits[candidate.ID])}
+		shape.Year = years[candidate.ID]
 		if score := ScoreAlbum(shape, want); score > bestScore {
 			best, bestScore = candidate, score
 		}
@@ -233,20 +242,6 @@ func (m *Matcher) findOrCreateAlbumLocked(ctx context.Context, hit provider.Albu
 	}
 	m.logger.Debug("created canonical album", "album", albumID, "title", hit.Title, "provider", providerNameOf(hit))
 	return albumID, true, nil
-}
-
-// albumYear reads the year any of an album's provider releases reports.
-func (m *Matcher) albumYear(ctx context.Context, albumID uuid.UUID) (string, error) {
-	variants, err := m.db.AlbumVariants(ctx, albumID)
-	if err != nil {
-		return "", err
-	}
-	for _, variant := range variants {
-		if variant.Year != "" {
-			return variant.Year, nil
-		}
-	}
-	return "", nil
 }
 
 // providerNameOf exists so the log line above cannot accidentally format the

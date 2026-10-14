@@ -3,8 +3,6 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
-	"fmt"
 	"strings"
 	"time"
 
@@ -151,6 +149,10 @@ type AlbumRepo interface {
 	EnsureAlbum(ctx context.Context, title string, artists []string) (uuid.UUID, error)
 	Album(ctx context.Context, id uuid.UUID) (*Album, error)
 	AlbumArtists(ctx context.Context, id uuid.UUID) ([]Artist, error)
+	// AlbumArtistsFor and AlbumYearsFor are the batch reads album matching
+	// uses: one query for a whole candidate set, rather than one per candidate.
+	AlbumArtistsFor(ctx context.Context, albumIDs []uuid.UUID) (map[uuid.UUID][]Artist, error)
+	AlbumYearsFor(ctx context.Context, albumIDs []uuid.UUID) (map[uuid.UUID]string, error)
 	// SetAlbumArtists replaces an album's credits, adopting an identity when
 	// the album had no artist yet.
 	SetAlbumArtists(ctx context.Context, id uuid.UUID, artists []string) error
@@ -287,22 +289,79 @@ func (d *DB) AlbumArtists(ctx context.Context, id uuid.UUID) ([]Artist, error) {
 		return nil, mapErr(err)
 	}
 	defer rows.Close()
+	return scanArtists(rows)
+}
 
-	var artists []Artist
+// AlbumArtistsFor lists many albums' credited artists at once, in credit order,
+// keyed by album id; an album with no credits has no entry. The batch form of
+// AlbumArtists, for scoring a search hit against many candidate albums.
+func (d *DB) AlbumArtistsFor(ctx context.Context, albumIDs []uuid.UUID) (map[uuid.UUID][]Artist, error) {
+	if len(albumIDs) == 0 {
+		return map[uuid.UUID][]Artist{}, nil
+	}
+	rows, err := d.db.QueryContext(ctx, `
+		SELECT aa.album_id, a.id, a.name, a.artwork_url
+		FROM album_artists aa
+		JOIN artists a ON a.id = aa.artist_id
+		WHERE aa.album_id IN (`+placeholders(len(albumIDs))+`)
+		ORDER BY aa.album_id, aa.position`, uuidStrings(albumIDs)...)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+
+	out := make(map[uuid.UUID][]Artist, len(albumIDs))
 	for rows.Next() {
 		var (
-			artist Artist
-			idStr  string
+			ownerStr, idStr string
+			artist          Artist
 		)
-		if err := rows.Scan(&idStr, &artist.Name, &artist.ArtworkURL); err != nil {
+		if err := rows.Scan(&ownerStr, &idStr, &artist.Name, &artist.ArtworkURL); err != nil {
 			return nil, mapErr(err)
+		}
+		owner, err := parseUUID(ownerStr)
+		if err != nil {
+			return nil, err
 		}
 		if artist.ID, err = parseUUID(idStr); err != nil {
 			return nil, err
 		}
-		artists = append(artists, artist)
+		out[owner] = append(out[owner], artist)
 	}
-	return artists, mapErr(rows.Err())
+	return out, mapErr(rows.Err())
+}
+
+// AlbumYearsFor reads the year any of an album's provider releases reports,
+// keyed by album id; an album whose releases report none has no entry. The year
+// is the first a release gives, in release order, matching AlbumVariants.
+func (d *DB) AlbumYearsFor(ctx context.Context, albumIDs []uuid.UUID) (map[uuid.UUID]string, error) {
+	if len(albumIDs) == 0 {
+		return map[uuid.UUID]string{}, nil
+	}
+	rows, err := d.db.QueryContext(ctx, `
+		SELECT album_id, year FROM album_variants
+		WHERE album_id IN (`+placeholders(len(albumIDs))+`) AND year <> ''
+		ORDER BY album_id, created_at`, uuidStrings(albumIDs)...)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+
+	out := make(map[uuid.UUID]string, len(albumIDs))
+	for rows.Next() {
+		var albumID, year string
+		if err := rows.Scan(&albumID, &year); err != nil {
+			return nil, mapErr(err)
+		}
+		parsed, err := parseUUID(albumID)
+		if err != nil {
+			return nil, err
+		}
+		if _, seen := out[parsed]; !seen {
+			out[parsed] = year
+		}
+	}
+	return out, mapErr(rows.Err())
 }
 
 const albumVariantColumns = `id, album_id, provider, provider_album_id, title, artists_json, year, track_count, created_at`
@@ -325,10 +384,8 @@ func scanAlbumVariant(row rowScanner) (*AlbumVariant, error) {
 	if variant.AlbumID, err = parseUUID(albumID); err != nil {
 		return nil, err
 	}
-	if artistsJSON != "" {
-		if err := json.Unmarshal([]byte(artistsJSON), &variant.Artists); err != nil {
-			return nil, fmt.Errorf("store: album variant %s artists: %w", id, err)
-		}
+	if err := unmarshalArtists(artistsJSON, "album variant", id, &variant.Artists); err != nil {
+		return nil, err
 	}
 	variant.CreatedAt = time.UnixMilli(created).UTC()
 	return &variant, nil
@@ -350,15 +407,15 @@ func (d *DB) AttachAlbumVariant(ctx context.Context, v *AlbumVariant) (*AlbumVar
 		v.CreatedAt = time.Now()
 	}
 	v.Artists = normalizeStrings(v.Artists)
-	artistsJSON, err := json.Marshal(v.Artists)
+	artistsJSON, err := marshalArtists(v.Artists, "album variant")
 	if err != nil {
-		return nil, false, fmt.Errorf("store: marshal album variant artists: %w", err)
+		return nil, false, err
 	}
 
 	_, err = d.db.ExecContext(ctx,
 		`INSERT INTO album_variants (`+albumVariantColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		v.ID.String(), v.AlbumID.String(), v.Provider, v.ProviderAlbumID, v.Title,
-		string(artistsJSON), v.Year, v.TrackCount, v.CreatedAt.UnixMilli())
+		artistsJSON, v.Year, v.TrackCount, v.CreatedAt.UnixMilli())
 	if err != nil {
 		if isConflict(err) {
 			// Another writer attached it first.
@@ -443,15 +500,13 @@ func (d *DB) AppendAlbumTracks(ctx context.Context, albumID uuid.UUID, trackIDs 
 			albumID.String()).Scan(&next); err != nil {
 			return mapErr(err)
 		}
+		existing, err := existingTrackIDs(ctx, tx, albumID, trackIDs)
+		if err != nil {
+			return err
+		}
 		fresh := make([]uuid.UUID, 0, len(trackIDs))
 		for _, trackID := range trackIDs {
-			var exists int
-			if err := tx.QueryRowContext(ctx,
-				`SELECT COUNT(*) FROM track_albums WHERE album_id = ? AND track_id = ?`,
-				albumID.String(), trackID.String()).Scan(&exists); err != nil {
-				return mapErr(err)
-			}
-			if exists == 0 {
+			if !existing[trackID] {
 				fresh = append(fresh, trackID)
 			}
 		}
@@ -462,6 +517,36 @@ func (d *DB) AppendAlbumTracks(ctx context.Context, albumID uuid.UUID, trackIDs 
 		return adoptAlbumArtwork(ctx, tx, albumID)
 	})
 	return added, err
+}
+
+// existingTrackIDs reports which of trackIDs the album already holds, in one
+// query rather than one count per track.
+func existingTrackIDs(ctx context.Context, q txLike, albumID uuid.UUID, trackIDs []uuid.UUID) (map[uuid.UUID]bool, error) {
+	out := make(map[uuid.UUID]bool, len(trackIDs))
+	if len(trackIDs) == 0 {
+		return out, nil
+	}
+	args := append([]any{albumID.String()}, uuidStrings(trackIDs)...)
+	rows, err := q.QueryContext(ctx, `
+		SELECT track_id FROM track_albums
+		WHERE album_id = ? AND track_id IN (`+placeholders(len(trackIDs))+`)`, args...)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var idStr string
+		if err := rows.Scan(&idStr); err != nil {
+			return nil, mapErr(err)
+		}
+		id, err := parseUUID(idStr)
+		if err != nil {
+			return nil, err
+		}
+		out[id] = true
+	}
+	return out, mapErr(rows.Err())
 }
 
 func insertAlbumTracks(ctx context.Context, tx txLike, albumID uuid.UUID, trackIDs []uuid.UUID, start int) error {
@@ -526,27 +611,7 @@ func (d *DB) AlbumsForArtist(ctx context.Context, artistID uuid.UUID) ([]Album, 
 		return nil, mapErr(err)
 	}
 	defer rows.Close()
-
-	var albums []Album
-	for rows.Next() {
-		var (
-			album   Album
-			idStr   string
-			created int64
-		)
-		if err := rows.Scan(&idStr, &album.Title, &created, &album.ArtworkURL); err != nil {
-			return nil, mapErr(err)
-		}
-		var err error
-		if album.ID, err = parseUUID(idStr); err != nil {
-			return nil, err
-		}
-		if created > 0 {
-			album.CreatedAt = time.UnixMilli(created).UTC()
-		}
-		albums = append(albums, album)
-	}
-	return albums, mapErr(rows.Err())
+	return scanAlbums(rows)
 }
 
 // AttachAlbumArtist credits an album to an artist.
@@ -720,22 +785,7 @@ func (d *DB) ArtistCandidates(ctx context.Context, normalized string, limit int)
 		return nil, mapErr(err)
 	}
 	defer rows.Close()
-
-	var artists []Artist
-	for rows.Next() {
-		var (
-			artist Artist
-			idStr  string
-		)
-		if err := rows.Scan(&idStr, &artist.Name, &artist.ArtworkURL); err != nil {
-			return nil, mapErr(err)
-		}
-		if artist.ID, err = parseUUID(idStr); err != nil {
-			return nil, err
-		}
-		artists = append(artists, artist)
-	}
-	return artists, mapErr(rows.Err())
+	return scanArtists(rows)
 }
 
 func scanAlbums(rows interface {

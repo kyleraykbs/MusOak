@@ -236,6 +236,48 @@ func ensureArtist(ctx context.Context, q execer, name string) (uuid.UUID, error)
 	return parseUUID(id)
 }
 
+// scanArtist reads one artist row.
+func scanArtist(row rowScanner) (Artist, error) {
+	var (
+		artist Artist
+		idStr  string
+	)
+	if err := row.Scan(&idStr, &artist.Name, &artist.ArtworkURL); err != nil {
+		return Artist{}, mapErr(err)
+	}
+	var err error
+	if artist.ID, err = parseUUID(idStr); err != nil {
+		return Artist{}, err
+	}
+	return artist, nil
+}
+
+// scanArtists reads a whole artist result set, in the order the query gave.
+func scanArtists(rows interface {
+	Next() bool
+	Scan(dest ...any) error
+	Err() error
+}) ([]Artist, error) {
+	var artists []Artist
+	for rows.Next() {
+		artist, err := scanArtist(rows)
+		if err != nil {
+			return nil, err
+		}
+		artists = append(artists, artist)
+	}
+	return artists, mapErr(rows.Err())
+}
+
+// uuidStrings renders ids as the string arguments a query takes.
+func uuidStrings(ids []uuid.UUID) []any {
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id.String()
+	}
+	return args
+}
+
 // TrackArtists lists a track's artists in credit order.
 func (d *DB) TrackArtists(ctx context.Context, id uuid.UUID) ([]Artist, error) {
 	rows, err := d.db.QueryContext(ctx, `
@@ -248,22 +290,85 @@ func (d *DB) TrackArtists(ctx context.Context, id uuid.UUID) ([]Artist, error) {
 		return nil, mapErr(err)
 	}
 	defer rows.Close()
+	return scanArtists(rows)
+}
 
-	var artists []Artist
+// TrackArtistsFor lists many tracks' artists at once, in credit order, keyed by
+// track id; a track with no credits has no entry. It is TrackArtists for a
+// whole candidate set: scoring a search hit against the library must not cost a
+// query per candidate.
+func (d *DB) TrackArtistsFor(ctx context.Context, trackIDs []uuid.UUID) (map[uuid.UUID][]Artist, error) {
+	if len(trackIDs) == 0 {
+		return map[uuid.UUID][]Artist{}, nil
+	}
+	rows, err := d.db.QueryContext(ctx, `
+		SELECT ta.track_id, a.id, a.name, a.artwork_url
+		FROM track_artists ta
+		JOIN artists a ON a.id = ta.artist_id
+		WHERE ta.track_id IN (`+placeholders(len(trackIDs))+`)
+		ORDER BY ta.track_id, ta.position`, uuidStrings(trackIDs)...)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+
+	out := make(map[uuid.UUID][]Artist, len(trackIDs))
 	for rows.Next() {
 		var (
-			a     Artist
-			idStr string
+			ownerStr, idStr string
+			artist          Artist
 		)
-		if err := rows.Scan(&idStr, &a.Name, &a.ArtworkURL); err != nil {
+		if err := rows.Scan(&ownerStr, &idStr, &artist.Name, &artist.ArtworkURL); err != nil {
 			return nil, mapErr(err)
 		}
-		if a.ID, err = parseUUID(idStr); err != nil {
+		owner, err := parseUUID(ownerStr)
+		if err != nil {
 			return nil, err
 		}
-		artists = append(artists, a)
+		if artist.ID, err = parseUUID(idStr); err != nil {
+			return nil, err
+		}
+		out[owner] = append(out[owner], artist)
 	}
-	return artists, mapErr(rows.Err())
+	return out, mapErr(rows.Err())
+}
+
+// TrackAlbumsFor lists many tracks' albums at once, in credit order, keyed by
+// track id; a track with no albums has no entry. The batch form of TrackAlbums.
+func (d *DB) TrackAlbumsFor(ctx context.Context, trackIDs []uuid.UUID) (map[uuid.UUID][]Album, error) {
+	if len(trackIDs) == 0 {
+		return map[uuid.UUID][]Album{}, nil
+	}
+	rows, err := d.db.QueryContext(ctx, `
+		SELECT ta.track_id, al.id, al.title
+		FROM track_albums ta
+		JOIN albums al ON al.id = ta.album_id
+		WHERE ta.track_id IN (`+placeholders(len(trackIDs))+`)
+		ORDER BY ta.track_id, ta.position`, uuidStrings(trackIDs)...)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+
+	out := make(map[uuid.UUID][]Album, len(trackIDs))
+	for rows.Next() {
+		var (
+			ownerStr, idStr string
+			album           Album
+		)
+		if err := rows.Scan(&ownerStr, &idStr, &album.Title); err != nil {
+			return nil, mapErr(err)
+		}
+		owner, err := parseUUID(ownerStr)
+		if err != nil {
+			return nil, err
+		}
+		if album.ID, err = parseUUID(idStr); err != nil {
+			return nil, err
+		}
+		out[owner] = append(out[owner], album)
+	}
+	return out, mapErr(rows.Err())
 }
 
 // TrackAlbums lists a track's albums in order.

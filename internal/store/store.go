@@ -141,8 +141,12 @@ type TrackRepo interface {
 	ArtistCandidates(ctx context.Context, normalized string, limit int) ([]Artist, error)
 	SetTrackDuration(ctx context.Context, id uuid.UUID, durationMs int64) error
 	TrackArtists(ctx context.Context, id uuid.UUID) ([]Artist, error)
+	// TrackArtistsFor and TrackAlbumsFor are the batch reads matching uses:
+	// one query for a whole candidate set, rather than one per candidate.
+	TrackArtistsFor(ctx context.Context, trackIDs []uuid.UUID) (map[uuid.UUID][]Artist, error)
 	SetTrackArtists(ctx context.Context, id uuid.UUID, names []string) error
 	TrackAlbums(ctx context.Context, id uuid.UUID) ([]Album, error)
+	TrackAlbumsFor(ctx context.Context, trackIDs []uuid.UUID) (map[uuid.UUID][]Album, error)
 	SetTrackAlbums(ctx context.Context, id uuid.UUID, titles []string) error
 	// TrackArtwork is the cover's path on this server, empty when none is known.
 	// The room manager needs it for the queue rows, which show the artwork.

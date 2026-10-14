@@ -415,12 +415,18 @@ func (s *Service) GetAlbum(ctx context.Context, albumID uuid.UUID) (*Album, erro
 	if out.Tracks, err = s.db.AlbumTracks(ctx, albumID); err != nil {
 		return nil, err
 	}
-	for _, track := range out.Tracks {
-		artists, err := s.db.TrackArtists(ctx, track.ID)
-		if err != nil {
-			return nil, err
-		}
-		out.TrackArtists = append(out.TrackArtists, artists)
+	// The credits of the whole tracklist in one read: a tracklist of twenty
+	// songs was twenty queries, one per song.
+	trackIDs := make([]uuid.UUID, 0, len(out.Tracks))
+	for i := range out.Tracks {
+		trackIDs = append(trackIDs, out.Tracks[i].ID)
+	}
+	artists, err := s.db.TrackArtistsFor(ctx, trackIDs)
+	if err != nil {
+		return nil, err
+	}
+	for i := range out.Tracks {
+		out.TrackArtists = append(out.TrackArtists, artists[out.Tracks[i].ID])
 	}
 	return out, nil
 }
@@ -461,12 +467,12 @@ func (s *Service) SyncAlbum(ctx context.Context, albumID uuid.UUID, providers []
 	if err != nil {
 		return nil, err
 	}
-	selected := selectVariants(variants, providers)
+	selected := selectByProvider(variants, providers, albumProvider)
 	if len(selected) == 0 {
 		return nil, fmt.Errorf("%w: %s", ErrNoSources, album.Title)
 	}
 
-	result := &SyncResult{AlbumID: albumID, Providers: providersFor(selected)}
+	result := &SyncResult{AlbumID: albumID, Providers: providerNames(selected, albumProvider)}
 	// Attaching a track links it to its album, so the album's own tracklist is
 	// already growing while the loop runs: what the sync added is the album's
 	// growth, not what AppendAlbumTracks had left to insert.
@@ -555,12 +561,12 @@ func (s *Service) SyncArtist(ctx context.Context, artistID uuid.UUID, providers 
 	if err != nil {
 		return nil, err
 	}
-	selected := selectArtistVariants(variants, providers)
+	selected := selectByProvider(variants, providers, artistProvider)
 	if len(selected) == 0 {
 		return nil, fmt.Errorf("%w: %s", ErrNoSources, artist.Name)
 	}
 
-	result := &ArtistSyncResult{ArtistID: artistID, Providers: artistProviders(selected)}
+	result := &ArtistSyncResult{ArtistID: artistID, Providers: providerNames(selected, artistProvider)}
 
 	// Each provider's albums are fetched in parallel; the database writes below
 	// stay on this goroutine.
@@ -616,16 +622,23 @@ func (s *Service) SyncArtist(ctx context.Context, artistID uuid.UUID, providers 
 	return result, nil
 }
 
-// selectVariants keeps the requested providers, or everything when none is
-// named. Order follows the request.
-func selectVariants(variants []store.AlbumVariant, providers []string) []store.AlbumVariant {
+// albumProvider and artistProvider read the provider name out of the two
+// release types, the only thing the shared helpers above cannot know.
+func albumProvider(v store.AlbumVariant) string  { return v.Provider }
+func artistProvider(v store.ArtistVariant) string { return v.Provider }
+
+// selectByProvider keeps the releases whose provider is named, or everything
+// when none is named. Order follows the request. The provider name is read
+// through name, so albums and artists share the one implementation rather than
+// carrying two that differ only in their element type.
+func selectByProvider[T any](variants []T, providers []string, name func(T) string) []T {
 	if len(providers) == 0 {
 		return variants
 	}
-	out := make([]store.AlbumVariant, 0, len(variants))
-	for _, name := range providers {
+	out := make([]T, 0, len(variants))
+	for _, want := range providers {
 		for _, variant := range variants {
-			if variant.Provider == name {
+			if name(variant) == want {
 				out = append(out, variant)
 			}
 		}
@@ -633,40 +646,15 @@ func selectVariants(variants []store.AlbumVariant, providers []string) []store.A
 	return out
 }
 
-func selectArtistVariants(variants []store.ArtistVariant, providers []string) []store.ArtistVariant {
-	if len(providers) == 0 {
-		return variants
-	}
-	out := make([]store.ArtistVariant, 0, len(variants))
-	for _, name := range providers {
-		for _, variant := range variants {
-			if variant.Provider == name {
-				out = append(out, variant)
-			}
-		}
-	}
-	return out
-}
-
-func providersFor(variants []store.AlbumVariant) []string {
+// providerNames lists the providers of a set of releases, once each, in the
+// order they appear.
+func providerNames[T any](variants []T, name func(T) string) []string {
 	out := make([]string, 0, len(variants))
 	seen := map[string]bool{}
 	for _, variant := range variants {
-		if !seen[variant.Provider] {
-			seen[variant.Provider] = true
-			out = append(out, variant.Provider)
-		}
-	}
-	return out
-}
-
-func artistProviders(variants []store.ArtistVariant) []string {
-	out := make([]string, 0, len(variants))
-	seen := map[string]bool{}
-	for _, variant := range variants {
-		if !seen[variant.Provider] {
-			seen[variant.Provider] = true
-			out = append(out, variant.Provider)
+		if provider := name(variant); !seen[provider] {
+			seen[provider] = true
+			out = append(out, provider)
 		}
 	}
 	return out

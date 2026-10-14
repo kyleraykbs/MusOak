@@ -16,6 +16,31 @@ type rowScanner interface {
 	Scan(dest ...any) error
 }
 
+// marshalArtists renders a credit list for storage. label names the row it
+// belongs to in the error, so the one helper serves variants, album variants
+// and uploads without losing which of them failed.
+func marshalArtists(artists []string, label string) (string, error) {
+	if artists == nil {
+		artists = []string{}
+	}
+	raw, err := json.Marshal(artists)
+	if err != nil {
+		return "", fmt.Errorf("store: marshal %s artists: %w", label, err)
+	}
+	return string(raw), nil
+}
+
+// unmarshalArtists reads a stored credit list; an empty column is no credits.
+func unmarshalArtists(raw, label, id string, dest *[]string) error {
+	if raw == "" {
+		return nil
+	}
+	if err := json.Unmarshal([]byte(raw), dest); err != nil {
+		return fmt.Errorf("store: %s %s artists: %w", label, id, err)
+	}
+	return nil
+}
+
 func scanVariant(row rowScanner) (*Variant, error) {
 	var (
 		v            Variant
@@ -35,10 +60,8 @@ func scanVariant(row rowScanner) (*Variant, error) {
 	if v.TrackID, err = parseUUID(trackID); err != nil {
 		return nil, err
 	}
-	if artistsJSON != "" {
-		if err := json.Unmarshal([]byte(artistsJSON), &v.Artists); err != nil {
-			return nil, fmt.Errorf("store: variant %s artists: %w", id, err)
-		}
+	if err := unmarshalArtists(artistsJSON, "variant", id, &v.Artists); err != nil {
+		return nil, err
 	}
 	v.Downloadable = downloadable != 0
 	v.CreatedAt = time.UnixMilli(created).UTC()
@@ -54,18 +77,14 @@ func (d *DB) CreateVariant(ctx context.Context, v *Variant) error {
 		v.CreatedAt = time.Now()
 	}
 	v.ISRC = strings.ToUpper(strings.TrimSpace(v.ISRC))
-	artists := v.Artists
-	if artists == nil {
-		artists = []string{}
-	}
-	artistsJSON, err := json.Marshal(artists)
+	artistsJSON, err := marshalArtists(v.Artists, "variant")
 	if err != nil {
-		return fmt.Errorf("store: marshal variant artists: %w", err)
+		return err
 	}
 	_, err = d.db.ExecContext(ctx,
 		`INSERT INTO variants (`+variantColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		v.ID.String(), v.TrackID.String(), v.Provider, v.ProviderTrackID, v.Title,
-		string(artistsJSON), v.Album, v.DurationMs, boolInt(v.Downloadable), v.ISRC,
+		artistsJSON, v.Album, v.DurationMs, boolInt(v.Downloadable), v.ISRC,
 		v.CreatedAt.UnixMilli())
 	return mapErr(err)
 }
