@@ -229,6 +229,28 @@ func (s *Service) SearchPlaylists(
 	return playlists, problems, nil
 }
 
+// ProviderPlaylist reads a platform playlist as it stands: its metadata and the
+// tracks in the provider's own order, straight from the provider.
+//
+// Nothing is written - no metadata, no track, no match - so opening a playlist
+// to look at it costs one provider read and leaves the library exactly as it
+// was. Bringing the tracks in is a separate, explicit act (SyncPlaylist); a
+// click that browses a playlist is not an import.
+func (s *Service) ProviderPlaylist(ctx context.Context, playlistID uuid.UUID) (*store.ExternalPlaylist, []provider.Track, error) {
+	playlist, err := s.db.ExternalPlaylist(ctx, playlistID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, nil, fmt.Errorf("%w: %s", ErrNoPlaylist, playlistID)
+		}
+		return nil, nil, err
+	}
+	detail, err := s.providers.Playlist(ctx, playlist.Provider, playlist.ProviderPlaylistID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read playlist %s: %w", playlist.Title, err)
+	}
+	return playlist, detail.Tracks, nil
+}
+
 // GetPlaylist loads a provider playlist with the tracks synced from it.
 func (s *Service) GetPlaylist(ctx context.Context, playlistID uuid.UUID) (*store.ExternalPlaylist, []store.Track, error) {
 	playlist, err := s.db.ExternalPlaylist(ctx, playlistID)

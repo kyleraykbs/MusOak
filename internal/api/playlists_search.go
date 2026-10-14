@@ -74,6 +74,51 @@ func (s *Server) playlistSearchAnswer(ctx context.Context, query string, limit i
 	}, nil
 }
 
+// providerTrackResponse is one track of a platform playlist as the provider
+// lists it, before any of it is in the library: browsing is not importing, so
+// these rows carry no library id to play or queue.
+type providerTrackResponse struct {
+	ProviderTrackID string   `json:"providerTrackId"`
+	Title           string   `json:"title"`
+	Artists         []string `json:"artists,omitempty"`
+	DurationMs      int64    `json:"durationMs,omitempty"`
+	ArtworkURL      string   `json:"artworkUrl,omitempty"`
+}
+
+// handleProviderPlaylist shows a platform playlist as the provider has it, and
+// writes nothing: it is the page that opens when somebody clicks a playlist in
+// search, which must show the songs rather than start an import.
+func (s *Server) handleProviderPlaylist(w http.ResponseWriter, r *http.Request) {
+	playlistID, ok := s.playlistID(w, r)
+	if !ok {
+		return
+	}
+	playlist, tracks, err := s.library.ProviderPlaylist(r.Context(), playlistID)
+	if err != nil {
+		writeLibraryError(w, err)
+		return
+	}
+	out := make([]providerTrackResponse, 0, len(tracks))
+	for _, track := range tracks {
+		out = append(out, providerTrackResponse{
+			ProviderTrackID: track.ProviderTrackID,
+			Title:           track.Title,
+			Artists:         track.Artists,
+			DurationMs:      track.DurationMs,
+			ArtworkURL:      track.ArtworkURL,
+		})
+	}
+	shaped, err := s.buildPlaylist(r.Context(), playlist)
+	if err != nil {
+		writeStoreError(w, err, "playlist read failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"playlist": shaped,
+		"tracks":   out,
+	})
+}
+
 // handlePlaylistSync pulls a provider playlist's tracks into the library, so
 // they can be played or copied into a playlist of the caller's own.
 func (s *Server) handlePlaylistSync(w http.ResponseWriter, r *http.Request) {
