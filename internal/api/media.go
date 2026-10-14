@@ -133,7 +133,7 @@ func (s *Server) handleMediaDownload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if waitParam(r) {
-		if _, err := s.media.Ensure(r.Context(), id); err != nil {
+		if _, err := s.ensureMedia(r.Context(), id, priorityParam(r)); err != nil {
 			writeError(w, http.StatusBadGateway, err.Error())
 			return
 		}
@@ -144,12 +144,36 @@ func (s *Server) handleMediaDownload(w http.ResponseWriter, r *http.Request) {
 	// Detached so the download survives the client hanging up: the manager
 	// deduplicates it with every other requester anyway.
 	ctx := context.WithoutCancel(r.Context())
+	priority := priorityParam(r)
 	go func() {
-		if _, err := s.media.Ensure(ctx, id); err != nil {
+		if _, err := s.ensureMedia(ctx, id, priority); err != nil {
 			s.logger.Warn("media download failed", "variant", id, "error", err)
 		}
 	}()
 	writeJSON(w, http.StatusAccepted, s.mediaStatus(r.Context(), id))
+}
+
+// ensureMedia downloads a variant either as the song somebody is waiting to
+// hear - which takes the whole pipe: the downloads running for anything else
+// are cancelled and none starts until it has finished - or as background work,
+// which waits its turn.
+func (s *Server) ensureMedia(ctx context.Context, variantID uuid.UUID, priority bool) (string, error) {
+	if priority {
+		return s.media.EnsurePrimary(ctx, variantID)
+	}
+	return s.media.Ensure(ctx, variantID)
+}
+
+// priorityParam reports whether a request is the primary song. The player sends
+// it for the song it is loading, and for nothing else: the songs after it are
+// background fetches, which is what leaves the pipe free for the one being
+// waited on.
+func priorityParam(r *http.Request) bool {
+	switch r.URL.Query().Get("priority") {
+	case "1", "true", "yes":
+		return true
+	}
+	return false
 }
 
 func waitParam(r *http.Request) bool {

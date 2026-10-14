@@ -82,8 +82,12 @@ type Manager struct {
 
 	sf syncgroup
 
+	// primary is the pipe a person's play holds: see EnsurePrimary.
+	primary primaryGate
+
 	mu               sync.Mutex
 	status           map[uuid.UUID]Status
+	background       map[uuid.UUID]context.CancelFunc
 	downloadAttempts int
 	downloadBackoff  time.Duration
 }
@@ -123,9 +127,33 @@ func (m *Manager) pathFor(variantID uuid.UUID) string {
 
 // Ensure makes sure the variant has a complete file on disk and returns its
 // path. Concurrent calls for the same variant share one download.
+//
+// This is the background shape of a fetch. While a person's play is having one
+// downloaded (EnsurePrimary), it waits for that to finish first.
 func (m *Manager) Ensure(ctx context.Context, variantID uuid.UUID) (string, error) {
+	return m.ensure(ctx, variantID, false)
+}
+
+// EnsurePrimary fetches the variant somebody is waiting to hear, and owns the
+// pipe until it is done: every other download already running is cancelled, and
+// none starts until this one has finished. It is otherwise the same download
+// Ensure would do, shared with anybody who asked for the same file - a
+// background fetch of the very variant this is waiting on is kept rather than
+// cancelled, because it is the file this call wants.
+func (m *Manager) EnsurePrimary(ctx context.Context, variantID uuid.UUID) (string, error) {
+	return m.ensure(ctx, variantID, true)
+}
+
+func (m *Manager) ensure(ctx context.Context, variantID uuid.UUID, primary bool) (string, error) {
 	if path, ok := m.ready(ctx, variantID); ok {
 		return path, nil
+	}
+	if primary {
+		// Marked before the fetch starts, so a background download that was
+		// about to begin waits instead of competing with it.
+		m.primary.enter()
+		m.cancelBackground(variantID)
+		defer m.primary.leave()
 	}
 
 	// The download outlives whichever caller started it: a client hanging up
@@ -133,7 +161,7 @@ func (m *Manager) Ensure(ctx context.Context, variantID uuid.UUID) (string, erro
 	detached := context.WithoutCancel(ctx)
 
 	v, err, _ := m.sf.Do(variantID.String(), func() (any, error) {
-		return m.fetch(detached, variantID)
+		return m.fetch(detached, variantID, primary)
 	})
 	if err != nil {
 		return "", err
@@ -143,9 +171,27 @@ func (m *Manager) Ensure(ctx context.Context, variantID uuid.UUID) (string, erro
 
 // fetch downloads, probes and stores one variant. It runs at most once per
 // variant at a time (singleflight).
-func (m *Manager) fetch(ctx context.Context, variantID uuid.UUID) (string, error) {
+//
+// A background fetch waits for the pipe (see EnsurePrimary) and is registered
+// while it runs, so that a play arriving can stop it. The fetch that is itself a
+// play does neither: it never waits, and nothing cancels it.
+func (m *Manager) fetch(ctx context.Context, variantID uuid.UUID, primary bool) (string, error) {
 	if path, ok := m.ready(ctx, variantID); ok {
 		return path, nil
+	}
+	if !primary {
+		// A person's play has the pipe. The caller's context is what ends the
+		// wait, so a request that gives up does not stay queued behind it.
+		if err := m.primary.wait(ctx); err != nil {
+			return "", err
+		}
+		// It may have arrived while this waited.
+		if path, ok := m.ready(ctx, variantID); ok {
+			return path, nil
+		}
+		var unregister func()
+		ctx, unregister = m.registerBackground(ctx, variantID)
+		defer unregister()
 	}
 
 	variant, err := m.db.Variant(ctx, variantID)
@@ -461,6 +507,86 @@ func (m *Manager) fail(variantID uuid.UUID, err error) error {
 	m.logger.Warn("media download failed", "variant", variantID, "error", err)
 	m.setStatus(Status{VariantID: variantID, State: StateFailed, Err: err.Error()})
 	return err
+}
+
+// primaryGate counts the downloads somebody is waiting to hear. A background
+// fetch waits while the count is above zero; a play never waits on anything.
+type primaryGate struct {
+	mu   sync.Mutex
+	n    int
+	done chan struct{}
+}
+
+func (g *primaryGate) enter() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.n == 0 {
+		g.done = make(chan struct{})
+	}
+	g.n++
+}
+
+func (g *primaryGate) leave() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.n--
+	if g.n == 0 {
+		close(g.done)
+		g.done = nil
+	}
+}
+
+// wait blocks until no play is downloading, or the context ends first.
+func (g *primaryGate) wait(ctx context.Context) error {
+	for {
+		g.mu.Lock()
+		if g.n == 0 {
+			g.mu.Unlock()
+			return nil
+		}
+		done := g.done
+		g.mu.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// registerBackground makes a background download cancellable and remembers it,
+// so a play arriving can stop it. The returned function forgets it again.
+func (m *Manager) registerBackground(ctx context.Context, variantID uuid.UUID) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(ctx)
+	m.mu.Lock()
+	if m.background == nil {
+		m.background = make(map[uuid.UUID]context.CancelFunc)
+	}
+	m.background[variantID] = cancel
+	m.mu.Unlock()
+	return ctx, func() {
+		m.mu.Lock()
+		delete(m.background, variantID)
+		m.mu.Unlock()
+		cancel()
+	}
+}
+
+// cancelBackground stops the downloads running for anything other than the
+// variant a person is waiting on, so nothing shares the provider's bandwidth
+// with it.
+func (m *Manager) cancelBackground(except uuid.UUID) {
+	m.mu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(m.background))
+	for id, cancel := range m.background {
+		if id != except {
+			cancels = append(cancels, cancel)
+		}
+	}
+	m.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
 }
 
 // hashFile returns the sha256 and size of a file.

@@ -213,3 +213,70 @@ func TestEvictionLeavesUploadsAlone(t *testing.T) {
 		t.Errorf("cache is %d bytes, over the %d byte quota: uploads must not count", total, size)
 	}
 }
+
+// waitForCalls blocks until the fake provider has been asked to download at
+// least want times, or the test fails.
+func waitForCalls(t *testing.T, f *fakeProvider, want int32) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if f.calls.Load() >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("downloads = %d, want at least %d", f.calls.Load(), want)
+}
+
+// A download somebody is waiting to hear takes the pipe: the ones running for
+// anything else are cancelled, and none starts until it has finished.
+func TestEnsurePrimaryTakesThePipe(t *testing.T) {
+	dir := t.TempDir()
+	fixture := tone(t, dir, "fixture.opus", 1.0)
+
+	// Slow enough to watch: three variants from one provider - one already
+	// downloading in the background, the one a person is waiting on, and one
+	// that would be fetched next.
+	fake := &fakeProvider{name: "ytmusic", fixture: fixture, delay: 300 * time.Millisecond}
+	m, db := newTestManager(t, fake)
+
+	background := seedVariant(t, db, true, "ytmusic")
+	playing := seedVariant(t, db, true, "ytmusic")
+	next := seedVariant(t, db, true, "ytmusic")
+
+	backgroundErr := make(chan error, 1)
+	go func() {
+		_, err := m.Ensure(context.Background(), background.ID)
+		backgroundErr <- err
+	}()
+	waitForCalls(t, fake, 1)
+
+	// The song the player is waiting to hear.
+	playingErr := make(chan error, 1)
+	go func() {
+		_, err := m.EnsurePrimary(context.Background(), playing.ID)
+		playingErr <- err
+	}()
+	waitForCalls(t, fake, 2)
+
+	// A fetch that was about to start waits rather than competing with it.
+	nextErr := make(chan error, 1)
+	go func() {
+		_, err := m.Ensure(context.Background(), next.ID)
+		nextErr <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if got := fake.calls.Load(); got != 2 {
+		t.Errorf("downloads = %d while a play is downloading, want 2: something else was allowed to start", got)
+	}
+
+	if err := <-playingErr; err != nil {
+		t.Fatalf("the play failed: %v", err)
+	}
+	if err := <-backgroundErr; !errors.Is(err, context.Canceled) {
+		t.Errorf("the background download = %v, want it cancelled for the play", err)
+	}
+	if err := <-nextErr; err != nil {
+		t.Fatalf("the fetch that waited failed: %v", err)
+	}
+}
