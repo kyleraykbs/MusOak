@@ -215,13 +215,19 @@ type ArtistResult struct {
 	Err      error
 }
 
-// Registry holds the enabled providers.
+// Registry holds the enabled providers, and the builders for the ones that are
+// not enabled but can still answer about a playlist.
 type Registry struct {
 	mu        sync.RWMutex
 	providers map[string]Provider
 	order     []string
-	timeout   time.Duration
-	logger    *slog.Logger
+	// browsing builds a provider that is not enabled but can still be asked
+	// about a playlist; browsed is what it built, built once each. See
+	// RegisterBrowsing.
+	browsing map[string]func() (Provider, error)
+	browsed  map[string]Provider
+	timeout  time.Duration
+	logger   *slog.Logger
 }
 
 // NewRegistry returns an empty registry. perProviderTimeout bounds each
@@ -232,9 +238,26 @@ func NewRegistry(logger *slog.Logger, perProviderTimeout time.Duration) *Registr
 	}
 	return &Registry{
 		providers: make(map[string]Provider),
+		browsing:  make(map[string]func() (Provider, error)),
+		browsed:   make(map[string]Provider),
 		timeout:   perProviderTimeout,
 		logger:    logger,
 	}
+}
+
+// RegisterBrowsing adds a provider that is *not* one of the server's enabled
+// ones but can still be asked about a playlist.
+//
+// A playlist is a list of names - artist and title - and reading one is not the
+// same act as serving it: Spotify's public embed page answers for any public
+// playlist with no account at all, so a link to one is importable whether or not
+// Spotify is enabled on this server. Only the playlist read consults this
+// (Registry.Playlist); search, matching and serving keep to the enabled set, so
+// a fallback can never quietly become a provider the server didn't ask for.
+func (r *Registry) RegisterBrowsing(name string, build func() (Provider, error)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.browsing[name] = build
 }
 
 // Register adds a provider. A later registration under the same name wins.
@@ -254,6 +277,28 @@ func (r *Registry) Get(name string) (Provider, bool) {
 	defer r.mu.RUnlock()
 	p, ok := r.providers[name]
 	return p, ok
+}
+
+// browsingProvider builds (once) a provider that is not enabled but can be
+// asked about a playlist. A build that fails is not remembered: the next import
+// may be the one that works.
+func (r *Registry) browsingProvider(name string) (Provider, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if p, built := r.browsed[name]; built {
+		return p, true
+	}
+	build, ok := r.browsing[name]
+	if !ok {
+		return nil, false
+	}
+	p, err := build()
+	if err != nil {
+		r.logger.Warn("provider: a browsing provider could not be built", "provider", name, "error", err)
+		return nil, false
+	}
+	r.browsed[name] = p
+	return p, true
 }
 
 // Names lists registered providers in registration order.
@@ -472,7 +517,13 @@ func (r *Registry) searchPlaylists(ctx context.Context, providers []Provider, q 
 func (r *Registry) Playlist(ctx context.Context, name, providerPlaylistID string) (*PlaylistDetail, error) {
 	p, ok := r.Get(name)
 	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrNotEnabled, name)
+		// Not one of the server's providers - but a platform that answers for a
+		// playlist without an account still can (see RegisterBrowsing), and a
+		// playlist somebody wants to bring over is usually a public one.
+		p, ok = r.browsingProvider(name)
+		if !ok {
+			return nil, fmt.Errorf("%w: %s", ErrNotEnabled, name)
+		}
 	}
 	searcher, ok := p.(PlaylistSearcher)
 	if !ok || !p.Capabilities().Playlists {

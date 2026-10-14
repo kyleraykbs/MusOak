@@ -327,3 +327,72 @@ func TestNamesAndGetPreserveRegistrationOrder(t *testing.T) {
 		t.Error("Get(z) must not resolve")
 	}
 }
+
+// A provider that is not enabled can still answer for a playlist: that is the
+// whole point of RegisterBrowsing, and it is what makes a Spotify playlist
+// importable on a server that never enabled Spotify (its public embed page
+// needs no account).
+func TestBrowsingProviderAnswersAPlaylist(t *testing.T) {
+	registry := NewRegistry(slog.New(slog.DiscardHandler), time.Second)
+
+	built := 0
+	registry.RegisterBrowsing("spotify", func() (Provider, error) {
+		built++
+		return &fakePlaylistProvider{}, nil
+	})
+
+	if _, err := registry.Playlist(context.Background(), "spotify", "public-playlist"); err != nil {
+		t.Fatalf("a browsing provider answered with an error: %v", err)
+	}
+	if _, err := registry.Playlist(context.Background(), "spotify", "another"); err != nil {
+		t.Fatalf("second read: %v", err)
+	}
+	if built != 1 {
+		t.Errorf("built %d times, want once: a browsing provider is built once and kept", built)
+	}
+	if _, err := registry.Playlist(context.Background(), "ytmusic", "x"); !errors.Is(err, ErrNotEnabled) {
+		t.Errorf("a name with no provider and no browsing fallback = %v, want ErrNotEnabled", err)
+	}
+}
+
+// An enabled provider wins over a browsing fallback for the same name, and the
+// fallback is only consulted for the playlist read: enabling nothing must not
+// turn into searching everything.
+func TestBrowsingProviderIsOnlyForPlaylists(t *testing.T) {
+	registry := NewRegistry(slog.New(slog.DiscardHandler), time.Second)
+	registry.RegisterBrowsing("spotify", func() (Provider, error) { return &fakePlaylistProvider{}, nil })
+
+	if names := registry.Names(); len(names) != 0 {
+		t.Errorf("registered names = %v, want none: browsing is not enabling", names)
+	}
+	results := registry.Search(context.Background(), "anything", SearchOpts{Limit: 5})
+	if len(results) != 0 {
+		t.Errorf("search results = %d, want none from a browsing provider", len(results))
+	}
+
+	enabled := &fakePlaylistProvider{}
+	registry.Register(enabled)
+	if _, err := registry.Playlist(context.Background(), "spotify", "x"); err != nil {
+		t.Fatalf("playlist: %v", err)
+	}
+}
+
+// fakePlaylistProvider answers a playlist, and nothing else.
+type fakePlaylistProvider struct{}
+
+func (f *fakePlaylistProvider) Name() string             { return "spotify" }
+func (f *fakePlaylistProvider) Capabilities() Caps       { return Caps{Playlists: true} }
+func (f *fakePlaylistProvider) Search(context.Context, string, SearchOpts) ([]Track, error) {
+	return nil, nil
+}
+func (f *fakePlaylistProvider) Download(context.Context, string, string) error { return nil }
+func (f *fakePlaylistProvider) SearchPlaylists(context.Context, string, SearchOpts) ([]Playlist, error) {
+	return nil, nil
+}
+
+func (f *fakePlaylistProvider) Playlist(context.Context, string) (*PlaylistDetail, error) {
+	return &PlaylistDetail{
+		Playlist: Playlist{Title: "A playlist"},
+		Tracks:   []Track{{ProviderTrackID: "t1", Title: "A song"}},
+	}, nil
+}

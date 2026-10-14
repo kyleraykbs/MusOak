@@ -229,6 +229,18 @@ func (s *Service) SearchPlaylists(
 	return playlists, problems, nil
 }
 
+// ProviderPlaylistByPlatform reads a playlist the library has never seen, by
+// the id the platform uses for it. It is the same read as ProviderPlaylist with
+// one fewer question asked: a link to a playlist is enough to look at it, and
+// nothing is written on the way - the row appears when somebody imports it.
+func (s *Service) ProviderPlaylistByPlatform(ctx context.Context, providerName, platformPlaylistID string) ([]provider.Track, error) {
+	detail, err := s.providers.Playlist(ctx, providerName, platformPlaylistID)
+	if err != nil {
+		return nil, fmt.Errorf("read playlist %s/%s: %w", providerName, platformPlaylistID, err)
+	}
+	return detail.Tracks, nil
+}
+
 // ProviderPlaylist reads a platform playlist as it stands: its metadata and the
 // tracks in the provider's own order, straight from the provider.
 //

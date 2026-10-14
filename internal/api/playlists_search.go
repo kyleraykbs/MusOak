@@ -3,9 +3,11 @@ package api
 import (
 	"context"
 	"net/http"
+	"strings"
 
 	"github.com/google/uuid"
 
+	"github.com/kyleraykbs/MusOak/internal/provider"
 	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
@@ -85,19 +87,10 @@ type providerTrackResponse struct {
 	ArtworkURL      string   `json:"artworkUrl,omitempty"`
 }
 
-// handleProviderPlaylist shows a platform playlist as the provider has it, and
-// writes nothing: it is the page that opens when somebody clicks a playlist in
-// search, which must show the songs rather than start an import.
-func (s *Server) handleProviderPlaylist(w http.ResponseWriter, r *http.Request) {
-	playlistID, ok := s.playlistID(w, r)
-	if !ok {
-		return
-	}
-	playlist, tracks, err := s.library.ProviderPlaylist(r.Context(), playlistID)
-	if err != nil {
-		writeLibraryError(w, err)
-		return
-	}
+// providerTracksJSON shapes provider tracks for a browse: what a page shows,
+// with no library id on any of them, because none exists until the playlist is
+// imported.
+func providerTracksJSON(tracks []provider.Track) []providerTrackResponse {
 	out := make([]providerTrackResponse, 0, len(tracks))
 	for _, track := range tracks {
 		out = append(out, providerTrackResponse{
@@ -108,6 +101,45 @@ func (s *Server) handleProviderPlaylist(w http.ResponseWriter, r *http.Request) 
 			ArtworkURL:      track.ArtworkURL,
 		})
 	}
+	return out
+}
+
+// handleProviderPlaylist shows a platform playlist as the provider has it, and
+// writes nothing: it is the page that opens when somebody clicks a playlist in
+// search, which must show the songs rather than start an import.
+//
+// The playlist can be named two ways, because a click out of search carries one
+// and a pasted link carries the other: the id of the library's row for it, or -
+// with `provider` - the platform's own id, which the library may never have
+// seen. Either way the tracks are read live.
+func (s *Server) handleProviderPlaylist(w http.ResponseWriter, r *http.Request) {
+	if providerName := strings.TrimSpace(r.URL.Query().Get("provider")); providerName != "" {
+		id := strings.TrimSpace(r.PathValue("playlistId"))
+		if id == "" {
+			writeError(w, http.StatusBadRequest, "a playlist id is required")
+			return
+		}
+		tracks, err := s.library.ProviderPlaylistByPlatform(r.Context(), providerName, id)
+		if err != nil {
+			writeLibraryError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"playlist": map[string]any{"provider": providerName, "providerPlaylistId": id},
+			"tracks":   providerTracksJSON(tracks),
+		})
+		return
+	}
+
+	playlistID, ok := s.playlistID(w, r)
+	if !ok {
+		return
+	}
+	playlist, tracks, err := s.library.ProviderPlaylist(r.Context(), playlistID)
+	if err != nil {
+		writeLibraryError(w, err)
+		return
+	}
 	shaped, err := s.buildPlaylist(r.Context(), playlist)
 	if err != nil {
 		writeStoreError(w, err, "playlist read failed")
@@ -115,7 +147,7 @@ func (s *Server) handleProviderPlaylist(w http.ResponseWriter, r *http.Request) 
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"playlist": shaped,
-		"tracks":   out,
+		"tracks":   providerTracksJSON(tracks),
 	})
 }
 

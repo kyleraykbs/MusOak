@@ -165,6 +165,16 @@ func (s *Server) registerProviders() {
 			s.logger,
 		))
 	}
+	// A Spotify playlist is importable whether or not Spotify is one of this
+	// server's providers: its public playlists are read from the embed page,
+	// which needs no account, and those names are all an import needs to find
+	// the same songs somewhere playable. Credentials, when the config has them,
+	// are used - the API answers with more than the embed does.
+	if !s.cfg.Providers.Spotify.Enabled {
+		s.providers.RegisterBrowsing("spotify", func() (provider.Provider, error) {
+			return spotify.New(s.cfg.Providers.Spotify.ClientID, s.cfg.Providers.Spotify.ClientSecret, s.logger), nil
+		})
+	}
 }
 
 // logProviderDeps reports missing external tooling at startup instead of on
