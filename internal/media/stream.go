@@ -18,6 +18,15 @@ import (
 // streamChunk is how much of a source is handed on at a time.
 const streamChunk = 32 * 1024
 
+// How long a byte range the download has not reached waits for it, and how
+// often it looks. A player that seeks wants the bytes within a second or it
+// gives up and shows a spinner, so this is short: past it the answer falls back
+// to streaming from the source, which is the old behaviour.
+const (
+	partRangeWait = 20 * time.Second
+	partRangePoll = 50 * time.Millisecond
+)
+
 // Stream answers a request for a variant whose download is still running with
 // the source's own audio, so playback starts now rather than when the whole file
 // has landed. It reports false when there is nothing to stream from - the file
@@ -119,10 +128,19 @@ func (m *Manager) servePartRange(w http.ResponseWriter, r *http.Request, variant
 		return false
 	}
 	if !rangeWithin(r.Header.Get("Range"), info.Size()) {
-		// The download has not written the bytes this asks for yet: a 416 would
-		// only make the player start over, and streaming from the source is what
-		// it did before.
-		return false
+		// The download has not written the bytes this asks for yet. The player
+		// asked for a position, not for the beginning: answering from the source
+		// instead hands it a stream from zero, which cannot be seeked, so it
+		// plays a moment of the start and stalls until the download reaches the
+		// position anyway. Waiting for the bytes is the same wait without the
+		// false start - and the download this page asked for is already running.
+		info, err = m.waitForRange(r.Context(), part, r.Header.Get("Range"), info.Size())
+		if err != nil {
+			return false
+		}
+		if !rangeWithin(r.Header.Get("Range"), info.Size()) {
+			return false
+		}
 	}
 	w.Header().Set("Content-Type", "audio/ogg")
 	w.Header().Set("Cache-Control", "no-store")
@@ -132,6 +150,36 @@ func (m *Manager) servePartRange(w http.ResponseWriter, r *http.Request, variant
 	http.ServeContent(w, r, "", time.Time{}, part)
 	return true
 }
+
+// waitForRange waits for a download to write the bytes a range asks for, up to
+// partRangeWait. It returns the file's information once the range is covered, or
+// an error if it never was - and the caller then streams from the source, which
+// is what this path did before any of this.
+//
+// The wait is bounded because the download can fail: a provider that cannot
+// deliver must not hold a listener's request open for ever.
+func (m *Manager) waitForRange(ctx context.Context, part *os.File, header string, size int64) (os.FileInfo, error) {
+	deadline := time.Now().Add(partRangeWait)
+	for {
+		if rangeWithin(header, size) {
+			return part.Stat()
+		}
+		if time.Now().After(deadline) {
+			return nil, errRangeTooFar
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(partRangePoll):
+		}
+		if info, err := part.Stat(); err == nil {
+			size = info.Size()
+		}
+	}
+}
+
+// errRangeTooFar is a range the download did not reach in time.
+var errRangeTooFar = errors.New("media: the download has not reached that range")
 
 // rangeWithin reports whether a single-range request asks for bytes the file
 // already holds. A suffix range ("-500", the last five hundred bytes) is not

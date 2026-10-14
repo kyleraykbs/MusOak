@@ -376,8 +376,14 @@ func TestStreamAnswersARangeFromTheDownloadedPart(t *testing.T) {
 		t.Errorf("X-Musoak-Stream = %q: a part file is not the rendition this URL names", got)
 	}
 
-	// A range the download has not reached is not answered from it: the source
-	// is streamed instead, which is what this path did for every range before.
+	// Nothing written yet is the other end of it: a range no part file can
+	// cover is not waited for, it falls back to streaming from the source, which
+	// is what this path did for every range before. (Waiting for a range a
+	// download may still write is tested by the case above, whose part file has
+	// the bytes; here there is no file at all.)
+	if err := os.Remove(partPath); err != nil {
+		t.Fatal(err)
+	}
 	response, body = ask("bytes=400-500")
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want the streamed answer", response.StatusCode)
