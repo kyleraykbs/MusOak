@@ -59,7 +59,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 // rendition's download state - so it is held through doLive and that state is
 // asked for again on every read (freshSearchMedia).
 func (s *Server) searchTracksAnswer(r *http.Request, query string, limit int, providers []string) (searchResponse, error) {
-	value, err := s.searches.doLive(searchKey("tracks", query, providers, limit), func() (any, error) {
+	value, err := s.searches.doLive(r.Context(), searchKey("tracks", query, providers, limit), func() (any, error) {
 		// Detached: one caller hanging up must not take a shared answer with it.
 		ctx := context.WithoutCancel(r.Context())
 		results := s.providers.SearchSome(ctx, providers, query, provider.SearchOpts{Limit: limit})

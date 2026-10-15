@@ -158,7 +158,7 @@ func (s *Server) handleAlbumSearch(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	value, err := s.searches.do(searchKey("albums", query, providers, limit), func() (any, error) {
+	value, err := s.searches.do(r.Context(), searchKey("albums", query, providers, limit), func() (any, error) {
 		// Detached: one caller hanging up must not take a shared answer with it.
 		return s.albumSearchAnswer(context.WithoutCancel(r.Context()), query, limit, providers)
 	})
@@ -201,7 +201,7 @@ func (s *Server) handleArtistSearch(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	value, err := s.searches.do(searchKey("artists", query, providers, limit), func() (any, error) {
+	value, err := s.searches.do(r.Context(), searchKey("artists", query, providers, limit), func() (any, error) {
 		return s.artistSearchAnswer(context.WithoutCancel(r.Context()), query, limit, providers)
 	})
 	if err != nil {

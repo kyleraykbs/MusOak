@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"sort"
 	"strconv"
 	"strings"
@@ -60,8 +61,8 @@ func newSearchAnswers(ttl time.Duration, max int) *searchAnswers {
 }
 
 // do runs fn for the key, unless its answer is already here or on its way.
-func (c *searchAnswers) do(key string, fn func() (any, error)) (any, error) {
-	return c.doLive(key, fn, nil)
+func (c *searchAnswers) do(ctx context.Context, key string, fn func() (any, error)) (any, error) {
+	return c.doLive(ctx, key, fn, nil)
 }
 
 // doLive is do for an answer that carries something live: the window holds the
@@ -75,7 +76,12 @@ func (c *searchAnswers) do(key string, fn func() (any, error)) (any, error) {
 // gets. It must return a copy, never the held value: several readers can be
 // served the same held answer at once. A nil restamp serves the answer as it
 // stands, which is what do does.
-func (c *searchAnswers) doLive(key string, fn func() (any, error), restamp func(any) any) (any, error) {
+//
+// ctx is the caller's own patience, and bounds only the *waiting*: an ask that
+// joins somebody else's in-flight question stops waiting when its own client is
+// gone. The work itself is not called off with it - whoever asked first is
+// still waiting for that answer, and a search costs a provider process.
+func (c *searchAnswers) doLive(ctx context.Context, key string, fn func() (any, error), restamp func(any) any) (any, error) {
 	for {
 		c.mu.Lock()
 		entry, seen := c.entries[key]
@@ -89,10 +95,17 @@ func (c *searchAnswers) doLive(key string, fn func() (any, error), restamp func(
 		}
 		if seen && entry.done != nil {
 			// Somebody is already asking. Wait for their answer rather than
-			// spending a second provider call on the same question.
+			// spending a second provider call on the same question - but not
+			// past this caller's own patience: a client that has gone has no
+			// use for the answer, and a question that never lands must not
+			// hold every asker behind it until the connection times out.
 			done := entry.done
 			c.mu.Unlock()
-			<-done
+			select {
+			case <-done:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 			continue
 		}
 		entry = &searchEntry{done: make(chan struct{})}

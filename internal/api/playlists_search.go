@@ -43,7 +43,7 @@ func (s *Server) handlePlaylistSearch(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	value, err := s.searches.do(searchKey("playlists", query, providers, limit), func() (any, error) {
+	value, err := s.searches.do(r.Context(), searchKey("playlists", query, providers, limit), func() (any, error) {
 		// Detached: one caller hanging up must not take a shared answer with it.
 		return s.playlistSearchAnswer(context.WithoutCancel(r.Context()), query, limit, providers)
 	})

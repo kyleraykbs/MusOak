@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -19,7 +20,7 @@ func TestSearchAnswersShareTheAskInFlight(t *testing.T) {
 	release := make(chan struct{})
 	first := make(chan any, 1)
 	go func() {
-		value, _ := cache.do("q", func() (any, error) {
+		value, _ := cache.do(context.Background(), "q", func() (any, error) {
 			calls.Add(1)
 			<-release
 			return "answer", nil
@@ -40,7 +41,7 @@ func TestSearchAnswersShareTheAskInFlight(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			value, err := cache.do("q", func() (any, error) {
+			value, err := cache.do(context.Background(), "q", func() (any, error) {
 				calls.Add(1)
 				return "second", nil
 			})
@@ -79,8 +80,8 @@ func TestSearchAnswersHoldTheAnswerForTheWindow(t *testing.T) {
 		calls.Add(1)
 		return calls.Load(), nil
 	}
-	first, _ := cache.do("q", ask)
-	second, _ := cache.do("q", ask)
+	first, _ := cache.do(context.Background(), "q", ask)
+	second, _ := cache.do(context.Background(), "q", ask)
 	if first != second {
 		t.Errorf("answers differ inside the window: %v then %v", first, second)
 	}
@@ -89,7 +90,7 @@ func TestSearchAnswersHoldTheAnswerForTheWindow(t *testing.T) {
 	}
 
 	time.Sleep(60 * time.Millisecond)
-	third, _ := cache.do("q", ask)
+	third, _ := cache.do(context.Background(), "q", ask)
 	if third == first {
 		t.Errorf("answer %v still held past the window", third)
 	}
@@ -106,14 +107,14 @@ func TestSearchAnswersDoNotHoldFailures(t *testing.T) {
 	boom := errors.New("provider down")
 
 	var calls atomic.Int32
-	first, err := cache.do("q", func() (any, error) {
+	first, err := cache.do(context.Background(), "q", func() (any, error) {
 		calls.Add(1)
 		return nil, boom
 	})
 	if !errors.Is(err, boom) || first != nil {
 		t.Fatalf("first ask = %v, %v", first, err)
 	}
-	second, err := cache.do("q", func() (any, error) {
+	second, err := cache.do(context.Background(), "q", func() (any, error) {
 		calls.Add(1)
 		return "recovered", nil
 	})
@@ -130,7 +131,7 @@ func TestSearchAnswersStayBounded(t *testing.T) {
 	cache := newSearchAnswers(time.Minute, 4)
 	for i := range 20 {
 		key := string(rune('a' + i))
-		if _, err := cache.do(key, func() (any, error) { return key, nil }); err != nil {
+		if _, err := cache.do(context.Background(), key, func() (any, error) { return key, nil }); err != nil {
 			t.Fatalf("ask %s: %v", key, err)
 		}
 	}
@@ -177,7 +178,7 @@ func TestSearchAnswersRestampLiveAnswersOnEveryRead(t *testing.T) {
 	}
 	restamp := func(held any) any { return held.(string) + "+live" }
 
-	first, err := cache.doLive("q", ask, restamp)
+	first, err := cache.doLive(context.Background(), "q", ask, restamp)
 	if err != nil {
 		t.Fatalf("first read: %v", err)
 	}
@@ -187,7 +188,7 @@ func TestSearchAnswersRestampLiveAnswersOnEveryRead(t *testing.T) {
 		t.Errorf("first read = %v, want the fresh answer", first)
 	}
 
-	second, err := cache.doLive("q", ask, restamp)
+	second, err := cache.doLive(context.Background(), "q", ask, restamp)
 	if err != nil {
 		t.Fatalf("second read: %v", err)
 	}
@@ -198,7 +199,7 @@ func TestSearchAnswersRestampLiveAnswersOnEveryRead(t *testing.T) {
 		t.Errorf("provider calls = %d, want the ask held", got)
 	}
 
-	if got, err := cache.do("q", ask); err != nil || got != "held" {
+	if got, err := cache.do(context.Background(), "q", ask); err != nil || got != "held" {
 		t.Errorf("do = %v, %v, want the held answer untouched", got, err)
 	}
 	if got := calls.Load(); got != 1 {
