@@ -24,3 +24,17 @@ Open, both needing input from Kyle:
   clientId/clientSecret at it and re-run `go test ./internal/provider/...`.
 - The NixOS/HM modules evaluate and build, but nothing wires them into the
   system flake yet; that is a `clan machines update <name>` away, by his call.
+
+## The reliability audit's backend findings (2026-10-15)
+
+- [x] `internal/api/searchanswers.go`: a waiter's own context bounds its wait,
+      so a client that has gone stops waiting for somebody else's answer.
+- [x] `internal/provider/provider.go`: `Album`, `ArtistAlbums` and `Playlist`
+      carry a per-provider deadline, as the fan-outs already did.
+- [x] `internal/api/playlists.go`: the playlist detail is one batched read for
+      the whole list (`TracksFor` + `buildTracks`), not three queries a song.
+- [ ] Declined, on purpose: batching the album and artist search rows'
+      detail reads. It needs `AlbumVariantsFor` and a track-count read added to
+      the narrow store interface, and what it saves is local SQLite point reads
+      measured against a provider fan-out in the same handler - seconds against
+      milliseconds. The measurement, not the principle, is why it stays.

@@ -286,3 +286,24 @@
 - Decision: the room's `master` no longer contains the current item. `beginLocked` splices it off the head as it becomes current, and `recomputeMasterLocked` excludes it while interleaving the pending queues by a fairness ledger (least songs heard first, then longest waiting, then join order) instead of the old fixed pass-per-member round robin.
 - Why: the old rebuild ran around the in-flight song, so a queue edit mid-song placed fresh items ahead of the song on — one member's songs showed (and prefetched) wrongly and played twice in a row after it ended ("two of my songs before my friend's"). The ledger reproduces the old order in the no-edit case and alternates correctly after a mid-song edit.
 - Reversible: yes (clients tolerate both shapes: the web slices/filters at the current id, the SDK's Pending filters it out).
+
+## [2026-10-15] A shared search answer's waiter is bounded by its own context
+- Decision: `searchAnswers.do`/`doLive` take the caller's context and select on it while waiting for somebody else's in-flight answer; the work itself still runs under `context.WithoutCancel`.
+- Why: a bare `<-done` meant a client that had hung up waited for an answer it would never read, and a question that never landed held every asker behind it. The cancellation applies to the waiting only: whoever asked first is still owed the answer, and the fan-out is a provider process.
+- Also: the leader was left unbounded on purpose. Its provider calls already carry `ProviderTimeout` (15 s each) and what follows is local matching, so a separate deadline here would be a knob with nothing behind it.
+- Reversible: yes
+
+## [2026-10-15] The single-provider fetches carry a provider deadline
+- Decision: `Registry.Album`, `ArtistAlbums` and `Playlist` wrap the call in `context.WithTimeout(ctx, r.timeout)`, exactly as `searchArtists` and the other fan-outs do.
+- Why: a provider that accepts the call and never answers held the request - and the artist sync behind it - until the client gave up, which is the one shape a per-provider timeout exists to stop.
+- Reversible: yes
+
+## [2026-10-15] The playlist detail is read in a batch
+- Decision: `writePlaylistDetail` loads the entries' tracks with one `TracksFor` and builds them with `buildTracks`, instead of `Track` + `TrackArtists` + `TrackAlbums` + artwork per entry.
+- Why: a playlist is the longest list the API renders, and it cost 2N+ round trips. The single-track artwork fallback (a header read before the cover was learned) is kept for the entries the batch leaves bare, so nothing is lost to the batching.
+- Reversible: yes
+
+## [2026-10-15] The album and artist search rows keep their per-row detail read
+- Decision: the N+1 in `albumSearchAnswer`/`artistSearchAnswer` stays. It is recorded in `agents/TODO.md` as declined.
+- Why: removing it needs `AlbumVariantsFor` and a track count added to the narrow store interface, and it saves local SQLite point reads - milliseconds - in a handler whose cost is a provider fan-out of seconds. Surface area in the store has to be paid for by something measurable.
+- Reversible: yes (the batch methods can be added whenever a slower store or a bigger page makes it worth it)
