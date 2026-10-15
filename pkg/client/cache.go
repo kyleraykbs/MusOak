@@ -22,6 +22,24 @@ type Cache struct {
 
 	mu    sync.Mutex
 	index map[string]CacheEntry
+	// tracks answers "do I hold a rendition of this track" without walking
+	// every entry: the participant asks it once per upcoming song while it
+	// warms, and the old walk stat'd every file under the lock to find one.
+	tracks map[string]string
+
+	// flightMu guards flights, the downloads in progress. Two callers asking
+	// for one variant share a single transfer instead of racing each other
+	// onto the same temp path and renaming a half-written file into place.
+	flightMu sync.Mutex
+	flights  map[string]*fetchFlight
+}
+
+// fetchFlight is one variant's download, shared by every caller that asked for
+// it while it ran.
+type fetchFlight struct {
+	done  chan struct{}
+	entry CacheEntry
+	err   error
 }
 
 // CacheEntry is one cached rendition.
@@ -40,7 +58,12 @@ func OpenCache(dir string) (*Cache, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("musoak: create cache dir: %w", err)
 	}
-	cache := &Cache{dir: dir, index: map[string]CacheEntry{}}
+	cache := &Cache{
+		dir:     dir,
+		index:   map[string]CacheEntry{},
+		tracks:  map[string]string{},
+		flights: map[string]*fetchFlight{},
+	}
 	if err := cache.load(); err != nil {
 		return nil, err
 	}
@@ -66,6 +89,9 @@ func (c *Cache) load() error {
 	}
 	for _, entry := range entries {
 		c.index[entry.VariantID] = entry
+		if entry.TrackID != "" {
+			c.tracks[entry.TrackID] = entry.VariantID
+		}
 	}
 	return nil
 }
@@ -106,20 +132,21 @@ func (c *Cache) Lookup(variantID string) (CacheEntry, bool) {
 	return entry, true
 }
 
-// LookupTrack returns a cached rendition of a track, if there is one.
+// LookupTrack returns a cached rendition of a track, if there is one. The
+// track index answers in one step, and the file is checked outside the lock so
+// a stat cannot hold up a download or an index write.
 func (c *Cache) LookupTrack(trackID string) (CacheEntry, bool) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	for _, entry := range c.index {
-		if entry.TrackID != trackID {
-			continue
-		}
-		if _, err := os.Stat(entry.Path); err != nil {
-			continue
-		}
-		return entry, true
+	variantID, ok := c.tracks[trackID]
+	entry := c.index[variantID]
+	c.mu.Unlock()
+	if !ok {
+		return CacheEntry{}, false
 	}
-	return CacheEntry{}, false
+	if _, err := os.Stat(entry.Path); err != nil {
+		return CacheEntry{}, false
+	}
+	return entry, true
 }
 
 // Entries lists everything the cache holds.
@@ -145,16 +172,48 @@ func (c *Cache) Put(entry CacheEntry) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.index[entry.VariantID] = entry
+	if entry.TrackID != "" {
+		c.tracks[entry.TrackID] = entry.VariantID
+	}
 	return c.save()
 }
 
 // Fetch makes sure a variant is on disk and returns its entry. Concurrent
-// calls for the same variant share one download.
+// calls for the same variant share one download: two transfers of one
+// rendition would otherwise race onto the same temp path and could rename a
+// half-written file into place as if it were the whole thing.
 func (c *Cache) Fetch(ctx context.Context, api *Client, variantID string) (CacheEntry, error) {
 	if entry, ok := c.Lookup(variantID); ok {
 		return entry, nil
 	}
 
+	c.flightMu.Lock()
+	if flight, ok := c.flights[variantID]; ok {
+		c.flightMu.Unlock()
+		select {
+		case <-flight.done:
+			return flight.entry, flight.err
+		case <-ctx.Done():
+			return CacheEntry{}, ctx.Err()
+		}
+	}
+	flight := &fetchFlight{done: make(chan struct{})}
+	c.flights[variantID] = flight
+	c.flightMu.Unlock()
+
+	flight.entry, flight.err = c.fetch(ctx, api, variantID)
+	close(flight.done)
+
+	c.flightMu.Lock()
+	delete(c.flights, variantID)
+	c.flightMu.Unlock()
+
+	return flight.entry, flight.err
+}
+
+// fetch performs one download of a variant into a private temp file, renaming
+// it into place only once the server's checksum matches.
+func (c *Cache) fetch(ctx context.Context, api *Client, variantID string) (CacheEntry, error) {
 	status, err := api.StartDownloadAndWait(ctx, variantID)
 	if err != nil {
 		return CacheEntry{}, err
@@ -164,14 +223,27 @@ func (c *Cache) Fetch(ctx context.Context, api *Client, variantID string) (Cache
 	}
 
 	final := c.Path(variantID)
-	tmp := final + ".part"
+	// The temp name is unique per download. A stale .part left by a crashed
+	// run, or a second download of the same variant, must never be able to
+	// write the file another one is about to rename into place.
+	tmp, err := os.CreateTemp(c.dir, variantID+".part-*")
+	if err != nil {
+		return CacheEntry{}, fmt.Errorf("musoak: create temp rendition: %w", err)
+	}
+	tmpName := tmp.Name()
+
 	sum, size, err := c.download(ctx, api, variantID, tmp)
 	if err != nil {
-		_ = os.Remove(tmp)
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 		return CacheEntry{}, err
 	}
-	if err := os.Rename(tmp, final); err != nil {
-		_ = os.Remove(tmp)
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return CacheEntry{}, fmt.Errorf("musoak: close temp rendition: %w", err)
+	}
+	if err := os.Rename(tmpName, final); err != nil {
+		_ = os.Remove(tmpName)
 		return CacheEntry{}, fmt.Errorf("musoak: store rendition: %w", err)
 	}
 
@@ -189,9 +261,9 @@ func (c *Cache) Fetch(ctx context.Context, api *Client, variantID string) (Cache
 	return entry, nil
 }
 
-// download streams a variant to path and verifies the sha256 the server
+// download streams a variant into file and verifies the sha256 the server
 // advertised, so a truncated or corrupted transfer is never cached.
-func (c *Cache) download(ctx context.Context, api *Client, variantID, path string) (string, int64, error) {
+func (c *Cache) download(ctx context.Context, api *Client, variantID string, file *os.File) (string, int64, error) {
 	resp, err := api.mediaResponse(ctx, variantID)
 	if err != nil {
 		return "", 0, err
@@ -205,12 +277,6 @@ func (c *Cache) download(ctx context.Context, api *Client, variantID, path strin
 	if resp.Header.Get("X-Musoak-Stream") != "" {
 		return "", 0, fmt.Errorf("musoak: variant %s came back as a stream, not the stored rendition", variantID)
 	}
-
-	file, err := os.Create(path)
-	if err != nil {
-		return "", 0, fmt.Errorf("musoak: create %s: %w", path, err)
-	}
-	defer file.Close()
 
 	hash := sha256.New()
 	size, err := io.Copy(io.MultiWriter(file, hash), resp.Body)

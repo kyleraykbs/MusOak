@@ -3,11 +3,18 @@ package client
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"sync"
 	"time"
 )
+
+// mediaIdleTimeout is how long a media transfer may go without a byte before
+// it is treated as dead. The media GET deliberately drops the request timeout
+// because a rendition is large, so without this a server that stalls mid-file
+// leaves the copy waiting forever.
+const mediaIdleTimeout = 30 * time.Second
 
 // mediaResponse performs the media GET and returns the raw response, so
 // callers can see the ETag as well as the body.
@@ -29,7 +36,37 @@ func (c *Client) mediaResponse(ctx context.Context, variantID string) (*http.Res
 		defer resp.Body.Close()
 		return nil, decodeError(resp)
 	}
+	resp.Body = newIdleBody(resp.Body, mediaIdleTimeout)
 	return resp, nil
+}
+
+// idleBody fails a read once the stream has been silent for the timeout: the
+// watchdog closes the underlying body, which unblocks whatever read is
+// waiting. Every byte that arrives pushes the deadline back, so it measures a
+// stall, not how long the whole rendition takes.
+type idleBody struct {
+	body    io.ReadCloser
+	timeout time.Duration
+	watch   *time.Timer
+}
+
+func newIdleBody(body io.ReadCloser, timeout time.Duration) *idleBody {
+	idle := &idleBody{body: body, timeout: timeout}
+	idle.watch = time.AfterFunc(timeout, func() { _ = body.Close() })
+	return idle
+}
+
+func (b *idleBody) Read(p []byte) (int, error) {
+	n, err := b.body.Read(p)
+	if n > 0 {
+		b.watch.Reset(b.timeout)
+	}
+	return n, err
+}
+
+func (b *idleBody) Close() error {
+	b.watch.Stop()
+	return b.body.Close()
 }
 
 // Sink plays a rendition. The CLI's sink drives a local player; a Discord
@@ -87,6 +124,11 @@ const (
 
 	// warmConcurrency is how many prefetches may run at once.
 	warmConcurrency = 2
+
+	// maxResyncBackoff caps how long a repeated clock-resync failure waits
+	// before trying again, so a server that is down is not asked once every
+	// resyncEvery forever.
+	maxResyncBackoff = 2 * time.Minute
 )
 
 // Participant follows a room on behalf of one member. The server is the room's
@@ -103,6 +145,9 @@ type Participant struct {
 	clockSamples   int
 	resyncEvery    time.Duration
 	driftTolerance int64
+	// resyncBackoff is how long the next clock-resync attempt waits after a
+	// run of failures; zero means the normal interval.
+	resyncBackoff time.Duration
 
 	OnEvent func(Event)
 	OnTrack func(SinkTrack)
@@ -206,11 +251,15 @@ var ErrRoomClosed = errors.New("musoak: the room closed")
 // Run follows the room until ctx ends, the room closes, or the connection to
 // it drops.
 func (p *Participant) Run(ctx context.Context) error {
-	offset, err := p.room.client.ClockOffset(ctx, p.clockSamples)
-	if err != nil {
-		return err
+	// A failed estimate at boot is not a reason to refuse the room: the offset
+	// only has to be close for the follower rule, and the resync fixes it. The
+	// old code returned here, so one failed dial meant the participant never
+	// started at all.
+	if offset, err := p.room.client.ClockOffset(ctx, p.clockSamples); err != nil {
+		p.logger.Warn("participant: initial clock sync failed; starting with the local clock", "error", err)
+	} else {
+		p.setOffset(offset)
 	}
-	p.setOffset(offset)
 
 	events, err := p.room.Events(ctx)
 	if err != nil {
@@ -226,7 +275,7 @@ func (p *Participant) Run(ctx context.Context) error {
 
 	drift := time.NewTicker(time.Second)
 	defer drift.Stop()
-	resync := time.NewTicker(p.resyncEvery)
+	resync := time.NewTimer(p.resyncEvery)
 	defer resync.Stop()
 
 	for {
@@ -254,14 +303,38 @@ func (p *Participant) Run(ctx context.Context) error {
 		case <-drift.C:
 			p.reconcile(ctx)
 		case <-resync.C:
-			if offset, err := p.room.client.ClockOffset(ctx, 3); err == nil {
-				p.setOffset(offset)
-			}
+			resync.Reset(p.resyncClock(ctx))
 		}
 	}
 }
 
-// adopt takes the room as the snapshot has it.
+// resyncClock re-estimates the offset and returns how long to wait before the
+// next attempt. A failed dial keeps the last good offset - the estimate only
+// has to be close - and backs off, instead of dialling the socket every
+// resyncEvery while the server is unreachable.
+func (p *Participant) resyncClock(ctx context.Context) time.Duration {
+	offset, err := p.room.client.ClockOffset(ctx, 3)
+	if err == nil {
+		p.setOffset(offset)
+		p.mu.Lock()
+		p.resyncBackoff = 0
+		p.mu.Unlock()
+		return p.resyncEvery
+	}
+	p.logger.Warn("participant: clock resync failed; keeping the last offset", "error", err)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.resyncBackoff == 0 {
+		p.resyncBackoff = p.resyncEvery
+	} else {
+		p.resyncBackoff *= 2
+	}
+	if p.resyncBackoff > maxResyncBackoff {
+		p.resyncBackoff = maxResyncBackoff
+	}
+	return p.resyncBackoff
+}
+
 // adopt takes a newer room snapshot, never replacing a socket event that
 // arrived after the request began.
 func (p *Participant) adopt(room *Room) {
@@ -288,7 +361,10 @@ func (p *Participant) apply(ctx context.Context, event Event) bool {
 		seq := p.lastSeq
 		p.mu.Unlock()
 		p.logger.Warn("participant: missed room events, resyncing", "last_seq", seq, "event_seq", event.Seq)
-		if snapshot, err := p.room.Snapshot(context.Background()); err == nil {
+		// The live ctx, not a fresh background one: a dead server must not
+		// freeze the loop past the caller's deadline - or ignore Ctrl-C - for
+		// as long as the request timeout.
+		if snapshot, err := p.room.Snapshot(ctx); err == nil {
 			p.adopt(snapshot)
 		}
 		return true
@@ -434,10 +510,16 @@ func (p *Participant) startAt(current *RoomPlayback) int64 {
 	return current.PositionAt(p.serverNow() + latency)
 }
 
-// load puts the room's song on the sink at the given position, fetching the file
-// first when this client does not hold one. If a fresh file, the load is timed
-// from issue through to the sink actually playing and the estimate is smoothed,
-// so the next load can be started in time to land on the room's beat.
+// load puts the room's song on the sink at the given position, from a file this
+// client already holds. It never fetches: it runs on the event and drift loop,
+// and a fetch here is the server fetching from its provider plus a whole-file
+// download - seconds to minutes in which no event, no drift correction and no
+// command would be read, and the socket back-fills until the server drops the
+// member. Warming is what fetches; a song that is not on disk yet is left for
+// the next beat, by which time warm has put it there. If a fresh file, the
+// load is timed from issue through to the sink actually playing and the
+// estimate is smoothed, so the next load can be started in time to land on the
+// room's beat.
 func (p *Participant) load(ctx context.Context, current *RoomPlayback, expected int64) {
 	item := current.Item
 	p.mu.Lock()
@@ -447,12 +529,12 @@ func (p *Participant) load(ctx context.Context, current *RoomPlayback, expected 
 
 	var issuedAt time.Time
 	if !sameFile {
-		issuedAt = time.Now()
-		entry, err := p.ensureTrack(ctx, item.TrackID)
-		if err != nil {
-			p.logger.Warn("participant: could not load the room's song", "track", item.TrackID, "error", err)
+		entry, ok := p.cache.LookupTrack(item.TrackID)
+		if !ok {
+			p.warm(ctx, item.TrackID)
 			return
 		}
+		issuedAt = time.Now()
 		p.setLocal(&localPlayback{itemID: item.ID, trackID: item.TrackID, entry: entry})
 		local = p.local()
 	}

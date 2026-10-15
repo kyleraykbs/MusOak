@@ -2,7 +2,10 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sync"
@@ -186,5 +189,58 @@ func TestARoomSeekIsFollowedHoweverFar(t *testing.T) {
 	}
 	if got := seeks[len(seeks)-1]; got < 89_000 || got > 93_000 {
 		t.Fatalf("seeked to %d, want the room's new position", got)
+	}
+}
+
+// A fetch on the reconcile loop freezes event processing, drift correction and
+// every command for as long as the server takes to fetch from its provider and
+// hand over the whole file. reconcile must act only on what is already on disk
+// and leave the fetching to warm.
+func TestReconcileDoesNotFetchOnTheLoop(t *testing.T) {
+	release := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/tracks/t1/variants", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"variants": []map[string]any{{"id": "v1", "downloadable": true}},
+		})
+	})
+	mux.HandleFunc("/api/v1/media/v1/download", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(MediaStatus{VariantID: "v1", State: MediaReady})
+	})
+	// The download the old code performed on the loop; this one does not
+	// finish while the test is watching.
+	mux.HandleFunc("/api/v1/media/v1", func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	defer close(release)
+
+	cache, err := OpenCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &idleSink{}
+	room := &RoomClient{client: New(server.URL), RoomID: "r1", MemberID: "m1"}
+	participant := NewParticipant(room, cache, sink, slog.New(slog.DiscardHandler))
+
+	item := QueueItem{ID: "item-1", TrackID: "t1", DurationMs: 300_000}
+	participant.adopt(&Room{
+		ID: "r1", Seq: 1, ServerNowMs: time.Now().UnixMilli(),
+		Current: &RoomPlayback{Item: item, Started: true, DurationMs: 300_000},
+	})
+
+	done := make(chan struct{})
+	go func() {
+		participant.reconcile(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("reconcile blocked on a fetch; it must act only on what is already on disk")
+	}
+	if played := sink.played(); len(played) != 0 {
+		t.Fatalf("reconcile played a song that was never fetched: %+v", played)
 	}
 }

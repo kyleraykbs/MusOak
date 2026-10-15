@@ -645,9 +645,6 @@ func TestAQueueChangeIsAppliedNotRefetched(t *testing.T) {
 	}
 }
 
-// A song queued while something else plays must be on disk before the room
-// reaches it: warming only when the current song changes leaves the download
-// on the critical path of the transition, which is heard as a wait.
 // A client that buffers audio is behind the room by design. Correcting that
 // with a seek is correcting the buffer: the tolerance has to cover the buffer.
 func TestTheDriftToleranceCoversTheCallersBuffer(t *testing.T) {
@@ -684,6 +681,9 @@ func TestTheDriftToleranceCoversTheCallersBuffer(t *testing.T) {
 	})
 }
 
+// A song queued while something else plays must be on disk before the room
+// reaches it: warming only when the current song changes leaves the download
+// on the critical path of the transition, which is heard as a wait.
 func TestASongQueuedMidTrackIsFetchedBeforeItPlays(t *testing.T) {
 	ctx := context.Background()
 	apiClient := newServer(t, nil)

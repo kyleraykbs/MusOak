@@ -10,8 +10,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -131,14 +133,53 @@ func asAPIError(err error, target **APIError) bool {
 	return false
 }
 
+// Retry bounds. An idempotent GET is tried this many times before its error is
+// returned, and the wait between attempts doubles from retryBaseDelay with
+// jitter, so a fleet that failed together does not come back together.
+const (
+	maxAttempts    = 3
+	retryBaseDelay = 100 * time.Millisecond
+)
+
 // do performs a request and decodes the JSON response into out (when non-nil).
+// An idempotent GET is retried on a transport failure or a 429/5xx, so a
+// momentary blip does not fail the caller outright.
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
-	var reader io.Reader
+	var raw []byte
 	if body != nil {
-		raw, err := json.Marshal(body)
-		if err != nil {
+		var err error
+		if raw, err = json.Marshal(body); err != nil {
 			return err
 		}
+	}
+	hasBody := body != nil
+
+	attempts := 1
+	if method == http.MethodGet {
+		attempts = maxAttempts
+	}
+	var lastErr error
+	for attempt := range attempts {
+		if attempt > 0 {
+			if err := sleepBackoff(ctx, attempt); err != nil {
+				return err
+			}
+		}
+		lastErr = c.attempt(ctx, method, path, raw, hasBody, out)
+		if lastErr == nil {
+			return nil
+		}
+		if attempt+1 < attempts && !isRetryable(lastErr) {
+			return lastErr
+		}
+	}
+	return lastErr
+}
+
+// attempt is one try of do's request.
+func (c *Client) attempt(ctx context.Context, method, path string, raw []byte, hasBody bool, out any) error {
+	var reader io.Reader
+	if raw != nil {
 		reader = bytes.NewReader(raw)
 	}
 
@@ -146,7 +187,7 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	if err != nil {
 		return err
 	}
-	if body != nil {
+	if hasBody {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	c.decorate(req)
@@ -171,6 +212,34 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 		return fmt.Errorf("musoak: decode %s %s: %w", method, path, err)
 	}
 	return nil
+}
+
+// isRetryable reports whether a failed GET is worth another try: a transport
+// failure (the request may never have landed) or a server that says it is
+// busy (429) or broken (5xx). A caller's own cancellation is not.
+func isRetryable(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Status == http.StatusTooManyRequests || apiErr.Status >= 500
+	}
+	return true
+}
+
+// sleepBackoff waits before retry attempt n, jittered around a doubling delay.
+func sleepBackoff(ctx context.Context, attempt int) error {
+	delay := retryBaseDelay << (attempt - 1)
+	wait := delay/2 + time.Duration(rand.Int64N(int64(delay)+1))
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (c *Client) decorate(req *http.Request) {
