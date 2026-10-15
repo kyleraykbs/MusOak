@@ -42,6 +42,11 @@ type mpvProcess struct {
 	nextID  int
 	pending map[int]chan mpvMessage
 
+	// writeMu serialises socket writes. IPC messages are newline-delimited
+	// frames, and the status refresh fires a burst of commands at the same
+	// time as a playback one, so two writes must never interleave.
+	writeMu sync.Mutex
+
 	events chan mpvMessage
 	closed chan struct{}
 	once   sync.Once
@@ -146,10 +151,30 @@ func (m *mpvProcess) readLoop() {
 		select {
 		case m.events <- message:
 		default:
-			m.logger.Debug("mpv: dropping event", "event", message.Event)
+			if terminalMpvEvent(message.Event) {
+				// A terminal event is one a consumer may be blocked on:
+				// waitForEnd cannot recover from a dropped end-file until the
+				// room's next beat. Make room by discarding the oldest waiting
+				// event, which is only ever status noise, and take this one.
+				select {
+				case <-m.events:
+				default:
+				}
+				m.events <- message
+				m.logger.Debug("mpv: dropped an event for a terminal one", "event", message.Event)
+			} else {
+				m.logger.Debug("mpv: dropping event", "event", message.Event)
+			}
 		}
 	}
 	m.shutdown()
+}
+
+// terminalMpvEvent is an event a consumer is waiting on rather than sampling:
+// losing end-file strands waitForEnd, so these are never the events the drop
+// policy takes.
+func terminalMpvEvent(name string) bool {
+	return name == "end-file" || name == "error"
 }
 
 func (m *mpvProcess) shutdown() {
@@ -180,8 +205,8 @@ func (m *mpvProcess) command(ctx context.Context, args ...any) (json.RawMessage,
 	if err != nil {
 		return nil, err
 	}
-	if _, err := m.conn.Write(append(payload, '\n')); err != nil {
-		return nil, fmt.Errorf("musoak: mpv write: %w", err)
+	if _, err := m.write(payload); err != nil {
+		return nil, err
 	}
 
 	select {
@@ -195,6 +220,18 @@ func (m *mpvProcess) command(ctx context.Context, args ...any) (json.RawMessage,
 		}
 		return message.Data, nil
 	}
+}
+
+// write frames one IPC message and sends it, holding the write lock so
+// concurrent commands cannot interleave their bytes on the stream.
+func (m *mpvProcess) write(payload []byte) (int, error) {
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+	written, err := m.conn.Write(append(payload, '\n'))
+	if err != nil {
+		return written, fmt.Errorf("musoak: mpv write: %w", err)
+	}
+	return written, nil
 }
 
 // property reads a property as JSON.
@@ -289,18 +326,22 @@ func (m *mpvProcess) waitForEnd(ctx context.Context) error {
 	}
 }
 
+// close asks mpv to quit, then waits for the process the start goroutine
+// already reaps. The signal firing is the same whether mpv exited or the
+// readLoop saw the socket close, so the fallback kill can never reach an mpv
+// that is already on its way out.
 func (m *mpvProcess) close() {
 	if m.cmd == nil || m.cmd.Process == nil {
 		return
 	}
-	_, _ = m.command(context.Background(), "quit")
-	done := make(chan struct{})
-	go func() {
-		_ = m.cmd.Wait()
-		close(done)
-	}()
+	// mpv usually exits before it can answer, so the reply is best-effort and
+	// bounded; this must not outlast the wait below.
+	quitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	_, _ = m.command(quitCtx, "quit")
+	cancel()
+
 	select {
-	case <-done:
+	case <-m.closed:
 	case <-time.After(2 * time.Second):
 		_ = m.cmd.Process.Kill()
 	}

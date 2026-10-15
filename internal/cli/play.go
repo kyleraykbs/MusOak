@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 
 	"github.com/kyleraykbs/MusOak/pkg/client"
 )
@@ -37,16 +38,29 @@ func (a *App) cmdPlay(ctx context.Context, args []string) error {
 		a.printf("playing %d track(s), %d prefetched ahead\n", len(queue), prefetch)
 	}
 
+	// The provider order decides which rendition plays and does not change
+	// between tracks, so it is resolved at most once for the whole play: once
+	// per slot meant two round trips per track, and none at all for a track
+	// already on disk.
+	var (
+		orderOnce sync.Once
+		order     []string
+	)
+	providerOrder := func(ctx context.Context) []string {
+		orderOnce.Do(func() { order = a.providerOrder(ctx) })
+		return order
+	}
+
 	// One slot per queue entry, started as the window slides forward. A slot
 	// resolves its rendition and downloads it in the background; the main loop
 	// only waits for the resolution, never for the bytes.
 	slots := make([]*slot, len(queue))
 	queued := 0
-	slots[0] = a.startSlot(ctx, queue[0])
+	slots[0] = a.startSlot(ctx, queue[0], providerOrder)
 	for queued < len(queue) {
 		for i := queued; i < len(queue) && i <= queued+prefetch; i++ {
 			if slots[i] == nil {
-				slots[i] = a.startSlot(ctx, queue[i])
+				slots[i] = a.startSlot(ctx, queue[i], providerOrder)
 			}
 		}
 
@@ -105,8 +119,10 @@ type playbackItem struct {
 	ready <-chan client.CacheEntry
 }
 
-// startSlot resolves one queue entry and makes sure a local copy exists.
-func (a *App) startSlot(ctx context.Context, item queueItem) *slot {
+// startSlot resolves one queue entry and makes sure a local copy exists. The
+// provider order is the play session's, resolved lazily by the caller so every
+// slot shares it.
+func (a *App) startSlot(ctx context.Context, item queueItem, order func(context.Context) []string) *slot {
 	s := &slot{
 		item:     item,
 		resolved: make(chan struct{}),
@@ -128,7 +144,7 @@ func (a *App) startSlot(ctx context.Context, item queueItem) *slot {
 			return
 		}
 
-		variant, err := a.resolveVariant(ctx, item)
+		variant, err := a.resolveVariant(ctx, item, order(ctx))
 		if err != nil {
 			s.err = err
 			close(s.resolved)
@@ -175,9 +191,9 @@ func (a *App) slotItem(s *slot) playbackItem {
 
 // resolveVariant picks the rendition to play for a track: the earliest-ranked
 // downloadable variant, resolving one first when the track only has
-// metadata-only renditions.
-func (a *App) resolveVariant(ctx context.Context, item queueItem) (client.Variant, error) {
-	order := a.providerOrder(ctx)
+// metadata-only renditions. order is the play session's effective provider
+// order, resolved once by the caller.
+func (a *App) resolveVariant(ctx context.Context, item queueItem, order []string) (client.Variant, error) {
 	variants, err := a.client.TrackVariants(ctx, item.TrackID)
 	if err != nil {
 		return client.Variant{}, err

@@ -200,6 +200,9 @@ func currentPath(ctx context.Context, t *testing.T, p *player) string {
 func TestSlotDownloadSurvivesContextCancel(t *testing.T) {
 	const variantID = "v1"
 	release := make(chan struct{})
+	// started fires when the server has the request in hand and is writing the
+	// body, which is what "the transfer is in flight" means here.
+	started := make(chan struct{}, 1)
 	body := []byte("first-half-second-half")
 	hashed := sha256.Sum256(body)
 	etag := hex.EncodeToString(hashed[:])
@@ -226,6 +229,10 @@ func TestSlotDownloadSurvivesContextCancel(t *testing.T) {
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
+		select {
+		case started <- struct{}{}:
+		default:
+		}
 		<-release
 		_, _ = w.Write(body[len("first-half"):])
 	})
@@ -236,7 +243,9 @@ func TestSlotDownloadSurvivesContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	s := app.startSlot(ctx, queueItem{TrackID: "t1", Title: "Song"})
+	// The play session's provider order, as cmdPlay would resolve it once.
+	order := func(context.Context) []string { return []string{"p"} }
+	s := app.startSlot(ctx, queueItem{TrackID: "t1", Title: "Song"}, order)
 	<-s.resolved
 	if s.err != nil {
 		t.Fatalf("resolve: %v", s.err)
@@ -244,11 +253,11 @@ func TestSlotDownloadSurvivesContextCancel(t *testing.T) {
 
 	// Wait until the transfer is actually in flight, then cancel the context
 	// the way a skip would and let the server finish the response.
-	part := app.cache.Path(variantID) + ".part"
-	waitForCondition(t, context.Background(), "the download to start", func() bool {
-		_, err := os.Stat(part)
-		return err == nil
-	})
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the download did not start")
+	}
 	cancel()
 	close(release)
 

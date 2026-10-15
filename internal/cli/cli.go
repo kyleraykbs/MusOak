@@ -166,6 +166,10 @@ type embeddedServer struct {
 	addr   string
 	http   *http.Server
 	server *api.Server
+
+	// cancel ends the background work started alongside the handler - the
+	// playlist prefetcher - when the CLI closes.
+	cancel context.CancelFunc
 }
 
 func startEmbedded(cfg *config.Config, logger *slog.Logger) (*embeddedServer, error) {
@@ -179,15 +183,23 @@ func startEmbedded(cfg *config.Config, logger *slog.Logger) (*embeddedServer, er
 		return nil, fmt.Errorf("musoak: bind embedded server: %w", err)
 	}
 	httpServer := &http.Server{Handler: server.Handler(), ReadHeaderTimeout: 10 * time.Second}
+
+	// Serving the handler directly is not the server's own Run, so the
+	// background pieces Run would start are started here. The prefetcher's
+	// context ends with the embedded server, not with one command.
+	ctx, cancel := context.WithCancel(context.Background())
+	server.StartPrefetch(ctx)
+
 	go func() {
 		if err := httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("musoak: embedded server stopped", "error", err)
 		}
 	}()
-	return &embeddedServer{addr: listener.Addr().String(), http: httpServer, server: server}, nil
+	return &embeddedServer{addr: listener.Addr().String(), http: httpServer, server: server, cancel: cancel}, nil
 }
 
 func (e *embeddedServer) Close() error {
+	e.cancel()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = e.http.Shutdown(ctx)

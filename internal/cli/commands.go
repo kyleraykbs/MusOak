@@ -5,11 +5,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/kyleraykbs/MusOak/internal/api"
 	"github.com/kyleraykbs/MusOak/pkg/client"
@@ -564,7 +566,12 @@ func (a *App) roomControl(ctx context.Context, args []string) error {
 	}
 }
 
-// roomJoin follows a room with mpv until the context ends.
+// roomJoin follows a room with mpv until the context ends. A dropped
+// connection to the room is not the end of the music: Participant.Run returns
+// nil for exactly that case, the sink is left playing, and the same
+// participant - still holding the item it loaded - follows the room again
+// after a jittered wait. Only the context ending, the room closing, or the
+// room ceasing to exist stops it.
 func (a *App) roomJoin(ctx context.Context, roomID string) error {
 	room, err := a.client.JoinRoom(ctx, roomID)
 	if err != nil {
@@ -594,12 +601,56 @@ func (a *App) roomJoin(ctx context.Context, roomID string) error {
 	}
 
 	a.printf("joined %s as %s; Ctrl-C to leave\n", roomID, room.MemberID)
-	err = participant.Run(ctx)
-	if errors.Is(err, client.ErrRoomClosed) {
-		a.printf("the room closed\n")
-		return nil
+
+	// Following the same participant across reconnects is what keeps the file
+	// playing: it still holds the item it loaded and the sink was never
+	// stopped, so a reconnected follower only corrects drift rather than
+	// starting the song over.
+	backoff := roomReconnectMin
+	for {
+		err := participant.Run(ctx)
+		if errors.Is(err, client.ErrRoomClosed) {
+			a.printf("the room closed\n")
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		// A dropped connection is nil; an error is a failed reconnect, and it
+		// is retried the same way. The room being gone entirely is the one
+		// thing worth giving up on, and the server answers that with a 404.
+		if client.IsNotFound(err) {
+			a.printf("the room is gone\n")
+			return nil
+		}
+		if err != nil {
+			a.logger.Debug("musoak: room follow failed", "room", roomID, "error", err)
+		} else {
+			a.logger.Debug("musoak: room connection dropped, reconnecting", "room", roomID)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(reconnectDelay(backoff)):
+		}
+		backoff = min(backoff*2, roomReconnectMax)
 	}
-	return err
+}
+
+// Bounds on the wait before following a room again after its connection
+// dropped: short enough that a blink is barely noticed, long enough that a room
+// which is down is not hammered.
+const (
+	roomReconnectMin = 250 * time.Millisecond
+	roomReconnectMax = 10 * time.Second
+)
+
+// reconnectDelay spreads a backoff over the second half of its range, so two
+// clients that dropped together do not march back in lockstep.
+func reconnectDelay(base time.Duration) time.Duration {
+	half := base / 2
+	return half + time.Duration(rand.Int64N(int64(half)+1))
 }
 
 // joinedRoom returns the room this CLI is in, re-joining when needed.
