@@ -1,10 +1,12 @@
 package api
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/kyleraykbs/MusOak/internal/config"
 )
@@ -178,5 +180,52 @@ func TestLimitsCanBeDisabled(t *testing.T) {
 		if rec := c.do(http.MethodGet, "/api/v1/search?q=x", "", nil); rec.Code != http.StatusOK {
 			t.Fatalf("search %d = %d, want 200", i, rec.Code)
 		}
+	}
+}
+
+// The sweep is amortised and the map is capped: a request prunes only a
+// bounded handful of buckets, and a flood of distinct clients cannot grow the
+// map without end.
+func TestLimiterAmortisesItsSweepAndBoundsTheMap(t *testing.T) {
+	l := newLimiter(60, 1)
+	l.sweepThreshold = 4
+	l.sweepBatch = 2
+	l.maxBuckets = 8
+
+	for i := range 100 {
+		if !l.allow(fmt.Sprintf("client-%d", i)) {
+			t.Fatalf("client %d was refused on its first request", i)
+		}
+	}
+
+	l.mu.Lock()
+	size := len(l.buckets)
+	l.mu.Unlock()
+	if size > l.maxBuckets {
+		t.Fatalf("bucket map grew to %d, want at most %d", size, l.maxBuckets)
+	}
+}
+
+// An idle bucket is dropped when the sweep reaches it, so a client that stops
+// asking does not stay in the map for ever.
+func TestLimiterSweepsAnIdleBucket(t *testing.T) {
+	l := newLimiter(60, 1)
+	l.sweepThreshold = 0
+	l.sweepBatch = 64
+
+	if !l.allow("stale") {
+		t.Fatal("a client's first request was refused")
+	}
+	l.mu.Lock()
+	l.buckets["stale"].seen = time.Now().Add(-2 * idleTTL)
+	l.mu.Unlock()
+
+	l.allow("fresh") // past the threshold, so this request prunes a bucket
+
+	l.mu.Lock()
+	_, still := l.buckets["stale"]
+	l.mu.Unlock()
+	if still {
+		t.Fatal("an idle bucket survived the sweep")
 	}
 }

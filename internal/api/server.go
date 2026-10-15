@@ -225,9 +225,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	// The playlists are kept downloaded for as long as the server runs. It is
 	// started here rather than in New so that a test's server stays quiet.
-	if s.prefetcher != nil {
-		go s.prefetcher.Run(ctx)
-	}
+	s.StartPrefetch(ctx)
 	return s.Serve(ctx, listener)
 }
 
@@ -238,6 +236,16 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	srv := &http.Server{
 		Handler:           s.handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		// A keep-alive connection that falls silent is closed rather than held
+		// open in case the client sends another request.
+		IdleTimeout: 2 * time.Minute,
+		// Reading a request is the one fetch that can otherwise stall a handler
+		// for ever: a client that opens a request and dribbles its body holds
+		// the goroutine reading it. The bound is generous enough for the
+		// largest upload - the body is JSON and runs to ninety-six megabytes -
+		// and still finite. WriteTimeout is deliberately unset: an audio stream
+		// is one long write, and a deadline on it would cut the song short.
+		ReadTimeout: 5 * time.Minute,
 	}
 
 	errCh := make(chan error, 1)

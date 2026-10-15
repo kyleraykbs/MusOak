@@ -20,6 +20,12 @@ type limiter struct {
 	// resolving the client address. Empty means the socket peer is the client.
 	trusted []*net.IPNet
 
+	// The sweep's sizes. They are fields so a test can shrink them; production
+	// takes the defaults below.
+	sweepThreshold int
+	sweepBatch     int
+	maxBuckets     int
+
 	mu      sync.Mutex
 	buckets map[string]*clientBucket
 }
@@ -29,8 +35,21 @@ type clientBucket struct {
 	seen    time.Time
 }
 
-// idleTTL is how long a client's bucket is kept after its last request.
-const idleTTL = 10 * time.Minute
+const (
+	// idleTTL is how long a client's bucket is kept after its last request.
+	idleTTL = 10 * time.Minute
+	// sweepThreshold is the map size past which a request prunes idle buckets.
+	sweepThreshold = 64
+	// sweepBatch is how many buckets one request may prune. Walking the whole
+	// map on every request is quadratic once enough distinct clients are live;
+	// a bounded walk ages the map out over the next handful of requests at O(1)
+	// each.
+	sweepBatch = 16
+	// maxBuckets caps the map. The sweep keeps it far below this while clients
+	// come and go; the cap is the backstop for a flood of distinct clients
+	// arriving faster than they can age out.
+	maxBuckets = 1 << 16
+)
 
 // newLimiter builds a limiter for perMinute requests with the given burst.
 // trusted carries the reverse proxies whose forwarded client address is
@@ -44,10 +63,13 @@ func newLimiter(perMinute, burst int, trusted ...*net.IPNet) *limiter {
 		burst = 1
 	}
 	return &limiter{
-		rate:    rate.Limit(float64(perMinute) / 60.0),
-		burst:   burst,
-		trusted: trusted,
-		buckets: make(map[string]*clientBucket),
+		rate:           rate.Limit(float64(perMinute) / 60.0),
+		burst:          burst,
+		trusted:        trusted,
+		sweepThreshold: sweepThreshold,
+		sweepBatch:     sweepBatch,
+		maxBuckets:     maxBuckets,
+		buckets:        make(map[string]*clientBucket),
 	}
 }
 
@@ -64,17 +86,44 @@ func (l *limiter) allow(key string) bool {
 	}
 	bucket.seen = now
 
-	if len(l.buckets) > 64 {
-		l.sweepLocked(now)
+	// Amortised sweep: once the map is past the threshold a request prunes a
+	// bounded handful of idle buckets. The walk starts somewhere different each
+	// time, so it lands on every part of the map over the next requests.
+	if len(l.buckets) > l.sweepThreshold {
+		l.sweepLocked(now, l.sweepBatch)
+	}
+	// The backstop: if a flood of distinct clients outruns the sweep, the map
+	// is trimmed to the cap rather than growing without end.
+	if len(l.buckets) > l.maxBuckets {
+		l.evictLocked(len(l.buckets) - l.maxBuckets)
 	}
 	return bucket.limiter.Allow()
 }
 
-func (l *limiter) sweepLocked(now time.Time) {
+// sweepLocked drops up to budget idle buckets, leaving the rest to later
+// requests so no single one walks the whole map.
+func (l *limiter) sweepLocked(now time.Time, budget int) {
 	for key, bucket := range l.buckets {
+		if budget <= 0 {
+			return
+		}
+		budget--
 		if now.Sub(bucket.seen) > idleTTL {
 			delete(l.buckets, key)
 		}
+	}
+}
+
+// evictLocked drops n buckets to keep the map bounded. A bucket dropped here
+// may not be idle - that client loses the budget it had built up - but the map
+// stays in hand, which is the point of the cap.
+func (l *limiter) evictLocked(n int) {
+	for key := range l.buckets {
+		if n <= 0 {
+			return
+		}
+		delete(l.buckets, key)
+		n--
 	}
 }
 

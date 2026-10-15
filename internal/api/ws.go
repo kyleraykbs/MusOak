@@ -13,6 +13,21 @@ import (
 // writeTimeout bounds a single WebSocket write.
 const wsWriteTimeout = 10 * time.Second
 
+// wsReadLimit bounds a message from the client. Client messages are clock
+// pings and nothing else, so the library's own 32 KiB default is already
+// generous; the limit is set anyway so the bound is a decision, not a default.
+const wsReadLimit = 64 << 10
+
+// The server keeps a connection honest: a ping every wsPingEvery, and wsPongWait
+// for the pong. A peer that has gone without a FIN - a phone that slept, a
+// killed tab - answers nothing, so the ping fails and the socket is closed;
+// that is what makes the handler, its subscriber and its member fall away
+// through the leave grace instead of leaking until OS TCP keepalive.
+const (
+	wsPingEvery = 30 * time.Second
+	wsPongWait  = 10 * time.Second
+)
+
 // clientMessage is what a client may send on the event socket.
 type clientMessage struct {
 	Type         string `json:"type"`
@@ -54,6 +69,10 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.CloseNow()
+	// A client sends nothing but the occasional clock ping; anything larger is
+	// not one of ours, and the bound keeps a client from making the server read
+	// without end.
+	conn.SetReadLimit(wsReadLimit)
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -72,14 +91,19 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		defer s.rooms.Disconnect(identity)
 	}
 
-	events, unsubscribe := s.rooms.Subscribe()
-	defer unsubscribe()
-
+	// A connection follows one room and subscribes to just that room: another
+	// room's heartbeat never lands in its buffer and costs it one of its own
+	// events, which it would then have to resync from a snapshot. No room named
+	// means every room, as before.
 	roomFilter := r.URL.Query().Get("roomId")
+	events, unsubscribe := s.rooms.SubscribeRoom(roomFilter)
+	defer unsubscribe()
 
 	// One writer: the read loop funnels pongs back through this channel.
 	pongs := make(chan serverMessage, 8)
 	go s.readSocket(ctx, conn, pongs)
+	// And one keepalive, so a connection that is only half here is noticed.
+	go s.pingSocket(ctx, conn, cancel)
 
 	for {
 		select {
@@ -99,9 +123,6 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			if roomFilter != "" && event.RoomID != roomFilter {
-				continue
-			}
 			message := serverMessage{
 				Type:   string(event.Type),
 				RoomID: event.RoomID,
@@ -120,6 +141,32 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 				// their queue with them.
 				s.logger.Debug("ws: event skipped, the client is behind",
 					"room", event.RoomID, "seq", event.Seq)
+			}
+		}
+	}
+}
+
+// pingSocket keeps the connection honest. It pings every wsPingEvery and waits
+// wsPongWait for the pong, which readSocket reads in passing; that wait is the
+// deadline a half-open connection trips, since a peer that has gone without a
+// FIN answers nothing. A ping that fails cancels the connection, so the handler
+// returns and the member goes through the leave grace, rather than the socket,
+// its subscriber and the member sitting here until OS TCP keepalive.
+func (s *Server) pingSocket(ctx context.Context, conn *websocket.Conn, cancel context.CancelFunc) {
+	ticker := time.NewTicker(wsPingEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pingCtx, stop := context.WithTimeout(ctx, wsPongWait)
+			err := conn.Ping(pingCtx)
+			stop()
+			if err != nil {
+				s.logger.Debug("ws: ping failed, closing the connection", "error", err)
+				cancel()
+				return
 			}
 		}
 	}

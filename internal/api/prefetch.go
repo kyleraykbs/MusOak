@@ -67,6 +67,16 @@ func (s *Server) startPrefetch() {
 	s.prefetcher = prefetch.New(adapter, adapter, adapter, s.logger, prefetch.Options{})
 }
 
+// StartPrefetch begins the background playlist prefetch. Run starts it for a
+// serving daemon; an embedder that serves the handler itself - the CLI's
+// in-process server - must call it too, or media.prefetchPlaylists quietly
+// does nothing.
+func (s *Server) StartPrefetch(ctx context.Context) {
+	if s.prefetcher != nil {
+		go s.prefetcher.Run(ctx)
+	}
+}
+
 // nudgePrefetch says the playlists changed, so the next pass is soon rather
 // than whenever the clock comes round.
 func (s *Server) nudgePrefetch() {

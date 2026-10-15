@@ -31,25 +31,30 @@ const (
 	EventRoomClosed   EventType = "room_closed"
 )
 
-// Event is one room state change, broadcast to every subscriber.
+// Event is one room state change, sent to every subscriber of that room.
 //
 // Seq is per-room and counts every event the room published. A client that sees
 // a gap missed events (the bus drops them rather than stall the room) and
 // refetches the snapshot, which is the resync path.
 //
-// The payloads are small on purpose, and the play order is never sent:
+// The payloads are small on purpose, and the play order travels with the event
+// that changed it:
 //
-//   - queue_updated carries {memberId, memberQueue} — one member's queue, or
-//     {memberId, gone: true} when they left. A client replaces that queue and
-//     derives the play order itself (round-robin across members in join order).
+//   - queue_updated carries {memberId, memberQueue, master} - one member's
+//     queue (or {memberId, gone: true} when they left) and the room's play
+//     order yet to come, the same list the snapshot carries. The server is the
+//     order's only author: the rule is who waited longest - the member whose
+//     last turn is oldest goes first, a member who has never had one before
+//     everybody who has, and equally old turns by join order - and a client
+//     renders that list rather than deriving one, so it cannot advance to a
+//     song the server never chose.
 //   - playback carries {current}, the whole current-state view or null when the
 //     room is idle. The Manager publishes it on every change and once a second
 //     as the room's heartbeat, so a client that missed an event is corrected by
-//     the next one.
+//     the next one. It carries no order: nothing in that beat changes one.
 //   - when the room advances off a song, the played item leaves its owner's
-//     queue and the play order, so that queue is republished too and the client
-//     splices the order the same way the server did. That is what keeps the
-//     derived order's round-robin phase identical to the server's.
+//     queue and the play order, so that queue is republished with the fresh
+//     order beside it.
 type Event struct {
 	Type   EventType `json:"type"`
 	RoomID string    `json:"roomId"`
@@ -66,40 +71,60 @@ const subscriberBuffer = 128
 type Bus struct {
 	mu     sync.RWMutex
 	nextID int
-	subs   map[int]chan Event
+	subs   map[int]*subscription
+}
+
+// subscription is one subscriber's channel. room is the one room it wants, or
+// empty for every room; a connection names its own room so another room's
+// heartbeat never lands in its buffer and costs it one of its own events.
+type subscription struct {
+	ch   chan Event
+	room string
 }
 
 // NewBus returns an empty event bus.
 func NewBus() *Bus {
-	return &Bus{subs: make(map[int]chan Event)}
+	return &Bus{subs: make(map[int]*subscription)}
 }
 
-// Subscribe returns a channel of events and a cancel function.
-func (b *Bus) Subscribe() (<-chan Event, func()) {
+// Subscribe returns a channel of every room's events and a cancel function.
+func (b *Bus) Subscribe() (<-chan Event, func()) { return b.subscribe("") }
+
+// SubscribeRoom returns a channel of one room's events and a cancel function.
+// Events of any other room are left out at the source, so a subscriber's buffer
+// is spent only on what it asked for.
+func (b *Bus) SubscribeRoom(roomID string) (<-chan Event, func()) {
+	return b.subscribe(roomID)
+}
+
+func (b *Bus) subscribe(roomID string) (<-chan Event, func()) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	id := b.nextID
 	b.nextID++
 	ch := make(chan Event, subscriberBuffer)
-	b.subs[id] = ch
+	b.subs[id] = &subscription{ch: ch, room: roomID}
 	return ch, func() {
 		b.mu.Lock()
 		defer b.mu.Unlock()
-		if _, ok := b.subs[id]; ok {
+		if sub, ok := b.subs[id]; ok {
 			delete(b.subs, id)
-			close(ch)
+			close(sub.ch)
 		}
 	}
 }
 
-// Publish delivers e to every subscriber without blocking: a subscriber that
-// cannot keep up misses events rather than stalling the room.
+// Publish delivers e to every subscriber it belongs to without blocking: a
+// subscriber that cannot keep up misses events rather than stalling the room.
 func (b *Bus) Publish(e Event) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	for _, ch := range b.subs {
+	for _, sub := range b.subs {
+		if sub.room != "" && sub.room != e.RoomID {
+			continue
+		}
 		select {
-		case ch <- e:
+		case sub.ch <- e:
 		default: // full: this subscriber falls behind and resyncs from a snapshot
 		}
 	}

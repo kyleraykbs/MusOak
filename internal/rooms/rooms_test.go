@@ -248,7 +248,7 @@ func TestEnqueueMixesQueuesFairly(t *testing.T) {
 		got = append(got, item.Title)
 	}
 	// The song on has charged its member a turn, so the fresh mix starts with
-	// the member who has heard nothing yet.
+	// the member who has not had one yet.
 	want := []string{"b1", "a2", "b2"}
 	for i := range want {
 		if i >= len(got) || got[i] != want[i] {
@@ -307,7 +307,7 @@ func TestTheServerStartsAndAdvancesTheRoom(t *testing.T) {
 
 // The play order keeps its place when an item is dropped: the room plays one
 // track per member per pass, and item ids tell two copies of one track apart.
-func TestAdvanceKeepsRoundRobinPhaseAndDropsFromQueue(t *testing.T) {
+func TestAdvanceKeepsTurnOrderAndDropsFromQueue(t *testing.T) {
 	f := newFixture(t, nil)
 	host := guest("host-1")
 	room := f.create("party", ControlsEveryone, "", host)
@@ -442,29 +442,96 @@ func TestServerKeepsTimeWithASocketDown(t *testing.T) {
 	}
 }
 
-// A queue change carries the room's play order with it: the order is the
-// server's to know, and a client that works one out for itself can come out with
-// a different answer the moment a queue is edited - which is a client playing
-// one song while the room plays another.
-func TestAQueueChangeCarriesThePlayOrder(t *testing.T) {
+// A queue change carries the room's play order as `master`, and it is exactly
+// the order the snapshot carries: the server is its only author, so a client
+// renders it rather than deriving one it can disagree with. The order holds
+// through an enqueue, an advance and a member leaving.
+func TestQueueEventsCarryTheRoomsOrder(t *testing.T) {
 	f := newFixture(t, nil)
 	host := guest("host-1")
 	room := f.create("party", ControlsEveryone, "", host)
+	if _, err := f.m.Join(room.ID, guest("bob"), "", ""); err != nil {
+		t.Fatal(err)
+	}
+	f.attach(host.ID)
+	// The room is already playing before the subscription, so an enqueue below
+	// does not also start a song and move the order out from under the event.
+	f.enqueue(room.ID, host.ID, f.track("running", 600_000).ID)
+
 	events, cancel := f.m.Subscribe()
 	defer cancel()
 
-	first := f.track("first", 60_000)
-	second := f.track("second", 60_000)
-	f.enqueue(room.ID, host.ID, first.ID, second.ID)
-
-	event := waitEvent(t, events, EventQueueUpdated)
-	data := event.Data.(map[string]any)
-	master, ok := data["master"].([]QueueItem)
-	if !ok {
-		t.Fatalf("a queue change carried no play order: %+v", data)
+	sameOrder := func(a, b []QueueItem) bool {
+		if len(a) != len(b) {
+			return false
+		}
+		for i := range a {
+			if a[i].ID != b[i].ID {
+				return false
+			}
+		}
+		return true
 	}
-	if len(master) != 2 || master[0].TrackID != first.ID || master[1].TrackID != second.ID {
-		t.Fatalf("the order sent is not the room's: %+v", master)
+	assertOrderMatches := func(label string) {
+		t.Helper()
+		event := waitEvent(t, events, EventQueueUpdated)
+		data := event.Data.(map[string]any)
+		order, ok := data["master"].([]QueueItem)
+		if !ok {
+			t.Fatalf("%s: a queue change carried no play order: %+v", label, data)
+		}
+		if want := f.get(room.ID).MasterQueue; !sameOrder(order, want) {
+			t.Fatalf("%s: event order = %+v, room order = %+v", label, order, want)
+		}
+	}
+
+	f.enqueue(room.ID, host.ID, f.track("queued", 600_000).ID)
+	assertOrderMatches("enqueue")
+
+	f.advance(601 * time.Second) // the running song ends; the beat carries the order it changed
+	assertOrderMatches("advance")
+
+	if _, err := f.m.Leave(room.ID, "bob"); err != nil {
+		t.Fatal(err)
+	}
+	assertOrderMatches("leave")
+}
+
+// The order is who waited longest, not who has played least: a member who has
+// already had two turns yields to one who has never had a turn.
+func TestMemberWhoHasPlayedYieldsToWhoHasNot(t *testing.T) {
+	f := newFixture(t, nil)
+	host := guest("host-1")
+	room := f.create("party", ControlsEveryone, "", host)
+	if _, err := f.m.Join(room.ID, guest("bob"), "", ""); err != nil {
+		t.Fatal(err)
+	}
+	f.attach(host.ID)
+	first := f.track("first", 10_000)
+	second := f.track("second", 10_000)
+	third := f.track("third", 10_000)
+	f.enqueue(room.ID, host.ID, first.ID, second.ID, third.ID)
+
+	// The host's first two songs have had their turn; the third is on.
+	f.advance(11 * time.Second)
+
+	bobSong := f.track("bob song", 600_000)
+	f.enqueue(room.ID, "bob", bobSong.ID)
+
+	state := f.get(room.ID)
+	titles := make([]string, 0, len(state.MasterQueue))
+	for _, item := range state.MasterQueue {
+		titles = append(titles, item.Title)
+	}
+	// Bob has never played, so his song is ahead of the host's remaining one.
+	want := []string{"bob song", "third"}
+	if len(titles) != len(want) {
+		t.Fatalf("order = %v, want %v", titles, want)
+	}
+	for i := range want {
+		if titles[i] != want[i] {
+			t.Fatalf("order = %v, want %v", titles, want)
+		}
 	}
 }
 
@@ -843,6 +910,57 @@ func TestSeqCountsEveryEvent(t *testing.T) {
 	}
 }
 
+// A connection follows one room: a subscription to it never carries another
+// room's events, so a neighbour's heartbeat cannot fill its buffer and cost it
+// one of its own.
+func TestSubscribeRoomDeliversOnlyItsRoom(t *testing.T) {
+	f := newFixture(t, nil)
+	one := f.create("one", ControlsEveryone, "", guest("a"))
+	two := f.create("two", ControlsEveryone, "", guest("b"))
+
+	events, cancel := f.m.SubscribeRoom(one.ID)
+	defer cancel()
+
+	// Activity in the other room must not reach this subscription at all.
+	f.enqueue(two.ID, "b", f.track("b-song", 60_000).ID)
+	select {
+	case event := <-events:
+		t.Fatalf("a subscription to %s received room %s's %s", one.ID, event.RoomID, event.Type)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	f.enqueue(one.ID, "a", f.track("a-song", 60_000).ID)
+	event := waitEvent(t, events, EventQueueUpdated)
+	if event.RoomID != one.ID {
+		t.Fatalf("event room = %s, want %s", event.RoomID, one.ID)
+	}
+}
+
+// A paused room people are still using is not closed under them: a member's
+// command puts the idle clock back even though nothing is playing or, as here,
+// even though the room has been sitting on a paused song for the whole window.
+func TestAPausedRoomPeopleAreUsingIsNotIdle(t *testing.T) {
+	f := newFixture(t, nil)
+	f.m.idleAfter = time.Minute
+	host := guest("host-1")
+	room := f.create("party", ControlsEveryone, "", host)
+	song := f.track("song", 600_000)
+	f.attach(host.ID)
+	f.enqueue(room.ID, host.ID, song.ID)
+	if _, err := f.m.Pause(room.ID, host.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	more := f.track("more", 600_000)
+	for range 4 {
+		f.advance(50 * time.Second)
+		f.enqueue(room.ID, host.ID, more.ID)
+	}
+	if _, err := f.m.Get(room.ID); err != nil {
+		t.Fatalf("a room people are still using closed as idle: %v", err)
+	}
+}
+
 func TestDisconnectGraceLeavesRooms(t *testing.T) {
 	f := newFixture(t, nil)
 	host := guest("host-1")
@@ -922,8 +1040,8 @@ func TestAQueuedItemCarriesTheArtistNames(t *testing.T) {
 }
 
 // Queueing in the middle of a song must not put the fresh songs in front of
-// the song on, and when it ends the room owes the member who has heard
-// nothing their turn first. This is the reported "two of my songs before my
+// the song on, and when it ends the room owes the member who has not had a
+// turn their turn first. This is the reported "two of my songs before my
 // friend's" bug: a mid-song rebuild used to slot the new songs around the
 // in-flight song, so after it ended one member played twice in a row.
 func TestQueueingMidSongKeepsTheOrderFairAndAhead(t *testing.T) {

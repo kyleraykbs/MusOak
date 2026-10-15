@@ -122,11 +122,10 @@ type room struct {
 	master  []QueueItem
 	current *playback
 
-	// The fairness ledger: how many songs each member has had on, and when the
-	// last one began. The pending order interleaves by these - least heard
-	// first, then longest waiting, then join order - so a queue edit mid-song
-	// cannot hand one member two songs in a row after the song on ends.
-	playedCounts   map[string]int
+	// lastPlayedAtMs is the fairness ledger: when each member last had a turn.
+	// The pending order is rebuilt from it - whoever last played longest ago
+	// goes first - so a queue edit mid-song cannot hand one member two songs in
+	// a row after the song on ends.
 	lastPlayedAtMs map[string]int64
 
 	// queueDirty names the member queues that changed since the last tick. The
@@ -189,6 +188,15 @@ type Store interface {
 	store.VoteRepo
 }
 
+// leaveTimer is a pending leave and the generation it was scheduled in. A
+// later socket close or a reconnect replaces the timer; the generation lets a
+// timer whose Stop came too late tell that it has been superseded, so it
+// cannot take a member out under the newer timer's name.
+type leaveTimer struct {
+	timer *time.Timer
+	gen   uint64
+}
+
 // Manager owns every room.
 type Manager struct {
 	mu  sync.Mutex
@@ -203,7 +211,17 @@ type Manager struct {
 	// leaving holds the pending leave for a member whose last socket closed. A
 	// client that reconnects drops its socket and opens another, and that gap
 	// must not read as leaving the room; a tab that closed for good must.
-	leaving map[string]*time.Timer
+	leaving map[string]*leaveTimer
+	// leaveSeq stamps each pending leave so no two share a generation.
+	leaveSeq uint64
+
+	// outbox holds the events published while mu was held. They are sent to
+	// subscribers by drain, after the lock is released: a send is a channel
+	// write, and doing it under mu leaves every room handler waiting behind
+	// the fan-out once a second. sendMu serialises draining so events reach
+	// subscribers in the order their seq was assigned.
+	outbox []Event
+	sendMu sync.Mutex
 
 	// grace is how long a member's rooms are kept after their last event
 	// socket closes. It is a field so tests can shrink it; production uses
@@ -237,9 +255,12 @@ const unknownDurationFallbackMs = 5 * 60 * 1000
 // socket is not taken out of the room it is still listening to.
 const socketGrace = 10 * time.Second
 
-// idleRoomAfter is how long a room that is not making progress is left open: no
-// song playing to a listener. A room with nothing playing in it and nobody to
-// come back to it is one that should not sit there for ever.
+// idleRoomAfter is how long a room may be left to itself before it closes: no
+// song running to a listener and nobody doing anything in it. Membership alone
+// is not activity - a browser that joined and never opened its socket would
+// otherwise keep a room alive for ever - so the clock still runs, but any
+// member command puts it back (see touchedLocked), and a room people are using
+// is not one to close under them.
 const idleRoomAfter = 2 * time.Hour
 
 // NewManager returns a room manager. The store is what queue rows read their
@@ -251,7 +272,7 @@ func NewManager(cfg *config.Config, st Store, logger *slog.Logger) *Manager {
 	return &Manager{
 		rooms:       make(map[string]*room),
 		connections: make(map[string]int),
-		leaving:     make(map[string]*time.Timer),
+		leaving:     make(map[string]*leaveTimer),
 		cfg:         cfg,
 		logger:      logger,
 		bus:         NewBus(),
@@ -269,9 +290,9 @@ func (m *Manager) Connect(memberID string) {
 		return
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if timer, ok := m.leaving[memberID]; ok {
-		timer.Stop()
+	defer m.unlock()
+	if entry, ok := m.leaving[memberID]; ok {
+		entry.timer.Stop()
 		delete(m.leaving, memberID)
 	}
 	m.connections[memberID]++
@@ -289,23 +310,34 @@ func (m *Manager) Disconnect(memberID string) {
 		return
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	defer m.unlock()
 	if m.connections[memberID] > 1 {
 		m.connections[memberID]--
 		return
 	}
 	delete(m.connections, memberID)
-	if timer, ok := m.leaving[memberID]; ok {
-		timer.Stop()
+	if entry, ok := m.leaving[memberID]; ok {
+		entry.timer.Stop()
 	}
-	m.leaving[memberID] = time.AfterFunc(m.grace, func() { m.leaveEveryRoom(memberID) })
+	m.leaveSeq++
+	gen := m.leaveSeq
+	m.leaving[memberID] = &leaveTimer{
+		timer: time.AfterFunc(m.grace, func() { m.leaveAfterGrace(memberID, gen) }),
+		gen:   gen,
+	}
 }
 
-// leaveEveryRoom takes a member out of every room they are in, once the grace
-// has passed with no socket of theirs coming back.
-func (m *Manager) leaveEveryRoom(memberID string) {
+// leaveAfterGrace takes a member out of every room they are in, once the grace
+// has passed with no socket of theirs coming back. It only does so for the
+// leave it was scheduled for: a reconnect or a later close replaces the timer,
+// and a Stop that came too late must not run a leave for a member who is back.
+func (m *Manager) leaveAfterGrace(memberID string, gen uint64) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	defer m.unlock()
+	entry, ok := m.leaving[memberID]
+	if !ok || entry.gen != gen {
+		return
+	}
 	delete(m.leaving, memberID)
 	if m.connections[memberID] > 0 {
 		return
@@ -324,8 +356,15 @@ func (m *Manager) leaveEveryRoom(memberID string) {
 // Bus exposes the event stream.
 func (m *Manager) Bus() *Bus { return m.bus }
 
-// Subscribe returns a channel of room events and a cancel function.
+// Subscribe returns a channel of every room's events and a cancel function.
 func (m *Manager) Subscribe() (<-chan Event, func()) { return m.bus.Subscribe() }
+
+// SubscribeRoom returns a channel of one room's events and a cancel function.
+// A connection subscribes to its own room, so another room's heartbeat cannot
+// fill its buffer and force its own events to be dropped.
+func (m *Manager) SubscribeRoom(roomID string) (<-chan Event, func()) {
+	return m.bus.SubscribeRoom(roomID)
+}
 
 // Start begins the room clock: one tick a second advances and republishes every
 // room. It is called once by the server; a manager that was never started is
@@ -333,12 +372,12 @@ func (m *Manager) Subscribe() (<-chan Event, func()) { return m.bus.Subscribe() 
 func (m *Manager) Start() {
 	m.mu.Lock()
 	if m.stop != nil {
-		m.mu.Unlock()
+		m.unlock()
 		return
 	}
 	stop := make(chan struct{})
 	m.stop = stop
-	m.mu.Unlock()
+	m.unlock()
 	go m.run(stop)
 }
 
@@ -360,7 +399,7 @@ func (m *Manager) run(stop <-chan struct{}) {
 // the time so tests can drive it with a held clock instead of waiting.
 func (m *Manager) tick(nowMs int64) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	defer m.unlock()
 	for _, id := range append([]string(nil), m.roomOrder...) {
 		room, ok := m.rooms[id]
 		if !ok || room.closed {
@@ -372,7 +411,9 @@ func (m *Manager) tick(nowMs int64) {
 
 // tickRoomLocked is one room's beat: start it if it has a queue and a listener,
 // move past every song that has ended, republish the anchored position, and
-// close a room that has been going nowhere for the idle window.
+// close a room left to itself. A room people are using is kept open by
+// touchedLocked, which the member commands call; the beat only counts the
+// silence in between.
 func (m *Manager) tickRoomLocked(room *room, nowMs int64) {
 	listening := m.anyoneListeningLocked(room)
 	playing := room.current != nil && room.current.started && !room.current.paused
@@ -420,6 +461,14 @@ func (m *Manager) tickRoomLocked(room *room, nowMs int64) {
 	}
 }
 
+// touchedLocked puts a room's idle clock back because a member did something in
+// it. Membership is the durable "somebody is here" fact, but a member who
+// joined and never opened a socket is not activity a room should live on for
+// ever, so it is commands - not mere presence - that keep the idle window open.
+func (m *Manager) touchedLocked(room *room) {
+	room.idleSinceMs = m.nowMsLocked()
+}
+
 // finishedLocked reports whether the current song has played out at nowMs.
 func (m *Manager) finishedLocked(room *room, nowMs int64) bool {
 	current := room.current
@@ -440,15 +489,15 @@ func (m *Manager) Close() {
 	m.mu.Lock()
 	stop := m.stop
 	m.stop = nil
-	m.mu.Unlock()
+	m.unlock()
 	if stop != nil {
 		close(stop)
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	for memberID, timer := range m.leaving {
-		timer.Stop()
+	defer m.unlock()
+	for memberID, entry := range m.leaving {
+		entry.timer.Stop()
 		delete(m.leaving, memberID)
 	}
 }
@@ -456,14 +505,14 @@ func (m *Manager) Close() {
 // SetClock replaces the clock; it exists for tests that hold time still.
 func (m *Manager) SetClock(c Clock) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	defer m.unlock()
 	m.clock = c
 }
 
 // NowMs is the server clock rooms stamp state with.
 func (m *Manager) NowMs() int64 {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	defer m.unlock()
 	return m.nowMsLocked()
 }
 
@@ -480,7 +529,7 @@ func (m *Manager) Create(name string, controls Controls, password string, host M
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	defer m.unlock()
 
 	id := uuid.NewString()
 	if name == "" {
@@ -499,7 +548,6 @@ func (m *Manager) Create(name string, controls Controls, password string, host M
 		members:        map[string]*Member{host.ID: &host},
 		order:          []string{host.ID},
 		queues:         map[string][]QueueItem{host.ID: {}},
-		playedCounts:   map[string]int{},
 		lastPlayedAtMs: map[string]int64{},
 		queueDirty:     map[string]bool{},
 		idleSinceMs:    m.nowMsLocked(),
@@ -515,7 +563,7 @@ func (m *Manager) Create(name string, controls Controls, password string, host M
 // List returns every room, oldest first.
 func (m *Manager) List() []Snapshot {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	defer m.unlock()
 
 	out := make([]Snapshot, 0, len(m.roomOrder))
 	for _, id := range m.roomOrder {
@@ -529,7 +577,7 @@ func (m *Manager) List() []Snapshot {
 // Get returns one room's state.
 func (m *Manager) Get(roomID string) (*Snapshot, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	defer m.unlock()
 
 	room, ok := m.rooms[roomID]
 	if !ok {
@@ -612,7 +660,7 @@ func withoutMember(order []string, memberID string) []string {
 // membership it goes, so the room does not show somebody twice.
 func (m *Manager) Join(roomID string, member Member, password, supersedes string) (*Snapshot, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	defer m.unlock()
 
 	room, err := m.roomLocked(roomID)
 	if err != nil {
@@ -650,6 +698,7 @@ func (m *Manager) Join(roomID string, member Member, password, supersedes string
 	// The room belongs to its owner, so a host who stepped out and came back
 	// leads it again rather than sitting in their own room as a guest.
 	m.takeHostLocked(room, member)
+	m.touchedLocked(room)
 	recomputeMasterLocked(room)
 
 	m.publishLocked(room, EventMemberJoined, map[string]any{"member": member, "memberCount": len(room.members)})
@@ -664,7 +713,7 @@ func (m *Manager) Join(roomID string, member Member, password, supersedes string
 // host promotes the longest-standing member.
 func (m *Manager) Leave(roomID, memberID string) (*Snapshot, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	defer m.unlock()
 
 	room, err := m.roomLocked(roomID)
 	if err != nil {
@@ -757,33 +806,39 @@ func (m *Manager) queueItemLocked(memberID string, src queueSource) QueueItem {
 }
 
 // recomputeMasterLocked rebuilds the order yet to come: every queued item the
-// room has not reached, interleaved so the member who has heard least goes
-// first, then whoever has waited longest, then join order.
+// room has not reached, in the order each member is owed the next turn.
 //
-// The song on is not part of it — it is playing, charged to its owner when it
-// began — so a queue edit while it plays can only shape what comes after. The
-// old rebuild started every pass at the head of the join order with the
-// in-flight song still taking its owner's slot: somebody queueing in the
-// middle of a song put their songs at the head, and when the song on ended
-// they played twice before the next member's turn.
+// A turn belongs to whoever waited longest: the member who last played longest
+// ago goes first, and a member who has never played goes before everybody who
+// has. Members whose turn is equally old - and all the never-played ones - fall
+// back to join order.
+//
+// The song on is not part of it - it is playing, charged to its owner when it
+// began - so a queue edit while it plays can only shape what comes after.
 func recomputeMasterLocked(room *room) {
 	inflight := ""
 	if room.current != nil {
 		inflight = room.current.item.ID
 	}
 
-	// The picks below simulate the plays to come, so they move working copies
-	// of the ledger; the room's own counts move only when a song begins.
-	heard := make(map[string]int, len(room.playedCounts))
-	for member, n := range room.playedCounts {
-		heard[member] = n
-	}
+	// The picks below simulate the turns to come, so they move a working copy
+	// of the ledger; the room's own record moves only when a song begins.
 	waited := make(map[string]int64, len(room.lastPlayedAtMs))
+	var newest int64
 	for member, at := range room.lastPlayedAtMs {
 		waited[member] = at
+		if at > newest {
+			newest = at
+		}
 	}
-	head := map[string]int{}
+	// A simulated turn is stamped newer than every real one, so the picks keep
+	// their order among themselves. The stamp counts up from the newest real
+	// last-play: real stamps are epoch milliseconds, so a fixed sentinel or a
+	// small counter would sort a pick as if it were the oldest turn rather than
+	// the newest.
+	next := newest
 
+	head := map[string]int{}
 	master := make([]QueueItem, 0, 64)
 	for {
 		best, bestSlot := "", -1
@@ -791,7 +846,7 @@ func recomputeMasterLocked(room *room) {
 			if head[member] >= len(room.queues[member]) {
 				continue
 			}
-			if best == "" || fairerLocked(room.order, member, slot, best, bestSlot, heard, waited) {
+			if best == "" || fairerLocked(member, slot, best, bestSlot, waited) {
 				best, bestSlot = member, slot
 			}
 		}
@@ -801,22 +856,20 @@ func recomputeMasterLocked(room *room) {
 		item := room.queues[best][head[best]]
 		head[best]++
 		if item.ID == inflight {
-			continue // the song on: already counted, already not in the order
+			continue // the song on: its turn is already in the ledger
 		}
 		master = append(master, item)
-		heard[best]++
-		// A picked song counts as the most recent, so the next tie goes to
-		// whoever has waited rather than falling back to join order.
-		waited[best] = 1 << 62
+		next++
+		waited[best] = next
 	}
 	room.master = master
 }
 
-// fairerLocked reports whether member a takes the next slot over member b.
-func fairerLocked(order []string, a string, aSlot int, b string, bSlot int, heard map[string]int, waited map[string]int64) bool {
-	if heard[a] != heard[b] {
-		return heard[a] < heard[b]
-	}
+// fairerLocked reports whether member a is owed the next turn over member b.
+// The member whose last turn is older goes first; a never-played member's last
+// turn reads as zero, so they go before everybody who has played. Equally old
+// turns fall back to join order.
+func fairerLocked(a string, aSlot int, b string, bSlot int, waited map[string]int64) bool {
 	if waited[a] != waited[b] {
 		return waited[a] < waited[b]
 	}
@@ -854,7 +907,7 @@ func (m *Manager) EnqueueMany(ctx context.Context, roomID, memberID string, trac
 	sources, readErr := m.loadQueueTracks(ctx, trackIDs)
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	defer m.unlock()
 
 	room, err := m.roomLocked(roomID)
 	if err != nil {
@@ -874,6 +927,7 @@ func (m *Manager) EnqueueMany(ctx context.Context, roomID, memberID string, trac
 		items = append(items, m.queueItemLocked(memberID, src))
 	}
 	room.queues[memberID] = append(room.queues[memberID], items...)
+	m.touchedLocked(room)
 	recomputeMasterLocked(room)
 	m.publishLocked(room, EventQueueUpdated, queueDataLocked(room, memberID))
 	m.startIfListeningLocked(room)
@@ -884,7 +938,7 @@ func (m *Manager) EnqueueMany(ctx context.Context, roomID, memberID string, trac
 // edit anyone's.
 func (m *Manager) Remove(roomID, memberID, itemID string) (*Snapshot, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	defer m.unlock()
 
 	room, err := m.roomLocked(roomID)
 	if err != nil {
@@ -901,6 +955,7 @@ func (m *Manager) Remove(roomID, memberID, itemID string) (*Snapshot, error) {
 				return nil, err
 			}
 			room.queues[owner] = append(items[:i], items[i+1:]...)
+			m.touchedLocked(room)
 			recomputeMasterLocked(room)
 			m.publishLocked(room, EventQueueUpdated, queueDataLocked(room, owner))
 			return m.snapshotLocked(room), nil
@@ -913,7 +968,7 @@ func (m *Manager) Remove(roomID, memberID, itemID string) (*Snapshot, error) {
 // A member edits their own queue; the host may edit anyone's.
 func (m *Manager) Reorder(roomID, memberID string, itemIDs []string) (*Snapshot, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	defer m.unlock()
 
 	room, err := m.roomLocked(roomID)
 	if err != nil {
@@ -959,6 +1014,7 @@ func (m *Manager) Reorder(roomID, memberID string, itemIDs []string) (*Snapshot,
 	}
 
 	room.queues[owner] = reordered
+	m.touchedLocked(room)
 	recomputeMasterLocked(room)
 	m.publishLocked(room, EventQueueUpdated, queueDataLocked(room, owner))
 	return m.snapshotLocked(room), nil
@@ -968,7 +1024,7 @@ func (m *Manager) Reorder(roomID, memberID string, itemIDs []string) (*Snapshot,
 // caller is the host.
 func (m *Manager) Clear(roomID, memberID, targetMemberID string) (*Snapshot, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	defer m.unlock()
 
 	room, err := m.roomLocked(roomID)
 	if err != nil {
@@ -988,6 +1044,7 @@ func (m *Manager) Clear(roomID, memberID, targetMemberID string) (*Snapshot, err
 	}
 
 	room.queues[targetMemberID] = []QueueItem{}
+	m.touchedLocked(room)
 	recomputeMasterLocked(room)
 	m.publishLocked(room, EventQueueUpdated, queueDataLocked(room, targetMemberID))
 	return m.snapshotLocked(room), nil
@@ -1005,7 +1062,6 @@ func (m *Manager) beginLocked(room *room) bool {
 	}
 	item := room.master[0]
 	room.master = room.master[1:]
-	room.playedCounts[item.AddedBy]++
 	room.lastPlayedAtMs[item.AddedBy] = m.nowMsLocked()
 	room.current = &playback{
 		item:       item,
@@ -1087,7 +1143,7 @@ func (m *Manager) anyoneListeningLocked(room *room) bool {
 // Pause freezes the room position.
 func (m *Manager) Pause(roomID, memberID string) (*Snapshot, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	defer m.unlock()
 
 	room, err := m.roomLocked(roomID)
 	if err != nil {
@@ -1096,6 +1152,7 @@ func (m *Manager) Pause(roomID, memberID string) (*Snapshot, error) {
 	if err := m.checkControlLocked(room, memberID); err != nil {
 		return nil, err
 	}
+	m.touchedLocked(room)
 	current := room.current
 	if current == nil || !current.started || current.paused {
 		return nil, ErrNoPlayback
@@ -1110,7 +1167,7 @@ func (m *Manager) Pause(roomID, memberID string) (*Snapshot, error) {
 // Resume continues from the paused position.
 func (m *Manager) Resume(roomID, memberID string) (*Snapshot, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	defer m.unlock()
 
 	room, err := m.roomLocked(roomID)
 	if err != nil {
@@ -1119,6 +1176,7 @@ func (m *Manager) Resume(roomID, memberID string) (*Snapshot, error) {
 	if err := m.checkControlLocked(room, memberID); err != nil {
 		return nil, err
 	}
+	m.touchedLocked(room)
 	current := room.current
 	if current == nil || (current.started && !current.paused) {
 		return nil, ErrNoPlayback
@@ -1137,7 +1195,7 @@ func (m *Manager) Seek(roomID, memberID string, positionMs int64) (*Snapshot, er
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	defer m.unlock()
 
 	room, err := m.roomLocked(roomID)
 	if err != nil {
@@ -1146,6 +1204,7 @@ func (m *Manager) Seek(roomID, memberID string, positionMs int64) (*Snapshot, er
 	if err := m.checkControlLocked(room, memberID); err != nil {
 		return nil, err
 	}
+	m.touchedLocked(room)
 	current := room.current
 	if current == nil {
 		return nil, ErrNoPlayback
@@ -1172,7 +1231,7 @@ func (m *Manager) Seek(roomID, memberID string, positionMs int64) (*Snapshot, er
 // Skip advances past the current song.
 func (m *Manager) Skip(roomID, memberID string) (*Snapshot, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	defer m.unlock()
 
 	room, err := m.roomLocked(roomID)
 	if err != nil {
@@ -1181,6 +1240,7 @@ func (m *Manager) Skip(roomID, memberID string) (*Snapshot, error) {
 	if err := m.checkControlLocked(room, memberID); err != nil {
 		return nil, err
 	}
+	m.touchedLocked(room)
 	if room.current == nil {
 		return nil, ErrNoPlayback
 	}
@@ -1197,21 +1257,22 @@ func (m *Manager) Vote(ctx context.Context, roomID, memberID string, score int) 
 	m.mu.Lock()
 	room, err := m.roomLocked(roomID)
 	if err != nil {
-		m.mu.Unlock()
+		m.unlock()
 		return nil, err
 	}
 	member, ok := room.members[memberID]
 	if !ok {
-		m.mu.Unlock()
+		m.unlock()
 		return nil, ErrMemberNotFound
 	}
 	current := room.current
 	if current == nil {
-		m.mu.Unlock()
+		m.unlock()
 		return nil, ErrNoPlayback
 	}
 
 	current.votes[memberID] = score
+	m.touchedLocked(room)
 	skip := m.shouldSkipLocked(room, current)
 	trackID := current.item.TrackID
 	if skip {
@@ -1220,7 +1281,7 @@ func (m *Manager) Vote(ctx context.Context, roomID, memberID string, score int) 
 		m.publishLocked(room, EventPlayback, m.playbackDataLocked(room))
 	}
 	snapshot := m.snapshotLocked(room)
-	m.mu.Unlock()
+	m.unlock()
 
 	// Votes outlive the room, so they are recorded for later stats.
 	m.persistVote(ctx, store.Vote{
@@ -1332,15 +1393,53 @@ func (m *Manager) closeRoomLocked(room *room) {
 // publishLocked announces a room change. It is the one funnel every change goes
 // through, so a room's seq counts every event and a client can tell a missed one
 // from a stream that is simply quiet.
+//
+// The event is queued rather than sent: the caller holds mu, and the send is
+// left to drain once the lock is released (see unlock). The seq is stamped here
+// so it still counts every event in the order the room made them.
 func (m *Manager) publishLocked(room *room, eventType EventType, data any) {
 	room.seq++
-	m.bus.Publish(Event{
+	m.outbox = append(m.outbox, Event{
 		Type:   eventType,
 		RoomID: room.id,
 		Seq:    room.seq,
 		AtMs:   m.nowMsLocked(),
 		Data:   data,
 	})
+}
+
+// unlock releases the manager's lock and then sends whatever events were
+// published while it was held. Every path that publishes ends by unlocking, so
+// the fan-out happens outside the critical section: a room handler waits on mu,
+// and a subscriber's channel write must not stand between the tick and every
+// handler once a second.
+func (m *Manager) unlock() {
+	m.mu.Unlock()
+	m.drain()
+}
+
+// drain sends the queued events. It takes one event at a time under the lock
+// and sends it without it, so a burst does not hold the lock for the whole
+// fan-out. sendMu keeps one drain at a time, and each takes the head of the
+// queue, so events reach subscribers in the order their seq was assigned no
+// matter which caller does the draining.
+func (m *Manager) drain() {
+	m.sendMu.Lock()
+	defer m.sendMu.Unlock()
+	for {
+		m.mu.Lock()
+		if len(m.outbox) == 0 {
+			m.mu.Unlock()
+			return
+		}
+		event := m.outbox[0]
+		m.outbox = m.outbox[1:]
+		if len(m.outbox) == 0 {
+			m.outbox = nil
+		}
+		m.mu.Unlock()
+		m.bus.Publish(event)
+	}
 }
 
 // snapshotLocked renders the room for clients.
