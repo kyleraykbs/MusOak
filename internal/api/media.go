@@ -9,6 +9,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kyleraykbs/MusOak/internal/media"
+	"github.com/kyleraykbs/MusOak/internal/ranking"
+	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
 // maxMediaVariantIDLen bounds path values before parsing, so a hostile path
@@ -40,6 +42,84 @@ func (s *Server) handleMediaFile(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	s.serveMedia(w, r, id)
+}
+
+// handleTrackStream plays a track a caller knows only by id, without the extra
+// round trip of listing its variants and choosing one: the server picks the
+// rendition it would play for this caller - the first downloadable one in their
+// effective provider order, the same choice the picker and the room path make -
+// and answers exactly as /api/v1/media/{variantId} does, streaming while the
+// file is still downloading and serving it with Range once it is on disk.
+//
+// The chosen rendition is named in X-Musoak-Variant, so a client can hand this
+// URL to its player and later swap to that rendition's media URL if it wants
+// them to be the same request from then on. A track with no downloadable
+// rendition at all is a 404 saying so, not an empty stream.
+func (s *Server) handleTrackStream(w http.ResponseWriter, r *http.Request) {
+	id, ok := trackIDFromPath(w, r)
+	if !ok {
+		return
+	}
+	if _, err := s.store.Track(r.Context(), id); err != nil {
+		writeStoreError(w, err, "track not found")
+		return
+	}
+	variant, found, err := s.preferredVariant(r.Context(), id, s.currentUser(r))
+	if err != nil {
+		writeStoreError(w, err, "variants unavailable")
+		return
+	}
+	if !found {
+		writeError(w, http.StatusNotFound,
+			"track has no downloadable rendition; resolve it first (POST /api/v1/tracks/{trackId}/resolve)")
+		return
+	}
+	w.Header().Set("X-Musoak-Variant", variant.ID.String())
+	s.serveMedia(w, r, variant.ID)
+}
+
+// preferredVariant is the rendition this server would play for a caller who
+// named only a track: the first downloadable one in their effective provider
+// order, which is the order the picker lists and the room path picks from. A
+// guest has no ranking of their own, so the aggregate order decides, exactly as
+// it does for an anonymous room member. The order is shared with the variants
+// endpoint, so a client that does resolve them and pick the first answers the
+// same variant this does.
+func (s *Server) preferredVariant(ctx context.Context, trackID uuid.UUID, user *store.User) (store.Variant, bool, error) {
+	variants, err := s.store.VariantsForTrack(ctx, trackID)
+	if err != nil {
+		return store.Variant{}, false, err
+	}
+	counts, err := s.store.VariantVoteCounts(ctx, trackID)
+	if err != nil {
+		return store.Variant{}, false, err
+	}
+	uploaders, err := s.store.VariantUploaders(ctx, trackID)
+	if err != nil {
+		return store.Variant{}, false, err
+	}
+	order, err := s.effectiveOrder(ctx, user)
+	if err != nil {
+		return store.Variant{}, false, err
+	}
+	var caller uuid.UUID
+	if user != nil {
+		caller = user.ID
+	}
+	for _, variant := range ranking.OrderVariants(order, variants, uploaders, counts, caller) {
+		if variant.Downloadable {
+			return variant, true, nil
+		}
+	}
+	return store.Variant{}, false, nil
+}
+
+// serveMedia answers one rendition's URL: the name it downloads under, the
+// source's own bytes while the file is still arriving, and the finished file
+// once it is on disk. Every path that plays a rendition goes through it, so the
+// track-level stream and the media URL cannot answer differently.
+func (s *Server) serveMedia(w http.ResponseWriter, r *http.Request, id uuid.UUID) {
 	// Resolved once, and handed down: the variant tells the answer its name and
 	// where its bytes come from, and the file is the answer when the rendition is
 	// already on disk. The serve paths used to fetch both again on the way to the

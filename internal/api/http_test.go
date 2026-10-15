@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -426,6 +428,93 @@ func TestLibraryImportAndMediaServing(t *testing.T) {
 	}
 }
 
+// An imported file keeps the cover it carries. A browser measured "recorded
+// artworkUrl for 0 of 3 imported songs": the import read the tags and dropped
+// the picture. It is filed in the artwork cache and recorded on the track, so
+// the path an uploaded cover is served from answers for it too.
+func TestLibraryImportRecordsEmbeddedCover(t *testing.T) {
+	c := newHTTPTestServer(t, nil)
+	dir := t.TempDir()
+	source, picturePath := mp3WithCoverFile(t, dir)
+	picture, err := os.ReadFile(picturePath)
+	if err != nil {
+		t.Fatalf("read the embedded picture: %v", err)
+	}
+
+	rec := c.do(http.MethodPost, "/api/v1/library/import", "", map[string]string{"path": source})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("import = %d: %s", rec.Code, rec.Body.String())
+	}
+	var imported struct {
+		Imported []struct {
+			Track struct {
+				ID         string `json:"id"`
+				Title      string `json:"title"`
+				ArtworkURL string `json:"artworkUrl"`
+			} `json:"track"`
+		} `json:"imported"`
+	}
+	c.decode(rec, &imported)
+	if len(imported.Imported) != 1 {
+		t.Fatalf("imported %d entries", len(imported.Imported))
+	}
+	track := imported.Imported[0].Track
+	if track.Title != "Covered Song" {
+		t.Errorf("title = %q, want the tag's", track.Title)
+	}
+	if track.ArtworkURL != "/api/v1/artwork/track/"+track.ID {
+		t.Fatalf("artworkUrl = %q, want this server's own path", track.ArtworkURL)
+	}
+
+	// The path serves the picture the tag carried, byte for byte, out of the
+	// cache the import filed it in.
+	rec = c.do(http.MethodGet, track.ArtworkURL, "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("artwork = %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); got != "image/jpeg" {
+		t.Errorf("content type = %q, want image/jpeg", got)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), picture) {
+		t.Errorf("served %d bytes, want the %d the file embedded", rec.Body.Len(), len(picture))
+	}
+	rec = c.do(http.MethodGet, track.ArtworkURL, "", nil)
+	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), picture) {
+		t.Errorf("second artwork request = %d, %d bytes", rec.Code, rec.Body.Len())
+	}
+}
+
+// A file with no picture still imports, and records no cover: the picture is a
+// bonus, never a condition.
+func TestLibraryImportWithoutCoverRecordsNone(t *testing.T) {
+	c := newHTTPTestServer(t, nil)
+	source := toneFile(t, t.TempDir(), "Bare.opus")
+
+	rec := c.do(http.MethodPost, "/api/v1/library/import", "", map[string]string{"path": source})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("import = %d: %s", rec.Code, rec.Body.String())
+	}
+	var imported struct {
+		Imported []struct {
+			Track struct {
+				ID         string `json:"id"`
+				ArtworkURL string `json:"artworkUrl"`
+			} `json:"track"`
+		} `json:"imported"`
+	}
+	c.decode(rec, &imported)
+	if len(imported.Imported) != 1 {
+		t.Fatalf("imported %d entries", len(imported.Imported))
+	}
+	track := imported.Imported[0].Track
+	if track.ArtworkURL != "" {
+		t.Errorf("artworkUrl = %q, want none", track.ArtworkURL)
+	}
+	if rec := c.do(http.MethodGet, "/api/v1/artwork/track/"+track.ID, "", nil); rec.Code != http.StatusNotFound {
+		t.Errorf("artwork for a track with no cover = %d, want 404", rec.Code)
+	}
+}
+
 func TestMediaDownloadRejectsUnknownVariant(t *testing.T) {
 	c := newHTTPTestServer(t, nil)
 	rec := c.do(http.MethodPost, "/api/v1/media/00000000-0000-0000-0000-000000000000/download", "", nil)
@@ -441,13 +530,53 @@ func TestMediaDownloadRejectsUnknownVariant(t *testing.T) {
 func toneFile(t *testing.T, dir, name string) string {
 	t.Helper()
 	dst := filepath.Join(dir, name)
-	cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+	if err := renderFFmpeg(t, "-hide_banner", "-loglevel", "error", "-y",
 		"-f", "lavfi", "-i", "sine=frequency=440:duration=1.0",
-		"-c:a", "libopus", "-f", "opus", dst)
+		"-c:a", "libopus", "-f", "opus", dst); err != nil {
+		t.Skipf("ffmpeg unavailable: %v", err)
+	}
+	return dst
+}
+
+// mp3WithCoverFile renders a one-second mp3 with an embedded JPEG cover, and
+// returns the audio beside the picture it embedded so a test can compare what
+// the server hands back with what went in. ffmpeg renders the cover first and
+// copies it into the tag unchanged, which is the shape a file off somebody's
+// disk has.
+func mp3WithCoverFile(t *testing.T, dir string) (audio, picture string) {
+	t.Helper()
+	picture = filepath.Join(dir, "cover.jpg")
+	if err := renderFFmpeg(t, "-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "color=c=red:s=64x64:d=1", "-frames:v", "1", picture); err != nil {
+		t.Skipf("ffmpeg unavailable: %v", err)
+	}
+	audio = filepath.Join(dir, "Covered Song.mp3")
+	if err := renderFFmpeg(t, "-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=1.0",
+		"-i", picture,
+		"-map", "0:a", "-map", "1:v",
+		"-c:a", "libmp3lame", "-c:v", "copy",
+		"-id3v2_version", "3",
+		"-metadata", "title=Covered Song",
+		"-metadata", "artist=An Artist",
+		"-metadata", "album=An Album",
+		"-metadata:s:v", "title=Album cover",
+		"-metadata:s:v", "comment=Cover (front)",
+		audio); err != nil {
+		t.Skipf("ffmpeg cannot embed a cover: %v", err)
+	}
+	return audio, picture
+}
+
+// renderFFmpeg runs one ffmpeg fixture render, reporting what it said when it
+// fails.
+func renderFFmpeg(t *testing.T, args ...string) error {
+	t.Helper()
+	cmd := exec.Command("ffmpeg", args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		t.Skipf("ffmpeg unavailable: %v: %s", err, stderr.String())
+		return fmt.Errorf("%w: %s", err, stderr.String())
 	}
-	return dst
+	return nil
 }

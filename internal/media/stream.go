@@ -56,7 +56,20 @@ const (
 // pressing play and the first byte. That fetch is its own provider process, so
 // only a couple of listeners run one at a time for a variant; beyond that the
 // answer is a 503 to come back to, not another process for the same bytes.
+//
+// What streaming does not remove is the provider's own startup: yt-dlp must
+// start and reach the network before its first byte, and that wait is what is
+// left. It is measured, not guessed - the wait for the provider to start is
+// carried on the answer as `X-Musoak-Provider-Ms`, and one log line at the
+// first byte records both that wait and the wait from there to the listener's
+// first audio.
 func (m *Manager) Stream(w http.ResponseWriter, r *http.Request, variantID uuid.UUID, res Resolved) bool {
+	// started is when the request reached this path. Everything a listener
+	// waits through before the provider's own process begins is measured from
+	// here, so the floor streaming cannot remove - the provider's startup,
+	// which is network-bound - is a measured number rather than a guess.
+	started := time.Now()
+
 	// A HEAD asks for what a GET would answer and none of its bytes. Starting a
 	// provider fetch to answer one is an yt-dlp run per request that only wanted
 	// headers; leaving it to the file answers a HEAD from what is on disk.
@@ -125,11 +138,21 @@ func (m *Manager) Stream(w http.ResponseWriter, r *http.Request, variantID uuid.
 	}
 	defer body.Close()
 
+	// The provider is under way: yt-dlp has reported the container it chose,
+	// which is the moment its own startup and extractor work is done and its
+	// bytes are about to flow. That wait - the part streaming cannot shorten,
+	// because it is the tool reaching the network - is what this records.
+	providerStart := time.Since(started)
+
 	w.Header().Set("Content-Type", contentType)
 	// The finished file answers this URL later with different bytes: nothing may
 	// keep this response, and it must never be validated as the file.
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Musoak-Stream", "1")
+	// The split between this server's own work and the provider's startup,
+	// free to carry on a response that has not been written yet. The wait for
+	// the first byte is the other half and is in the log line.
+	w.Header().Set("X-Musoak-Provider-Ms", strconv.FormatInt(providerStart.Milliseconds(), 10))
 	if length := m.streamLength(r.Context(), variant); length > 0 {
 		// The length the server knows, for a client that wants a timeline: the
 		// audio still arriving has no length of its own, and a bar drawn from
@@ -143,7 +166,7 @@ func (m *Manager) Stream(w http.ResponseWriter, r *http.Request, variantID uuid.
 		flusher.Flush()
 	}
 
-	m.copyStream(w, r, body, variantID)
+	m.copyStream(w, r, body, variantID, started, providerStart)
 	return true
 }
 
@@ -258,12 +281,27 @@ func rangeWithin(header string, size int64) bool {
 
 // copyStream hands a source's bytes on as they arrive. A failed write is a
 // listener that has gone; the source is left to the caller's Close.
-func (m *Manager) copyStream(w http.ResponseWriter, r *http.Request, body io.Reader, variantID uuid.UUID) {
+//
+// started is when the request reached Stream and providerStart is when the
+// provider's own fetch began producing; the first bytes are where their sum
+// ends, and the one log line says both, so the floor streaming leaves in place
+// - the provider's network-bound startup - is on record rather than in a guess.
+func (m *Manager) copyStream(w http.ResponseWriter, r *http.Request, body io.Reader, variantID uuid.UUID, started time.Time, providerStart time.Duration) {
 	flusher, canFlush := w.(http.Flusher)
 	buf := make([]byte, streamChunk)
+	first := true
 	for {
 		n, err := body.Read(buf)
 		if n > 0 {
+			if first {
+				// One line per stream, not per chunk: a stream can run for
+				// minutes and every chunk is the socket, not new information.
+				first = false
+				m.logger.Info("media: stream started",
+					"variant", variantID,
+					"provider_ms", providerStart.Milliseconds(),
+					"first_byte_ms", (time.Since(started) - providerStart).Milliseconds())
+			}
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				return
 			}

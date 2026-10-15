@@ -72,17 +72,62 @@ func (b *idleBody) Close() error {
 }
 
 // StreamInfo is what a streamed answer says about itself: whether the server is
-// streaming a variant it has not finished downloading, and the track's length
-// when the server knows it. A stream carries no length of its own - no
-// Content-Length, no ETag, no ranges - so this is where a client draws a
-// timeline for audio whose own length is still unknown.
+// streaming a variant it has not finished downloading, the track's length when
+// the server knows it, and, for a track-level stream, the rendition the server
+// chose. A stream carries no length of its own - no Content-Length, no ETag, no
+// ranges - so this is where a client draws a timeline for audio whose own length
+// is still unknown.
 type StreamInfo struct {
+	// VariantID is the rendition the server chose for a track-level stream,
+	// from X-Musoak-Variant. It is empty when the request named the rendition
+	// itself, or when the answer did not carry the header.
+	VariantID string
 	// Streaming is true when the answer is a source stream rather than the
 	// stored rendition; a request for a finished file is not streamed.
 	Streaming bool
 	// DurationMs is the track's length in milliseconds, zero when the server
 	// does not know it.
 	DurationMs int64
+}
+
+// streamResponse performs a media GET whose first byte may be slow - a stream
+// starts a provider fetch - and returns the raw response so the caller reads
+// what its headers say. The short request timeout is dropped: the header
+// arrives with the source's first bytes, and a slow provider is not a slow
+// request.
+func (c *Client) streamResponse(ctx context.Context, url string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	c.decorate(req)
+
+	hc := *c.http
+	hc.Timeout = 0
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		defer resp.Body.Close()
+		return nil, decodeError(resp)
+	}
+	return resp, nil
+}
+
+// streamInfoFrom reads what a media or track-stream answer says about itself
+// from its headers, so both questions are answered by one reading.
+func streamInfoFrom(resp *http.Response) StreamInfo {
+	info := StreamInfo{
+		VariantID: strings.TrimSpace(resp.Header.Get("X-Musoak-Variant")),
+		Streaming: resp.Header.Get("X-Musoak-Stream") != "",
+	}
+	if raw := strings.TrimSpace(resp.Header.Get("X-Musoak-Duration")); raw != "" {
+		if ms, err := strconv.ParseInt(raw, 10, 64); err == nil && ms > 0 {
+			info.DurationMs = ms
+		}
+	}
+	return info
 }
 
 // MediaStreamInfo asks what a variant's URL would answer and reads only the
@@ -92,33 +137,27 @@ type StreamInfo struct {
 // stream will actually be played from, so the length describes the song it is
 // playing.
 func (c *Client) MediaStreamInfo(ctx context.Context, variantID string, startMs int64) (StreamInfo, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.MediaURL(variantID, startMs), nil)
-	if err != nil {
-		return StreamInfo{}, err
-	}
-	c.decorate(req)
-
-	// A stream starts a provider fetch, which must not inherit the short
-	// request timeout: the header arrives with the source's first bytes, and a
-	// slow provider is not a slow request.
-	hc := *c.http
-	hc.Timeout = 0
-	resp, err := hc.Do(req)
+	resp, err := c.streamResponse(ctx, c.MediaURL(variantID, startMs))
 	if err != nil {
 		return StreamInfo{}, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return StreamInfo{}, decodeError(resp)
-	}
+	return streamInfoFrom(resp), nil
+}
 
-	info := StreamInfo{Streaming: resp.Header.Get("X-Musoak-Stream") != ""}
-	if raw := strings.TrimSpace(resp.Header.Get("X-Musoak-Duration")); raw != "" {
-		if ms, err := strconv.ParseInt(raw, 10, 64); err == nil && ms > 0 {
-			info.DurationMs = ms
-		}
+// TrackStreamInfo asks the server to pick and stream a rendition of a track the
+// caller knows only by id, and reads only the headers: which rendition the
+// server chose, whether it is streaming, and how long the track is. The audio is
+// not read and the response is closed at once. This is where a client learns
+// X-Musoak-Variant - the rendition it could not name itself - so it can hand the
+// player TrackStreamURL now and swap to that rendition's MediaURL later.
+func (c *Client) TrackStreamInfo(ctx context.Context, trackID string, startMs int64) (StreamInfo, error) {
+	resp, err := c.streamResponse(ctx, c.TrackStreamURL(trackID, startMs))
+	if err != nil {
+		return StreamInfo{}, err
 	}
-	return info, nil
+	defer resp.Body.Close()
+	return streamInfoFrom(resp), nil
 }
 
 // Sink plays a rendition. The CLI's sink drives a local player; a Discord

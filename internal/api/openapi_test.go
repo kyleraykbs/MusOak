@@ -95,6 +95,7 @@ func TestDocumentedEndpointsExist(t *testing.T) {
 		"/api/v1/search",
 		"/api/v1/tracks/{trackId}",
 		"/api/v1/tracks/{trackId}/variants",
+		"/api/v1/tracks/{trackId}/stream",
 		"/api/v1/tracks/{trackId}/resolve",
 		"/api/v1/media/{variantId}",
 		"/api/v1/media/{variantId}/status",

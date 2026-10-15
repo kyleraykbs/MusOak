@@ -88,6 +88,27 @@ func (c *Client) MediaURL(variantID string, startMs int64) string {
 	return media + "?" + query.Encode()
 }
 
+// TrackStreamURL is the URL a track's server-chosen rendition is streamed from,
+// for a client that knows only the track: the server picks the rendition by the
+// caller's own provider ranking - the same choice the variant picker makes - so
+// playback starts without the extra round trip of listing the variants and
+// choosing one. The answer is exactly the media URL's, and names the rendition
+// it chose in X-Musoak-Variant, so a client can hand this to a player now and
+// swap to that rendition's MediaURL later if it wants the two to be the same
+// request from then on.
+//
+// startMs is where inside the track the stream should begin, exactly as it is
+// for MediaURL.
+func (c *Client) TrackStreamURL(trackID string, startMs int64) string {
+	stream := c.baseURL + "/api/v1/tracks/" + trackID + "/stream"
+	if startMs <= 0 {
+		return stream
+	}
+	query := url.Values{}
+	query.Set("start", strconv.FormatInt(startMs, 10))
+	return stream + "?" + query.Encode()
+}
+
 // Token returns the current bearer token, empty for a guest.
 func (c *Client) Token() string { return c.token }
 

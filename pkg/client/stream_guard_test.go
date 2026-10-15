@@ -33,6 +33,51 @@ func TestMediaURLCarriesTheStartOffset(t *testing.T) {
 	}
 }
 
+// TestTrackStreamURLNamesTheTrackLevelStream pins the URL a client that knows
+// only the track hands its player: the server picks the rendition, so the
+// client cannot name one - which is why MediaURL cannot be used here.
+func TestTrackStreamURLNamesTheTrackLevelStream(t *testing.T) {
+	c := client.New("http://localhost:4420/")
+	if got, want := c.TrackStreamURL("track-1", 0), "http://localhost:4420/api/v1/tracks/track-1/stream"; got != want {
+		t.Errorf("TrackStreamURL = %q, want %q", got, want)
+	}
+	if got, want := c.TrackStreamURL("track-1", 45_000), "http://localhost:4420/api/v1/tracks/track-1/stream?start=45000"; got != want {
+		t.Errorf("TrackStreamURL = %q, want %q", got, want)
+	}
+}
+
+// TestTrackStreamInfoReadsTheChosenVariant pins the decode that closes the
+// track-level loop: the rendition the server chose is read from
+// X-Musoak-Variant, alongside the stream marker and the length, so a client can
+// swap to that rendition's media URL later.
+func TestTrackStreamInfoReadsTheChosenVariant(t *testing.T) {
+	var gotPath string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/tracks/track-1/stream", func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("X-Musoak-Variant", "variant-9")
+		w.Header().Set("X-Musoak-Stream", "1")
+		w.Header().Set("X-Musoak-Duration", "213000")
+		_, _ = w.Write([]byte("arriving"))
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	info, err := client.New(server.URL).TrackStreamInfo(context.Background(), "track-1", 0)
+	if err != nil {
+		t.Fatalf("TrackStreamInfo: %v", err)
+	}
+	if info.VariantID != "variant-9" {
+		t.Errorf("VariantID = %q, want the rendition the server chose", info.VariantID)
+	}
+	if !info.Streaming || info.DurationMs != 213_000 {
+		t.Errorf("info = %+v, want a stream of 213000ms", info)
+	}
+	if gotPath != "/api/v1/tracks/track-1/stream" {
+		t.Errorf("path = %q, want the track-level stream", gotPath)
+	}
+}
+
 // TestMediaStreamInfoReadsTheStreamHeaders pins the probe that tells a client
 // what a stream says about itself before any of its bytes are read: that it is
 // a stream, and the track's length, which the audio itself cannot report.

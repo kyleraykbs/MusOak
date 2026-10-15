@@ -211,6 +211,72 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /api/v1/tracks/{trackId}/stream:
+    get:
+      tags: [media]
+      summary: Play a track without naming its rendition
+      description: |
+        The server picks the rendition it would play for this caller - the first
+        downloadable one in their effective provider order, the same choice the
+        variant picker makes - so a client that knows only the track id can
+        start the bytes in one request instead of listing the variants and
+        choosing. The answer is exactly `GET /api/v1/media/{variantId}`'s: a
+        finished file with Range support and an ETag, or the source streamed
+        while it downloads, marked `X-Musoak-Stream: 1`.
+
+        The chosen rendition is named in `X-Musoak-Variant`, so a client can
+        hand this URL to its player and swap to that rendition's media URL
+        later. A track with no downloadable rendition at all is a 404.
+      operationId: streamTrack
+      parameters:
+        - { $ref: "#/components/parameters/TrackID" }
+        - name: start
+          in: query
+          required: false
+          description: |
+            Where in the track a stream should begin, in milliseconds, exactly
+            as `GET /api/v1/media/{variantId}` reads it. A finished file is
+            ranged as usual.
+          schema: { type: integer, format: int64, minimum: 0 }
+      responses:
+        "200":
+          description: The whole file, or a stream of it while it downloads.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+            X-Musoak-Variant:
+              description: The rendition the server chose for this caller.
+              schema: { type: string, format: uuid }
+            X-Musoak-Stream:
+              description: Present, and `1`, when this is a stream of a variant that has not finished downloading.
+              schema: { type: string }
+            X-Musoak-Duration:
+              description: |
+                The track's length in milliseconds, when the server knows it.
+              schema: { type: integer, format: int64 }
+            X-Musoak-Provider-Ms:
+              description: |
+                How long the request waited for the provider's own process to
+                start producing, in milliseconds. The rest of the wait is the
+                provider's network-bound work and is logged, not guessed.
+              schema: { type: integer, format: int64 }
+          content:
+            audio/ogg:
+              schema: { type: string, format: binary }
+            audio/mp4:
+              schema: { type: string, format: binary }
+            audio/webm:
+              schema: { type: string, format: binary }
+        "206":
+          description: The requested byte range.
+          content:
+            audio/ogg:
+              schema: { type: string, format: binary }
+        "404":
+          description: No such track, or the track has no downloadable rendition.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /api/v1/tracks/{trackId}/resolve:
     post:
       tags: [library]
@@ -287,6 +353,11 @@ paths:
                 The track's length in milliseconds, when the server knows it.
                 A stream has no length of its own - it is a fetch in progress -
                 so this is what a client draws a timeline from.
+              schema: { type: integer, format: int64 }
+            X-Musoak-Provider-Ms:
+              description: |
+                How long the request waited for the provider's own process to
+                start producing, in milliseconds.
               schema: { type: integer, format: int64 }
           content:
             audio/ogg:

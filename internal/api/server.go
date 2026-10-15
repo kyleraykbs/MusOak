@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/kyleraykbs/MusOak/internal/artwork"
 	"github.com/kyleraykbs/MusOak/internal/auth"
 	"github.com/kyleraykbs/MusOak/internal/config"
@@ -95,7 +97,10 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		searches:  newSearchAnswers(SearchAnswerTTL, 256),
 	}
 	quotaBytes := int64(cfg.Media.QuotaMB) * 1024 * 1024
-	s.media = media.New(filepath.Join(cfg.StorageDir, "media"), quotaBytes, db, s.providers, logger)
+	// The artwork cache is built first: it is the seam the media pipeline
+	// files the covers imported files carry through.
+	s.artwork = artwork.New(filepath.Join(cfg.StorageDir, "artwork"), db, logger)
+	s.media = media.New(filepath.Join(cfg.StorageDir, "media"), quotaBytes, db, s.providers, importArtwork{s.artwork}, logger)
 	s.matcher = match.New(db, s.providers, cfg.Match.Threshold, logger)
 	s.auth = auth.New(cfg, db, logger)
 	s.ranking = ranking.New(db, cfg.DefaultProviderOrder, logger)
@@ -105,7 +110,6 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 	s.rooms.Start()
 	s.radio = radio.New(db, s.providers, s.matcher, logger)
 	s.library = library.New(db, s.providers, s.matcher, logger)
-	s.artwork = artwork.New(filepath.Join(cfg.StorageDir, "artwork"), db, logger)
 	s.lyrics = lyrics.New(db, lyrics.NewLRCLIB(), logger)
 
 	// One search burst may be as wide as a handful of keystrokes; login bursts
@@ -128,6 +132,37 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 	s.routes()
 	return s, nil
 }
+
+// importArtwork is the seam internal/media files an imported file's cover
+// through: the media package hands over the picture and gets back the artwork
+// source its track records. It lives here because the cache the image lands in,
+// and the path clients fetch it from, are this package's.
+type importArtwork struct{ fetcher *artwork.Fetcher }
+
+// StoreImportedArtwork files the cover an imported file carried under the
+// source a local track's image is cached at, and answers that source.
+//
+// The source is a pseudo-URL, not something to download - the bytes are already
+// here. It is what makes the track's cover answer on /api/v1/artwork/track/<id>.
+func (a importArtwork) StoreImportedArtwork(trackID uuid.UUID, contentType string, data []byte) (string, error) {
+	// The tag's own type is the only thing an imported picture comes with, so
+	// it decides the suffix the image is stored and served under. A type this
+	// server does not serve (a BMP cover, a tag that says nothing) is an error:
+	// the import goes on without a cover.
+	extension, known := artwork.ExtensionFor(artwork.ContentType(contentType))
+	if !known {
+		return "", fmt.Errorf("artwork: %q is not an image this server serves", contentType)
+	}
+	source := localArtworkSource(trackID)
+	if err := a.fetcher.Store(source, data, extension); err != nil {
+		return "", err
+	}
+	return source, nil
+}
+
+// localArtworkSource is the pseudo-URL an imported file's cover is cached
+// under: stable and unique per track, as uploadSource is per upload.
+func localArtworkSource(id uuid.UUID) string { return "local:" + id.String() }
 
 // Close releases the server's resources.
 func (s *Server) Close() error {
