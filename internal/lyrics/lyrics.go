@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -74,17 +75,63 @@ const (
 	sourceLRCLIBNone = "lrclib-none"
 )
 
+// Bound on one lookup. A caller that passes its own deadline keeps it; this is
+// the service's own leash, so a source that has stopped answering cannot hold a
+// lookup - and the goroutine that asked for it - open for the caller's whole
+// patience.
+const fetchTimeout = 10 * time.Second
+
+// The failure breaker. A source that has just failed this many times in a row
+// is left alone for the cooldown: a dead or hanging LRCLIB then costs a couple
+// of lookups per cooldown instead of one per lyric-less song opened in a burst.
+//
+// Nothing is written to the cache while it is out, so a failure stays what it
+// is - an unanswered question - rather than becoming the answer "this song has
+// no words".
+const (
+	breakerFailures = 2
+	breakerCooldown = 30 * time.Second
+)
+
+// maxConcurrentFetches bounds how many lookups are in flight at once. A burst
+// of songs opened together then queues behind a handful of source calls rather
+// than opening one connection per song, and a caller that cannot get a slot
+// within its own deadline gives up cheaply instead of piling on.
+const maxConcurrentFetches = 4
+
 // Service resolves one rendition's lyrics and caches the answer.
 type Service struct {
 	store   Store
 	fetcher Fetcher
 	logger  *slog.Logger
+
+	// now is what the breaker's cooldown is measured against.
+	now func() time.Time
+	// fetchTimeout bounds one lookup, so the service is bounded even when its
+	// caller asks with no deadline at all.
+	fetchTimeout time.Duration
+	// slots is the concurrency bound above.
+	slots chan struct{}
+
+	breakerMu  sync.Mutex
+	failures   int
+	retryAfter time.Time
 }
 
 // New returns a service that reads and writes its cache through store and asks
 // fetcher for anything the cache does not have.
 func New(store Store, fetcher Fetcher, logger *slog.Logger) *Service {
-	return &Service{store: store, fetcher: fetcher, logger: logger}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &Service{
+		store:        store,
+		fetcher:      fetcher,
+		logger:       logger,
+		now:          time.Now,
+		fetchTimeout: fetchTimeout,
+		slots:        make(chan struct{}, maxConcurrentFetches),
+	}
 }
 
 // Resolve returns one rendition's lyrics, or nil when the lookup failed. A
@@ -92,6 +139,10 @@ func New(store Store, fetcher Fetcher, logger *slog.Logger) *Service {
 // cached like an instrumental, so a song without lyrics is not asked about
 // again on every open. A source that fails is not an answer at all: nothing is
 // cached, and the next open tries again.
+//
+// A source that has just failed repeatedly is not asked again for a short
+// while, which is also not an answer: the lookup fails cheaply (see the breaker
+// above) and the next open after the cooldown asks again.
 //
 // The only errors that leave this method are the store's: an unknown track, or
 // a cache that could not be read.
@@ -101,17 +152,32 @@ func (s *Service) Resolve(ctx context.Context, trackID, variantID uuid.UUID) (*s
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return nil, err
 	}
+	if !s.asking() {
+		// The source is out. Nothing is cached for a question that was never
+		// put to it, and the caller is told what a failed lookup tells it.
+		return nil, nil
+	}
 
 	query, err := s.query(ctx, trackID, variantID)
 	if err != nil {
 		return nil, err
 	}
 
+	ctx, cancel := context.WithTimeout(ctx, s.fetchTimeout)
+	defer cancel()
+	if !s.enter(ctx) {
+		// No slot within the deadline: the answer is not worth waiting for.
+		return nil, nil
+	}
+	defer s.leave()
+
 	result, err := s.fetcher.Fetch(ctx, query)
 	if err != nil {
+		s.failed()
 		s.warn("lyrics fetch failed", "track", trackID, "variant", variantID, "error", err)
 		return nil, nil
 	}
+	s.answered()
 	if result.Instrumental {
 		found := &store.Lyrics{
 			TrackID:    trackID,
@@ -185,6 +251,46 @@ func (s *Service) save(ctx context.Context, l *store.Lyrics) {
 		s.warn("could not cache lyrics", "track", l.TrackID, "variant", l.VariantID, "error", err)
 	}
 }
+
+// asking reports whether the source is worth asking now. After enough failures
+// in a row it is left alone until the cooldown has passed; the first failure
+// after that closes the window again, so a source that is still down is asked
+// about once per cooldown rather than once per song.
+func (s *Service) asking() bool {
+	s.breakerMu.Lock()
+	defer s.breakerMu.Unlock()
+	return s.failures < breakerFailures || !s.now().Before(s.retryAfter)
+}
+
+// failed records a lookup the source did not answer, and arms the cooldown.
+func (s *Service) failed() {
+	s.breakerMu.Lock()
+	defer s.breakerMu.Unlock()
+	s.failures++
+	s.retryAfter = s.now().Add(breakerCooldown)
+}
+
+// answered records that the source is alive, which is enough to close the
+// breaker: one answer is what it takes to know the source is not out.
+func (s *Service) answered() {
+	s.breakerMu.Lock()
+	defer s.breakerMu.Unlock()
+	s.failures, s.retryAfter = 0, time.Time{}
+}
+
+// enter takes a slot for one lookup, or reports false when the deadline passes
+// first, so a burst cannot open a source call per song.
+func (s *Service) enter(ctx context.Context) bool {
+	select {
+	case s.slots <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// leave gives the slot back.
+func (s *Service) leave() { <-s.slots }
 
 func (s *Service) warn(message string, args ...any) {
 	if s.logger != nil {

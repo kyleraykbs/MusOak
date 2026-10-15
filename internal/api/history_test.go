@@ -226,3 +226,134 @@ func TestPlayHistoryFlow(t *testing.T) {
 		t.Fatalf("favorites = %+v, want First with two plays", favorites.Tracks)
 	}
 }
+
+// A client that never saw the answer - a dropped response, a reload, a retry -
+// reports the same stop again, and one listen must not be counted twice: a
+// double count is a wrong "most played". A real second listen is not caught by
+// this, because it takes more than the window of listening to produce one.
+func TestRepeatedPlayReportCountsOnce(t *testing.T) {
+	c := newHTTPTestServer(t, nil)
+	c.register("kyle", "hunter2hunter2")
+	kyle := c.userNamed("kyle")
+	track := seedTracks(t, c, "Once")[0]
+
+	report := map[string]any{
+		"trackId": track.ID.String(), "playedMs": 60_000, "source": "web",
+	}
+	for range 3 {
+		rec := c.call(c.handleRecordPlay, http.MethodPost, "/api/v1/me/plays", kyle, report)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("repeat report = %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+
+	rec := c.call(c.handleHistory, http.MethodGet, "/api/v1/me/history", kyle, nil)
+	var page historyPage
+	c.decode(rec, &page)
+	if len(page.Plays) != 1 {
+		t.Fatalf("history = %d plays, want the one listen", len(page.Plays))
+	}
+	rec = c.call(c.handleTopTracks, http.MethodGet, "/api/v1/me/stats/top", kyle, nil)
+	var top topPage
+	c.decode(rec, &top)
+	if len(top.Tracks) != 1 || top.Tracks[0].Plays != 1 {
+		t.Fatalf("top tracks = %+v, want one play", top.Tracks)
+	}
+
+	// A different length heard is a different listen, even straight away: a
+	// skip at five seconds and one at a minute are two stops, not one.
+	rec = c.call(c.handleRecordPlay, http.MethodPost, "/api/v1/me/plays", kyle, map[string]any{
+		"trackId": track.ID.String(), "playedMs": 61_000, "source": "web",
+	})
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("second listen = %d", rec.Code)
+	}
+	rec = c.call(c.handleTopTracks, http.MethodGet, "/api/v1/me/stats/top", kyle, nil)
+	c.decode(rec, &top)
+	if len(top.Tracks) != 1 || top.Tracks[0].Plays != 2 {
+		t.Fatalf("top tracks after a different listen = %+v, want two plays", top.Tracks)
+	}
+}
+
+// A listing holds up to two hundred listens and renders them in a fixed number
+// of queries (store.TracksFor, Server.buildTracks), not one set per row - and
+// the rows still come back with their credits and covers, in the order they
+// were listened to, with a deleted song dropped rather than rendered empty.
+func TestHistoryListingRendersInBatches(t *testing.T) {
+	c := newHTTPTestServer(t, nil)
+	c.register("kyle", "hunter2hunter2")
+	kyle := c.userNamed("kyle")
+	ctx := context.Background()
+
+	tracks := seedTracks(t, c, "One", "Two", "Three")
+	for _, track := range tracks {
+		if err := c.store.SetTrackArtists(ctx, track.ID, []string{"An Artist"}); err != nil {
+			t.Fatalf("SetTrackArtists: %v", err)
+		}
+		if err := c.store.SetTrackAlbums(ctx, track.ID, []string{"An Album"}); err != nil {
+			t.Fatalf("SetTrackAlbums: %v", err)
+		}
+		if err := c.store.SetTrackArtwork(ctx, track.ID, "/art/"+track.ID.String()+".jpg"); err != nil {
+			t.Fatalf("SetTrackArtwork: %v", err)
+		}
+	}
+
+	// More listens than the default page holds, all of the same song but with
+	// different lengths heard so each one counts.
+	for i := range defaultHistoryLimit + 10 {
+		rec := c.call(c.handleRecordPlay, http.MethodPost, "/api/v1/me/plays", kyle, map[string]any{
+			"trackId": tracks[i%len(tracks)].ID.String(), "playedMs": 30_000 + i,
+		})
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("play %d = %d: %s", i, rec.Code, rec.Body.String())
+		}
+	}
+	// The newest listen names a song that has since been deleted.
+	gone := seedTracks(t, c, "Gone")[0]
+	if rec := c.call(c.handleRecordPlay, http.MethodPost, "/api/v1/me/plays", kyle, map[string]any{
+		"trackId": gone.ID.String(), "playedMs": 45_000,
+	}); rec.Code != http.StatusNoContent {
+		t.Fatalf("play of the deleted song = %d", rec.Code)
+	}
+	if err := c.store.DeleteTrack(ctx, gone.ID); err != nil {
+		t.Fatalf("DeleteTrack: %v", err)
+	}
+
+	rec := c.call(c.handleHistory, http.MethodGet, "/api/v1/me/history", kyle, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("history = %d: %s", rec.Code, rec.Body.String())
+	}
+	var page struct {
+		Plays []struct {
+			AtMs  int64 `json:"atMs"`
+			Track struct {
+				ID      string   `json:"id"`
+				Artists []string `json:"artists"`
+				Albums  []string `json:"albums"`
+				Artwork string   `json:"artworkUrl"`
+				Title   string   `json:"title"`
+			} `json:"track"`
+		} `json:"plays"`
+	}
+	c.decode(rec, &page)
+	if len(page.Plays) != defaultHistoryLimit {
+		t.Fatalf("history = %d plays, want the %d the page holds", len(page.Plays), defaultHistoryLimit)
+	}
+	for i, play := range page.Plays {
+		if play.Track.ID == gone.ID.String() {
+			t.Fatal("a deleted song is still in the history")
+		}
+		if len(play.Track.Artists) != 1 || play.Track.Artists[0] != "An Artist" {
+			t.Fatalf("play %d artists = %v", i, play.Track.Artists)
+		}
+		if len(play.Track.Albums) != 1 || play.Track.Albums[0] != "An Album" {
+			t.Fatalf("play %d albums = %v", i, play.Track.Albums)
+		}
+		if play.Track.Artwork == "" {
+			t.Fatalf("play %d has no artwork", i)
+		}
+		if i > 0 && page.Plays[i-1].AtMs < play.AtMs {
+			t.Fatal("history is not newest first")
+		}
+	}
+}

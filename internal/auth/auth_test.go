@@ -229,3 +229,51 @@ func TestIssuePrunesExpiredSessions(t *testing.T) {
 		t.Errorf("stale session survived a login: %v", err)
 	}
 }
+
+// brokenUserStore is a store that answers everything except the account read,
+// which fails the way a database having a bad moment does.
+type brokenUserStore struct {
+	*store.DB
+	err error
+}
+
+func (b *brokenUserStore) User(context.Context, uuid.UUID) (*store.User, error) {
+	return nil, b.err
+}
+
+// A store that cannot read the account is not a bad token: reporting it as one
+// turns a database being briefly unavailable into "sign in again" for every
+// client holding a perfectly good token.
+func TestAuthenticateKeepsStoreFailuresOutOfBadTokens(t *testing.T) {
+	db, err := store.Open("file:auth-" + uuid.NewString() + "?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	broken := errors.New("database is on fire")
+	svc := New(config.Default(), &brokenUserStore{DB: db, err: broken}, slog.New(slog.DiscardHandler))
+
+	_, token, err := svc.Register(context.Background(), "kyle", "hunter2hunter2")
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	user, err := svc.Authenticate(context.Background(), token)
+	if user != nil {
+		t.Errorf("Authenticate = %+v, want no account", user)
+	}
+	if errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("a store failure was reported as an invalid token: %v", err)
+	}
+	if !errors.Is(err, broken) {
+		t.Fatalf("err = %v, want the store's own failure", err)
+	}
+
+	// An account that is gone is an invalid token: a session row cannot
+	// outlive its account (it cascades), so nothing else explains it.
+	gone := New(config.Default(), &brokenUserStore{DB: db, err: store.ErrNotFound}, slog.New(slog.DiscardHandler))
+	if _, err := gone.Authenticate(context.Background(), token); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("err = %v, want ErrInvalidToken", err)
+	}
+}

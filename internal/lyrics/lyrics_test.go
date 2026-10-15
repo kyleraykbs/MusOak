@@ -6,7 +6,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -381,4 +383,163 @@ func TestLRCLIBErrorStatusIsAnError(t *testing.T) {
 		context.Background(), Query{Artist: "A", Track: "B"}); err == nil {
 		t.Error("a 500 must be an error, not an empty answer")
 	}
+}
+
+// A source that has just failed repeatedly is left alone for a while. A dead or
+// hanging LRCLIB then costs a couple of lookups per cooldown rather than one per
+// lyric-less song opened in a burst - and nothing is written to the cache, so a
+// failure stays the unanswered question it is rather than becoming the answer
+// "this song has no words".
+func TestResolveStopsAskingASourceThatKeepsFailing(t *testing.T) {
+	fs := &fakeStore{track: testTrack(uuid.New())}
+	fetcher := &fakeFetcher{err: errors.New("network down")}
+	svc := New(fs, fetcher, nil)
+
+	for i := range breakerFailures + 3 {
+		found, err := svc.Resolve(context.Background(), fs.track.ID, uuid.Nil)
+		if err != nil {
+			t.Fatalf("lookup %d: %v", i, err)
+		}
+		if found != nil {
+			t.Fatalf("lookup %d answered %+v, want no answer", i, found)
+		}
+	}
+	if got := len(fetcher.calls); got != breakerFailures {
+		t.Errorf("source calls = %d, want the source left alone after %d failures", got, breakerFailures)
+	}
+	if len(fs.saves) != 0 {
+		t.Errorf("a failure was cached as an answer: %+v", fs.saves)
+	}
+}
+
+// The cooldown is not forever, and one answer closes the breaker: a blip costs
+// a few lookups and no more, and the song is answered properly once the source
+// is well again.
+func TestResolveAsksAgainAfterTheCooldown(t *testing.T) {
+	fs := &fakeStore{track: testTrack(uuid.New())}
+	fetcher := &fakeFetcher{err: errors.New("network down")}
+	svc := New(fs, fetcher, nil)
+
+	for i := range breakerFailures + 2 {
+		if found, err := svc.Resolve(context.Background(), fs.track.ID, uuid.Nil); err != nil || found != nil {
+			t.Fatalf("lookup %d = (%+v, %v)", i, found, err)
+		}
+	}
+	if got := len(fetcher.calls); got != breakerFailures {
+		t.Fatalf("source calls = %d, want the breaker to hold", got)
+	}
+
+	// The cooldown passes and the source is well again.
+	svc.now = func() time.Time { return time.Now().Add(breakerCooldown + time.Second) }
+	fetcher.err = nil
+	fetcher.result = Result{Plain: "words"}
+
+	found, err := svc.Resolve(context.Background(), fs.track.ID, uuid.Nil)
+	if err != nil {
+		t.Fatalf("after the cooldown: %v", err)
+	}
+	if found == nil || found.Plain != "words" {
+		t.Fatalf("after the cooldown = %+v, want the source asked again", found)
+	}
+	if got := len(fetcher.calls); got != breakerFailures+1 {
+		t.Errorf("source calls = %d, want one more after the cooldown", got)
+	}
+
+	// The answer is cached and the breaker is closed, so the next open is free.
+	if _, err := svc.Resolve(context.Background(), fs.track.ID, uuid.Nil); err != nil {
+		t.Fatalf("cached read: %v", err)
+	}
+	if got := len(fetcher.calls); got != breakerFailures+1 {
+		t.Errorf("source calls = %d, want the answer read from the cache", got)
+	}
+}
+
+// gatedFetcher holds every lookup open until it is released, so a test can see
+// how many the service lets run at once. It fails rather than answers, which is
+// the state a burst of opens meets a dead source in.
+type gatedFetcher struct {
+	mu      sync.Mutex
+	calls   int
+	entered chan struct{}
+	release chan struct{}
+}
+
+func newGatedFetcher() *gatedFetcher {
+	return &gatedFetcher{entered: make(chan struct{}, 16), release: make(chan struct{})}
+}
+
+func (g *gatedFetcher) Fetch(ctx context.Context, _ Query) (Result, error) {
+	g.mu.Lock()
+	g.calls++
+	g.mu.Unlock()
+	select {
+	case g.entered <- struct{}{}:
+	default:
+	}
+	select {
+	case <-g.release:
+		return Result{}, errors.New("network down")
+	case <-ctx.Done():
+		return Result{}, ctx.Err()
+	}
+}
+
+func (g *gatedFetcher) count() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.calls
+}
+
+// A burst of opens does not open one source call per song: the lookups queue
+// behind a handful of slots, and a caller that cannot get one within its
+// deadline gives up cheaply - answering "no lyrics" the way a failed lookup
+// does - instead of piling on.
+func TestResolveBoundsConcurrentLookups(t *testing.T) {
+	fs := &fakeStore{track: testTrack(uuid.New())}
+	gate := newGatedFetcher()
+	svc := New(fs, gate, nil)
+
+	// The same song opened by a burst of clients at once: every one of them
+	// misses the cache, and the service decides how many reach the source.
+	// Their own patience is the service's default, which outlasts this test.
+	var wg sync.WaitGroup
+	for range maxConcurrentFetches {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if found, err := svc.Resolve(context.Background(), fs.track.ID, uuid.Nil); err != nil || found != nil {
+				t.Errorf("lookup = (%+v, %v), want no answer", found, err)
+			}
+		}()
+	}
+	for range maxConcurrentFetches {
+		select {
+		case <-gate.entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("the lookups never reached the source")
+		}
+	}
+
+	// One more, with a patience shorter than the slots will be held for: no
+	// slot is free, so its own deadline is what ends it.
+	waiting, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if found, err := svc.Resolve(waiting, fs.track.ID, uuid.Nil); err != nil || found != nil {
+			t.Errorf("waiting lookup = (%+v, %v), want no answer", found, err)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a lookup without a slot never gave up")
+	}
+	if got := gate.count(); got != maxConcurrentFetches {
+		t.Errorf("source calls in flight = %d, want at most %d", got, maxConcurrentFetches)
+	}
+
+	close(gate.release)
+	wg.Wait()
 }

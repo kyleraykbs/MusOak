@@ -168,7 +168,17 @@ func (s *Service) Authenticate(ctx context.Context, token string) (*store.User, 
 	}
 	user, err := s.db.User(ctx, session.UserID)
 	if err != nil {
-		return nil, ErrInvalidToken
+		if errors.Is(err, store.ErrNotFound) {
+			// The account behind the session is gone. Sessions are removed
+			// with their account (the row cascades), so this is a session row
+			// that outlived a deletion; there is nobody to be signed in as.
+			return nil, ErrInvalidToken
+		}
+		// A store that cannot answer is not a bad token: the caller reports an
+		// invalid token as "sign in again", and a database having a bad moment
+		// must not sign the whole household out. Whoever called this decides
+		// what to do with an error that is not an authentication failure.
+		return nil, fmt.Errorf("auth: read the session's account: %w", err)
 	}
 	return user, nil
 }

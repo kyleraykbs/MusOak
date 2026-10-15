@@ -161,3 +161,47 @@ func TestSearchKeyNamesTheQuestion(t *testing.T) {
 		}
 	}
 }
+
+// A held answer that carries something live is re-stamped on every read: the
+// window is for the expensive part of the answer, and the part that changes
+// while it stands - a rendition's download state - is not served stale for the
+// rest of the window. A search with nothing live in it holds its answer as it
+// stands, which is what do does.
+func TestSearchAnswersRestampLiveAnswersOnEveryRead(t *testing.T) {
+	cache := newSearchAnswers(time.Minute, 8)
+
+	var calls atomic.Int32
+	ask := func() (any, error) {
+		calls.Add(1)
+		return "held", nil
+	}
+	restamp := func(held any) any { return held.(string) + "+live" }
+
+	first, err := cache.doLive("q", ask, restamp)
+	if err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	// The first caller gets the ask's own answer, so there is nothing stale in
+	// what it is handed.
+	if first != "held" {
+		t.Errorf("first read = %v, want the fresh answer", first)
+	}
+
+	second, err := cache.doLive("q", ask, restamp)
+	if err != nil {
+		t.Fatalf("second read: %v", err)
+	}
+	if second != "held+live" {
+		t.Errorf("second read = %v, want the held answer re-stamped", second)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("provider calls = %d, want the ask held", got)
+	}
+
+	if got, err := cache.do("q", ask); err != nil || got != "held" {
+		t.Errorf("do = %v, %v, want the held answer untouched", got, err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("provider calls = %d, want do to read the held answer", got)
+	}
+}

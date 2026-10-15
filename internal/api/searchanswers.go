@@ -61,12 +61,30 @@ func newSearchAnswers(ttl time.Duration, max int) *searchAnswers {
 
 // do runs fn for the key, unless its answer is already here or on its way.
 func (c *searchAnswers) do(key string, fn func() (any, error)) (any, error) {
+	return c.doLive(key, fn, nil)
+}
+
+// doLive is do for an answer that carries something live: the window holds the
+// expensive part of the answer - the provider round trip and the matching - but
+// a held answer whose content can change while it stands would otherwise be
+// served stale for the whole window. A song downloaded a moment ago must not be
+// reported as still downloading because the search that named it was answered
+// before the download finished.
+//
+// restamp is handed the held value on every read and returns what the caller
+// gets. It must return a copy, never the held value: several readers can be
+// served the same held answer at once. A nil restamp serves the answer as it
+// stands, which is what do does.
+func (c *searchAnswers) doLive(key string, fn func() (any, error), restamp func(any) any) (any, error) {
 	for {
 		c.mu.Lock()
 		entry, seen := c.entries[key]
 		if seen && entry.done == nil && time.Since(entry.at) < c.ttl {
 			value, err := entry.value, entry.err
 			c.mu.Unlock()
+			if restamp != nil && err == nil {
+				value = restamp(value)
+			}
 			return value, err
 		}
 		if seen && entry.done != nil {

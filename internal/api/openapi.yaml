@@ -255,8 +255,25 @@ paths:
         and carries no ETag. The container is the source's own (`audio/mp4`,
         `audio/webm`, `audio/ogg`), not the stored Ogg/Opus. The download carries
         on in the background, so a later request is answered from disk.
+
+        `start` begins a stream where a listener already is - a room whose song
+        is a minute gone, a session picked up where it was left - and what
+        arrives is the rest of the track, running to its end. A client that
+        wants to move inside a stream asks again with a new `start`; a stream
+        itself cannot be ranged, because it is a fetch in progress rather than a
+        file.
       operationId: getMedia
-      parameters: [{ $ref: "#/components/parameters/VariantID" }]
+      parameters:
+        - { $ref: "#/components/parameters/VariantID" }
+        - name: start
+          in: query
+          required: false
+          description: |
+            Where in the track a stream should begin, in milliseconds. Only
+            consulted when the answer is a stream; a finished file is ranged as
+            usual. Zero, absent or unparseable means the whole track from the
+            beginning.
+          schema: { type: integer, format: int64, minimum: 0 }
       responses:
         "200":
           description: The whole file, or a stream of it while it downloads.
@@ -265,6 +282,12 @@ paths:
             X-Musoak-Stream:
               description: Present, and `1`, when this is a stream of a variant that has not finished downloading.
               schema: { type: string }
+            X-Musoak-Duration:
+              description: |
+                The track's length in milliseconds, when the server knows it.
+                A stream has no length of its own - it is a fetch in progress -
+                so this is what a client draws a timeline from.
+              schema: { type: integer, format: int64 }
           content:
             audio/ogg:
               schema: { type: string, format: binary }
@@ -1829,7 +1852,19 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409":
-          description: No selected provider has a rendition of the seed track.
+          description: |
+            No station could be built from the seed: either none of the selected
+            providers has a rendition of it, or the providers that answered had
+            no suggestions at all. The seed itself is in the library; nothing
+            about the request will change, so asking again will not build one
+            either.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "502":
+          description: |
+            Every provider that was asked failed, so there was nothing to build
+            a station from. The failure names the providers and what each said.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }

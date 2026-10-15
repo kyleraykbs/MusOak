@@ -54,8 +54,12 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 // searchTracksAnswer is the tracks search, held under the same caching and
 // sharing every other search is: the same question, asked again inside the
 // window, is answered from here rather than from the providers.
+//
+// Its answer is also the only one that carries something live - each
+// rendition's download state - so it is held through doLive and that state is
+// asked for again on every read (freshSearchMedia).
 func (s *Server) searchTracksAnswer(r *http.Request, query string, limit int, providers []string) (searchResponse, error) {
-	value, err := s.searches.do(searchKey("tracks", query, providers, limit), func() (any, error) {
+	value, err := s.searches.doLive(searchKey("tracks", query, providers, limit), func() (any, error) {
 		// Detached: one caller hanging up must not take a shared answer with it.
 		ctx := context.WithoutCancel(r.Context())
 		results := s.providers.SearchSome(ctx, providers, query, provider.SearchOpts{Limit: limit})
@@ -90,6 +94,8 @@ func (s *Server) searchTracksAnswer(r *http.Request, query string, limit int, pr
 			}
 		}
 		return response, nil
+	}, func(held any) any {
+		return s.freshSearchMedia(r.Context(), held)
 	})
 	if err != nil {
 		return searchResponse{}, err
@@ -104,6 +110,57 @@ func (s *Server) searchTracksAnswer(r *http.Request, query string, limit int, pr
 	}
 	s.withPlays(r.Context(), s.currentUser(r), refs)
 	return response, nil
+}
+
+// freshSearchMedia re-reads the download state of every rendition in a held
+// search answer, and answers with a copy of it carrying those states.
+//
+// A search answer is held for the whole window (searchanswers.go), and what it
+// says about a rendition's file is live: a song downloaded a moment ago must
+// not keep being reported as downloading because the question was answered
+// before the download finished. The expensive parts - the providers' round
+// trip and the matching - are what the window is for and stay held; the file
+// state is asked for again on every read, which is one query for the listing
+// plus a memory lookup per rendition (media.Manager.Status).
+//
+// The held answer is shared by every reader, so the groups and each group's
+// renditions are copied before their states are written.
+func (s *Server) freshSearchMedia(ctx context.Context, held any) any {
+	response, ok := held.(searchResponse)
+	if !ok {
+		return held
+	}
+	groups := make([]searchGroup, len(response.Groups))
+	copy(groups, response.Groups)
+
+	ids := make([]uuid.UUID, 0, len(groups))
+	for i := range groups {
+		for _, variant := range groups[i].Variants {
+			if id, err := uuid.Parse(variant.ID); err == nil {
+				ids = append(ids, id)
+			}
+		}
+	}
+	ready, err := s.store.MediaFilesFor(ctx, ids)
+	if err != nil {
+		// A listing is still worth answering; the manager below fills every row.
+		ready = nil
+	}
+	for i := range groups {
+		variants := groups[i].Variants
+		stamped := make([]variantResponse, len(variants))
+		for j := range variants {
+			stamped[j] = variants[j]
+			id, err := uuid.Parse(variants[j].ID)
+			if err != nil {
+				continue
+			}
+			stamped[j].Media = s.variantMediaStatus(ctx, id, ready)
+		}
+		groups[i].Variants = stamped
+	}
+	response.Groups = groups
+	return response
 }
 
 // searchRequest is the shape every search shares: the words, how many, and
