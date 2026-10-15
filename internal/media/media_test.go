@@ -94,12 +94,29 @@ func (f *fakeProvider) Download(ctx context.Context, id, dest string, _ provider
 
 func newTestManager(t *testing.T, p provider.Provider) (*Manager, *store.DB) {
 	t.Helper()
+	return newTestManagerWithArtwork(t, p, nil)
+}
+
+// newTestManagerWithArtwork is newTestManager for an import whose cover has to
+// be filed somewhere.
+func newTestManagerWithArtwork(t *testing.T, p provider.Provider, artwork ArtworkStorer) (*Manager, *store.DB) {
+	t.Helper()
 	db := openTestDB(t)
 	var providers []provider.Provider
 	if p != nil {
 		providers = append(providers, p)
 	}
-	m := New(filepath.Join(t.TempDir(), "media"), 0, db, newTestRegistry(t, providers...), discardLogger())
+	dir, err := os.MkdirTemp("", "musoak-test-media-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Not t.TempDir(): a fetch the manager still has in flight when a test ends
+	// can touch this path a moment later, and t.TempDir's cleanup fails the run
+	// with "directory not empty" for that - a flake that says nothing about what
+	// the test asserted. A stream starts its download on a goroutine by design,
+	// so tests that stream cannot make that race go away; this can.
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	m := New(dir, 0, db, newTestRegistry(t, providers...), artwork, discardLogger())
 	return m, db
 }
 

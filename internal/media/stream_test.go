@@ -114,6 +114,7 @@ func TestAStreamStartsWhereTheListenerIs(t *testing.T) {
 		resp.Body.Close()
 		pw.Close()
 		srv.Close()
+		settled(t, m, variant.ID)
 
 		if !streamed {
 			t.Fatalf("%q: not answered as a stream (status %s)", test.query, resp.Status)
@@ -134,6 +135,11 @@ func TestAStreamCarriesTheLengthTheServerKnows(t *testing.T) {
 		contentType:  "audio/webm",
 		pipe:         pr,
 		writer:       pw,
+		// The download a stream starts in the background never finishes here, so
+		// nothing is still writing into the test's directory when it ends: a
+		// fetch that completes mid-test left a file half-written under
+		// t.TempDir and the cleanup failed, one run in three.
+		hold: true,
 	}
 	m, db := newTestManager(t, p)
 	m.SetDownloadRetry(1, time.Millisecond)
@@ -151,6 +157,7 @@ func TestAStreamCarriesTheLengthTheServerKnows(t *testing.T) {
 	if got := resp.Header.Get("X-Musoak-Duration"); got != "187500" {
 		t.Errorf("X-Musoak-Duration = %q, want the variant's length 187500", got)
 	}
+	settled(t, m, variant.ID)
 }
 
 func TestStartOffset(t *testing.T) {
@@ -195,6 +202,24 @@ func (p *streamProvider) Download(ctx context.Context, id, dest string, progress
 		close(p.recorded)
 	}
 	return errors.New("stream test: the download is not what is under test here")
+}
+
+// settled waits for the background fetch a stream starts to finish, so a test
+// never ends while the manager is still working inside its own temp directory:
+// Go removes that directory at cleanup, and a goroutine that touches it a
+// moment later fails the run with "directory not empty" - a flake that says
+// nothing about what the test asserted.
+func settled(t *testing.T, m *Manager, variantID uuid.UUID) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		switch m.Status(context.Background(), variantID).State {
+		case StateReady, StateFailed, StateNone:
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("the background fetch never settled for %s", variantID)
 }
 
 // serveStream puts a manager's stream behind a real HTTP server, so the test
