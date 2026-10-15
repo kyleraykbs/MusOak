@@ -278,26 +278,53 @@ func (s *Server) writePlaylistDetail(w http.ResponseWriter, r *http.Request, pla
 		return
 	}
 
-	detail := playlistDetailResponse{
-		playlistResponse: playlistSummary(playlist, viewer),
-		Items:            make([]playlistItemResponse, 0, len(items)),
-	}
-	detail.TrackCount = len(items)
+	// One read for the whole playlist, not three per song. A playlist is longer
+	// than a page of anything else, and the artists and albums of every entry
+	// come back together (see buildTracks): a two-hundred-song playlist cost six
+	// hundred round trips to render.
+	ids := make([]uuid.UUID, 0, len(items))
 	for _, item := range items {
-		track, err := s.store.Track(r.Context(), item.TrackID)
-		if errors.Is(err, store.ErrNotFound) {
+		ids = append(ids, item.TrackID)
+	}
+	byID, err := s.store.TracksFor(r.Context(), ids)
+	if err != nil {
+		writeStoreError(w, err, "playlist unavailable")
+		return
+	}
+	positions := make([]int, 0, len(items))
+	tracks := make([]store.Track, 0, len(items))
+	for _, item := range items {
+		track, ok := byID[item.TrackID]
+		if !ok {
 			continue // the track was deleted from under the playlist
 		}
-		if err != nil {
-			writeStoreError(w, err, "playlist unavailable")
-			return
+		positions = append(positions, item.Position)
+		tracks = append(tracks, track)
+	}
+	responses, err := s.buildTracks(r.Context(), tracks)
+	if err != nil {
+		writeStoreError(w, err, "playlist unavailable")
+		return
+	}
+	// The lookup buildTrack makes for a single track, kept: the header may have
+	// been read before the cover was learned, so a track that has a cover is not
+	// shown without one. Only the entries the batch left bare are asked about.
+	for i := range responses {
+		if responses[i].ArtworkURL != "" {
+			continue
 		}
-		response, err := s.buildTrack(r.Context(), *track)
-		if err != nil {
-			writeStoreError(w, err, "playlist unavailable")
-			return
+		if url, err := s.store.TrackArtwork(r.Context(), tracks[i].ID); err == nil && url != "" {
+			responses[i].ArtworkURL = artworkPath(store.ArtworkTrack, tracks[i].ID)
 		}
-		detail.Items = append(detail.Items, playlistItemResponse{Position: item.Position, Track: response})
+	}
+
+	detail := playlistDetailResponse{
+		playlistResponse: playlistSummary(playlist, viewer),
+		Items:            make([]playlistItemResponse, 0, len(responses)),
+	}
+	detail.TrackCount = len(items)
+	for i := range responses {
+		detail.Items = append(detail.Items, playlistItemResponse{Position: positions[i], Track: responses[i]})
 	}
 	refs := make([]*trackResponse, 0, len(detail.Items))
 	for i := range detail.Items {
