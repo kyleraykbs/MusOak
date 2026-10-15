@@ -1,6 +1,7 @@
 package media
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dhowden/tag"
 	"github.com/google/uuid"
 
 	"github.com/kyleraykbs/MusOak/internal/ffmpeg"
@@ -39,6 +41,82 @@ func tone(t *testing.T, dir string, name string, seconds float64) string {
 
 func trimFloat(f float64) string {
 	return strconvFormat(f)
+}
+
+// mp3WithCover renders a one-second mp3 carrying an embedded JPEG cover, and
+// returns the audio beside the picture it embedded so a test can compare what
+// was stored with what went in. ffmpeg renders the cover first and copies it
+// into the tag unchanged, which is the shape a file off somebody's disk has.
+func mp3WithCover(t *testing.T, dir string) (audio, cover string) {
+	t.Helper()
+	if missing := ffmpeg.Missing(); len(missing) > 0 {
+		t.Skipf("ffmpeg unavailable: %v", missing)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cover = filepath.Join(dir, "cover.jpg")
+	if err := runFFmpeg(ctx, []string{"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "color=c=red:s=64x64:d=1", "-frames:v", "1", cover}); err != nil {
+		t.Skipf("ffmpeg cannot render a cover: %v", err)
+	}
+
+	audio = filepath.Join(dir, "Covered Song.mp3")
+	if err := runFFmpeg(ctx, []string{"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=1.0",
+		"-i", cover,
+		"-map", "0:a", "-map", "1:v",
+		"-c:a", "libmp3lame", "-c:v", "copy",
+		"-id3v2_version", "3",
+		"-metadata", "title=Covered Song",
+		"-metadata", "artist=An Artist",
+		"-metadata", "album=An Album",
+		"-metadata:s:v", "title=Album cover",
+		"-metadata:s:v", "comment=Cover (front)",
+		audio}); err != nil {
+		t.Skipf("ffmpeg cannot embed a cover: %v", err)
+	}
+	return audio, cover
+}
+
+// storedPicture is one call into the artwork storer.
+type storedPicture struct {
+	trackID     uuid.UUID
+	contentType string
+	data        []byte
+}
+
+// fakeArtworkStorer stands in for the artwork cache the server wires in: it
+// remembers what it was handed rather than writing a file.
+type fakeArtworkStorer struct {
+	// err, when set, refuses every picture, as an image the server cannot
+	// serve does.
+	err error
+	// answer, when set, is the source Store reports for a picture it filed.
+	answer *string
+
+	mu    sync.Mutex
+	calls []storedPicture
+}
+
+func (f *fakeArtworkStorer) StoreImportedArtwork(trackID uuid.UUID, contentType string, data []byte) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return "", f.err
+	}
+	f.calls = append(f.calls, storedPicture{trackID: trackID, contentType: contentType, data: data})
+	if f.answer != nil {
+		return *f.answer, nil
+	}
+	return "local:" + trackID.String(), nil
+}
+
+// stored returns the calls made so far.
+func (f *fakeArtworkStorer) stored() []storedPicture {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]storedPicture(nil), f.calls...)
 }
 
 // fakeProvider serves a fixture file as if it had downloaded it.
@@ -466,6 +544,140 @@ func TestScanDirImportsAudioFiles(t *testing.T) {
 		if v.Provider != store.LocalProvider {
 			t.Errorf("variant %s provider = %s", v.ID, v.Provider)
 		}
+	}
+}
+
+// An imported file that carries a cover keeps it: the picture goes through the
+// artwork storer and the source it answers is recorded on the track, which is
+// what a browser fetches the cover from.
+func TestImportRecordsEmbeddedCover(t *testing.T) {
+	dir := t.TempDir()
+	source, coverPath := mp3WithCover(t, dir)
+	cover, err := os.ReadFile(coverPath)
+	if err != nil {
+		t.Fatalf("read the embedded picture: %v", err)
+	}
+
+	storer := &fakeArtworkStorer{}
+	m, db := newTestManagerWithArtwork(t, nil, storer)
+	ctx := context.Background()
+
+	variant, err := m.Import(ctx, source)
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+
+	calls := storer.stored()
+	if len(calls) != 1 {
+		t.Fatalf("the cover was filed %d times, want 1", len(calls))
+	}
+	if calls[0].trackID != variant.TrackID {
+		t.Errorf("cover filed for track %s, want %s", calls[0].trackID, variant.TrackID)
+	}
+	if calls[0].contentType != "image/jpeg" {
+		t.Errorf("content type = %q, want the type the tag carried", calls[0].contentType)
+	}
+	if !bytes.Equal(calls[0].data, cover) {
+		t.Errorf("filed %d bytes, want the %d the file embedded", len(calls[0].data), len(cover))
+	}
+
+	recorded, err := db.TrackArtwork(ctx, variant.TrackID)
+	if err != nil {
+		t.Fatalf("TrackArtwork: %v", err)
+	}
+	if recorded != "local:"+variant.TrackID.String() {
+		t.Errorf("artwork_url = %q, want the source the cover was filed under", recorded)
+	}
+}
+
+// A manager built without an artwork cache - every manager but the ones wired
+// through the server - still imports a file that carries a cover, and records
+// none, rather than tripping over the picture.
+func TestImportWithoutAnArtworkStorerRecordsNoCover(t *testing.T) {
+	dir := t.TempDir()
+	source, _ := mp3WithCover(t, dir)
+
+	m, db := newTestManager(t, nil)
+	ctx := context.Background()
+	variant, err := m.Import(ctx, source)
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if _, err := db.TrackArtwork(ctx, variant.TrackID); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("artwork = %v, want none recorded", err)
+	}
+}
+
+// A file with no cover still imports, and records none: the picture is a bonus,
+// never a condition.
+func TestScanDirRecordsCoversOnlyForFilesThatCarryOne(t *testing.T) {
+	dir := t.TempDir()
+	mp3WithCover(t, dir)
+	tone(t, dir, "Bare.opus", 0.5)
+
+	storer := &fakeArtworkStorer{}
+	m, db := newTestManagerWithArtwork(t, nil, storer)
+	ctx := context.Background()
+	imported, err := m.ScanDir(ctx, dir)
+	if err != nil {
+		t.Fatalf("ScanDir: %v", err)
+	}
+	if len(imported) != 2 {
+		t.Fatalf("imported = %d, want 2", len(imported))
+	}
+	for _, variant := range imported {
+		_, err := db.TrackArtwork(ctx, variant.TrackID)
+		hasCover := err == nil
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("TrackArtwork: %v", err)
+		}
+		if want := variant.Title == "Covered Song"; hasCover != want {
+			t.Errorf("track %q has a cover = %v, want %v", variant.Title, hasCover, want)
+		}
+	}
+	if calls := storer.stored(); len(calls) != 1 {
+		t.Errorf("the cover was filed %d times, want 1", len(calls))
+	}
+}
+
+// Every way a cover can be unusable leaves the import alone: a picture past the
+// cap is never handed to the cache, and one the cache refuses is logged rather
+// than recorded. The pictures here are the ones ffmpeg will not embed for a
+// test, so the seam is called the way an import calls it.
+func TestUnusableCoversAreSkippedNotFatal(t *testing.T) {
+	ctx := context.Background()
+	storer := &fakeArtworkStorer{}
+	m, db := newTestManagerWithArtwork(t, nil, storer)
+
+	track := &store.Track{Title: "Song"}
+	if err := db.CreateTrack(ctx, track); err != nil {
+		t.Fatal(err)
+	}
+
+	// Past the cap the upload endpoint applies.
+	m.storeCover(ctx, track.ID, &tag.Picture{MIMEType: "image/jpeg", Data: make([]byte, maxImportedArtworkBytes+1)})
+	if calls := storer.stored(); len(calls) != 0 {
+		t.Errorf("an oversized picture reached the cache: %d bytes", len(calls[0].data))
+	}
+
+	// A type this server does not serve: the cache refuses it.
+	storer.err = errors.New("artwork: image/bmp is not an image this server serves")
+	m.storeCover(ctx, track.ID, &tag.Picture{MIMEType: "image/bmp", Data: []byte("bmp")})
+	if calls := storer.stored(); len(calls) != 0 {
+		t.Errorf("a refused picture was stored anyway: %+v", calls)
+	}
+
+	// A cache that files nothing has nothing to record.
+	storer.err = nil
+	none := ""
+	storer.answer = &none
+	m.storeCover(ctx, track.ID, &tag.Picture{MIMEType: "image/png", Data: []byte("png")})
+	if calls := storer.stored(); len(calls) != 1 {
+		t.Errorf("the picture was filed %d times, want 1", len(calls))
+	}
+
+	if _, err := db.TrackArtwork(ctx, track.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("artwork = %v, want none recorded", err)
 	}
 }
 

@@ -152,6 +152,8 @@ type Store interface {
 	store.MediaRepo
 	store.VariantRepo
 	store.TrackRepo
+	// ArtworkRepo is what records the cover an imported file carries.
+	store.ArtworkRepo
 }
 
 // Download retry policy: transient provider failures (a flaky yt-dlp run, a
@@ -178,6 +180,7 @@ type Manager struct {
 	quotaBytes int64
 	db         Store
 	providers  *provider.Registry
+	artwork    ArtworkStorer
 	logger     *slog.Logger
 
 	sf syncgroup
@@ -225,8 +228,9 @@ type syncgroup interface {
 
 // New returns a manager storing files in dir. quotaBytes caps the directory;
 // zero means no cap. When the cache grows past the quota, the least recently
-// served renditions are evicted.
-func New(dir string, quotaBytes int64, db Store, providers *provider.Registry, logger *slog.Logger) *Manager {
+// served renditions are evicted. artwork files the covers imported files carry,
+// and may be nil: an import then records no cover.
+func New(dir string, quotaBytes int64, db Store, providers *provider.Registry, artwork ArtworkStorer, logger *slog.Logger) *Manager {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -235,6 +239,7 @@ func New(dir string, quotaBytes int64, db Store, providers *provider.Registry, l
 		quotaBytes:       quotaBytes,
 		db:               db,
 		providers:        providers,
+		artwork:          artwork,
 		logger:           logger,
 		sf:               &singleflight.Group{},
 		status:           make(map[uuid.UUID]Status),

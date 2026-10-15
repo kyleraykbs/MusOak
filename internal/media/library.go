@@ -18,6 +18,21 @@ import (
 	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
+// maxImportedArtworkBytes bounds one cover an imported file carries. It is the
+// same cap the upload endpoint puts on an uploaded image (maxArtworkBytes in
+// internal/api): a cover is a few hundred kilobytes, and a picture past this is
+// not one. A picture this large is skipped, never the import.
+const maxImportedArtworkBytes = 8 << 20
+
+// ArtworkStorer files a cover an imported file carried, rather than one fetched
+// from a provider, and answers the value to record on the track. That value is
+// the artwork cache's source for the image, which is what the server's own
+// /api/v1/artwork/track/<id> path resolves to. An image this server cannot serve
+// is an error, and leaves the import without a cover rather than failing it.
+type ArtworkStorer interface {
+	StoreImportedArtwork(trackID uuid.UUID, contentType string, data []byte) (string, error)
+}
+
 // audioExtensions are the file types ScanDir picks up.
 var audioExtensions = map[string]bool{
 	".opus": true,
@@ -147,6 +162,10 @@ func (m *Manager) Import(ctx context.Context, path string) (*store.Variant, erro
 			return nil, err
 		}
 	}
+	// The file's own cover, filed and recorded exactly as an uploaded one is.
+	if meta.Cover != nil {
+		m.storeCover(ctx, track.ID, meta.Cover)
+	}
 
 	m.setStatus(Status{
 		VariantID:  variant.ID,
@@ -216,6 +235,9 @@ type fileTags struct {
 	Title   string
 	Artists []string
 	Album   string
+	// Cover is the picture the file carries, kept until the track exists to
+	// record it on. Nil when the file carries none.
+	Cover *tag.Picture
 }
 
 // readTags reads artist, title and album, falling back to the file name.
@@ -237,6 +259,9 @@ func readTags(path string) fileTags {
 		Title: strings.TrimSpace(md.Title()),
 		Album: strings.TrimSpace(md.Album()),
 	}
+	if picture := md.Picture(); picture != nil && len(picture.Data) > 0 {
+		out.Cover = picture
+	}
 	if artist := strings.TrimSpace(md.Artist()); artist != "" {
 		out.Artists = []string{artist}
 	}
@@ -249,4 +274,31 @@ func readTags(path string) fileTags {
 func titleFromPath(path string) string {
 	base := filepath.Base(path)
 	return strings.TrimSpace(strings.TrimSuffix(base, filepath.Ext(base)))
+}
+
+// storeCover files the picture an imported file carried and records where it
+// landed on the track, the way the upload path files a cover somebody sent.
+//
+// A picture this server cannot serve is a track without a cover, not a song
+// that could not be imported: every failure here is logged and dropped.
+func (m *Manager) storeCover(ctx context.Context, trackID uuid.UUID, cover *tag.Picture) {
+	if m.artwork == nil {
+		return
+	}
+	if len(cover.Data) > maxImportedArtworkBytes {
+		m.logger.Debug("import: cover skipped, too large",
+			"track", trackID, "bytes", len(cover.Data), "limit", maxImportedArtworkBytes)
+		return
+	}
+	source, err := m.artwork.StoreImportedArtwork(trackID, cover.MIMEType, cover.Data)
+	if err != nil {
+		m.logger.Debug("import: cover skipped", "track", trackID, "error", err)
+		return
+	}
+	if source == "" {
+		return
+	}
+	if err := m.db.SetTrackArtwork(ctx, trackID, source); err != nil {
+		m.logger.Debug("import: cover not recorded", "track", trackID, "error", err)
+	}
 }

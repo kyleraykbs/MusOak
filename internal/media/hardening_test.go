@@ -86,7 +86,7 @@ func TestEvictionRemovesLeastRecentlyUsed(t *testing.T) {
 	registry := newTestRegistry(t, fake)
 
 	// Room for two renditions, so a third forces an eviction.
-	manager := New(t.TempDir(), 2*size, db, registry, discardLogger())
+	manager := New(t.TempDir(), 2*size, db, registry, nil, discardLogger())
 	manager.SetDownloadRetry(1, time.Millisecond)
 
 	first := seedVariant(t, db, true, "ytmusic")
@@ -146,7 +146,7 @@ func TestNoQuotaMeansNoEviction(t *testing.T) {
 
 	fake := &fakeProvider{name: "ytmusic", fixture: fixture}
 	m, db := newTestManager(t, fake)
-	manager := New(m.dir, 0, db, newTestRegistry(t, fake), discardLogger())
+	manager := New(m.dir, 0, db, newTestRegistry(t, fake), nil, discardLogger())
 	manager.SetDownloadRetry(1, time.Millisecond)
 
 	ctx := context.Background()
@@ -188,7 +188,7 @@ func TestEvictionLeavesUploadsAlone(t *testing.T) {
 	registry := newTestRegistry(t, fake)
 
 	// Room for exactly one rendition, uploads excluded.
-	manager := New(t.TempDir(), size, db, registry, discardLogger())
+	manager := New(t.TempDir(), size, db, registry, nil, discardLogger())
 	manager.SetDownloadRetry(1, time.Millisecond)
 
 	ctx := context.Background()
@@ -288,7 +288,7 @@ func TestEvictionLeavesAServedFileAlone(t *testing.T) {
 	fake := &fakeProvider{name: "ytmusic", fixture: fixture}
 	db := openTestDB(t)
 	// Room for one rendition, so a sweep with two must take one.
-	manager := New(t.TempDir(), int64(len(data)), db, newTestRegistry(t, fake), discardLogger())
+	manager := New(t.TempDir(), int64(len(data)), db, newTestRegistry(t, fake), nil, discardLogger())
 	ctx := context.Background()
 
 	first := seedVariant(t, db, true, "ytmusic")
