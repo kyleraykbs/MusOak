@@ -571,7 +571,12 @@ func (r *Registry) Playlist(ctx context.Context, name, providerPlaylistID string
 	if !ok || !p.Capabilities().Playlists {
 		return nil, fmt.Errorf("%w: %s", ErrPlaylistsUnsupported, name)
 	}
-	return searcher.Playlist(ctx, providerPlaylistID)
+	// One provider's share of the wait, the same as a fan-out gives it: a
+	// provider that never answers otherwise holds this request, and every
+	// hand-over and artist sync behind it, until the client gives up.
+	cctx, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
+	return searcher.Playlist(cctx, providerPlaylistID)
 }
 
 // SearchArtists fans out to the providers that can browse artists.
@@ -621,7 +626,10 @@ func (r *Registry) Album(ctx context.Context, name, providerAlbumID string) (*Al
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrNotSearchableByAlbum, name)
 	}
-	return searcher.Album(ctx, providerAlbumID)
+	// One provider's share of the wait, the same as a fan-out gives it.
+	cctx, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
+	return searcher.Album(cctx, providerAlbumID)
 }
 
 // ArtistAlbums lists one provider artist's albums.
@@ -634,7 +642,10 @@ func (r *Registry) ArtistAlbums(ctx context.Context, name, providerArtistID stri
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrNotSearchableByArtist, name)
 	}
-	return searcher.ArtistAlbums(ctx, providerArtistID)
+	// One provider's share of the wait, the same as a fan-out gives it.
+	cctx, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
+	return searcher.ArtistAlbums(cctx, providerArtistID)
 }
 
 // Radio builds a station from seed using exactly the named providers, so a
