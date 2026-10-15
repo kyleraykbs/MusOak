@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+
+	"github.com/kyleraykbs/MusOak/internal/media"
 )
 
 // maxMediaVariantIDLen bounds path values before parsing, so a hostile path
@@ -38,29 +40,34 @@ func (s *Server) handleMediaFile(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// Resolved once, and handed down: the variant tells the answer its name and
+	// where its bytes come from, and the file is the answer when the rendition is
+	// already on disk. The serve paths used to fetch both again on the way to the
+	// first byte, once per query and once per stat.
+	res := s.media.Resolve(r.Context(), id)
+
 	// The bytes are Opus in an Ogg container, served as audio/ogg - and a
 	// browser left to itself names a download of that ".ogg". Say the name the
 	// file actually has: the extension the library stores it under, and the song
 	// it belongs to. "inline" so the same response still plays in an audio
 	// element.
 	w.Header().Set("Content-Disposition", mime.FormatMediaType("inline", map[string]string{
-		"filename": s.mediaFileName(r.Context(), id),
+		"filename": mediaFileName(res, id),
 	}))
-	if s.media.Stream(w, r, id) {
+	if s.media.Stream(w, r, id, res) {
 		return
 	}
-	s.media.ServeFile(w, r, id)
+	s.media.ServeFile(w, r, id, res)
 }
 
 // mediaFileName is what a download of a rendition should be called:
 // "Artist - Title.opus", the way the file is stored. A variant that cannot be
 // read still gets a name, its own id.
-func (s *Server) mediaFileName(ctx context.Context, variantID uuid.UUID) string {
-	variant, err := s.store.Variant(ctx, variantID)
-	if err != nil {
+func mediaFileName(res media.Resolved, variantID uuid.UUID) string {
+	if res.Variant == nil {
 		return variantID.String() + ".opus"
 	}
-	return opusFileName(strings.Join(variant.Artists, ", "), variant.Title, variantID)
+	return opusFileName(strings.Join(res.Variant.Artists, ", "), res.Variant.Title, variantID)
 }
 
 // opusFileName builds a name a file system will accept out of the song's own.

@@ -78,7 +78,7 @@ func (p *streamProvider) Download(ctx context.Context, id, dest string) error {
 func serveStream(t *testing.T, m *Manager, variantID uuid.UUID) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !m.Stream(w, r, variantID) {
+		if !m.Stream(w, r, variantID, m.Resolve(r.Context(), variantID)) {
 			http.Error(w, "media not ready", http.StatusNotFound)
 		}
 	}))
@@ -193,7 +193,7 @@ func TestStreamLeavesAFinishedFileToDisk(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/media/"+variant.ID.String(), nil)
-	if m.Stream(httptest.NewRecorder(), req, variant.ID) {
+	if m.Stream(httptest.NewRecorder(), req, variant.ID, m.Resolve(req.Context(), variant.ID)) {
 		t.Fatal("a finished file must be served from disk, not streamed")
 	}
 }
@@ -248,7 +248,7 @@ func TestStreamRefusesWhatItCannotStream(t *testing.T) {
 			variant := seedVariant(t, db, tc.downloadable, tc.variantOwner)
 
 			req := httptest.NewRequest(http.MethodGet, "/api/v1/media/"+variant.ID.String(), nil)
-			if m.Stream(httptest.NewRecorder(), req, variant.ID) {
+			if m.Stream(httptest.NewRecorder(), req, variant.ID, m.Resolve(req.Context(), variant.ID)) {
 				t.Fatal("Stream claimed to stream something it cannot")
 			}
 		})
@@ -287,7 +287,7 @@ func TestStreamKeepsTheDownloadAfterTheListenerLeaves(t *testing.T) {
 		t.Fatalf("stream status = %d, want 200", resp.StatusCode)
 	}
 
-	cancel()      // the listener skipped mid-song
+	cancel() // the listener skipped mid-song
 	_ = resp.Body.Close()
 	_ = pw.Close() // the source ends, so the handler can return
 

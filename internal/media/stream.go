@@ -45,14 +45,28 @@ const (
 // The download is not disturbed. It is started (or joined) in the background and
 // the next request for the variant is served from disk, so streaming costs one
 // extra fetch of the same audio and buys the listener the seconds between
-// pressing play and the first byte.
-func (m *Manager) Stream(w http.ResponseWriter, r *http.Request, variantID uuid.UUID) bool {
-	if _, ok := m.ready(r.Context(), variantID); ok {
+// pressing play and the first byte. That fetch is its own provider process, so
+// only a couple of listeners run one at a time for a variant; beyond that the
+// answer is a 503 to come back to, not another process for the same bytes.
+func (m *Manager) Stream(w http.ResponseWriter, r *http.Request, variantID uuid.UUID, res Resolved) bool {
+	// A HEAD asks for what a GET would answer and none of its bytes. Starting a
+	// provider fetch to answer one is an yt-dlp run per request that only wanted
+	// headers; leaving it to the file answers a HEAD from what is on disk.
+	if r.Method != http.MethodGet {
 		return false
 	}
 
-	variant, err := m.db.Variant(r.Context(), variantID)
-	if err != nil {
+	// A finished file is served from disk, so this is the gap before it. The
+	// handler resolved the file for this request already, so this is a stat and
+	// not a query.
+	if res.FileErr == nil && res.File != nil {
+		if info, err := os.Stat(res.File.Path); err == nil && info.Size() > 0 {
+			return false
+		}
+	}
+
+	variant := res.Variant
+	if variant == nil {
 		return false
 	}
 	if !variant.Downloadable ||
@@ -80,6 +94,16 @@ func (m *Manager) Stream(w http.ResponseWriter, r *http.Request, variantID uuid.
 	if r.Header.Get("Range") != "" && m.servePartRange(w, r, variantID) {
 		return true
 	}
+
+	// Past a couple of listeners, the same bytes are not fetched again: the
+	// answer is a moment, and by the time it is over the download behind them has
+	// the file.
+	if !m.beginStream(variantID) {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "media stream busy", http.StatusServiceUnavailable)
+		return true
+	}
+	defer m.endStream(variantID)
 
 	body, contentType, err := m.providers.Stream(r.Context(), variant.Provider, variant.ProviderTrackID)
 	if err != nil {
@@ -160,6 +184,8 @@ func (m *Manager) servePartRange(w http.ResponseWriter, r *http.Request, variant
 // deliver must not hold a listener's request open for ever.
 func (m *Manager) waitForRange(ctx context.Context, part *os.File, header string, size int64) (os.FileInfo, error) {
 	deadline := time.Now().Add(partRangeWait)
+	ticker := time.NewTicker(partRangePoll)
+	defer ticker.Stop()
 	for {
 		if rangeWithin(header, size) {
 			return part.Stat()
@@ -170,7 +196,7 @@ func (m *Manager) waitForRange(ctx context.Context, part *os.File, header string
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(partRangePoll):
+		case <-ticker.C:
 		}
 		if info, err := part.Stat(); err == nil {
 			size = info.Size()

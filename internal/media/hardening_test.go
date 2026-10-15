@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
@@ -114,9 +116,10 @@ func TestEvictionRemovesLeastRecentlyUsed(t *testing.T) {
 		t.Fatalf("third Ensure: %v", err)
 	}
 
-	if _, err := db.MediaFile(ctx, second.ID); !errors.Is(err, store.ErrNotFound) {
-		t.Errorf("the least recently used rendition should have been evicted, got %v", err)
-	}
+	waitForEviction(t, func() bool {
+		_, err := db.MediaFile(ctx, second.ID)
+		return errors.Is(err, store.ErrNotFound)
+	}, "evicted the least recently used rendition")
 	if _, err := os.Stat(doomed.Path); !os.IsNotExist(err) {
 		t.Errorf("evicted file is still on disk: %v", err)
 	}
@@ -199,6 +202,11 @@ func TestEvictionLeavesUploadsAlone(t *testing.T) {
 		t.Fatalf("second Ensure: %v", err)
 	}
 
+	waitForEviction(t, func() bool {
+		total, err := db.MediaBytes(ctx)
+		return err == nil && total <= size
+	}, "brought the cache back under the quota")
+
 	if _, err := db.MediaFile(ctx, upload.VariantID); err != nil {
 		t.Errorf("the upload's row was evicted: %v", err)
 	}
@@ -226,6 +234,81 @@ func waitForCalls(t *testing.T, f *fakeProvider, want int32) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("downloads = %d, want at least %d", f.calls.Load(), want)
+}
+
+// waitForEviction waits for the paced sweep to reach what a test is watching.
+// Eviction no longer runs on the request that finished a download, so the
+// assertion has to wait for it rather than read the table straight after Ensure.
+func waitForEviction(t *testing.T, met func() bool, what string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if met() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("the sweep never %s", what)
+}
+
+// seedRendition puts a finished file and its row on disk without downloading it,
+// for the tests that watch what a sweep does to files already there.
+func seedRendition(t *testing.T, db *store.DB, manager *Manager, id uuid.UUID, data []byte) {
+	t.Helper()
+	if err := os.MkdirAll(manager.Dir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := manager.pathFor(id)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertMediaFile(context.Background(), &store.MediaFile{
+		VariantID: id,
+		Path:      path,
+		SHA256:    id.String(),
+		Bytes:     int64(len(data)),
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A sweep must not delete the file a request is reading. Cutting a listener off
+// mid-word to free space is worse than briefly holding the quota: the bytes are
+// paid for again by the next request, and the listener hears a skip that is not
+// in the music.
+func TestEvictionLeavesAServedFileAlone(t *testing.T) {
+	dir := t.TempDir()
+	fixture := tone(t, dir, "fixture.opus", 0.5)
+	data, err := os.ReadFile(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fake := &fakeProvider{name: "ytmusic", fixture: fixture}
+	db := openTestDB(t)
+	// Room for one rendition, so a sweep with two must take one.
+	manager := New(t.TempDir(), int64(len(data)), db, newTestRegistry(t, fake), discardLogger())
+	ctx := context.Background()
+
+	first := seedVariant(t, db, true, "ytmusic")
+	second := seedVariant(t, db, true, "ytmusic")
+	seedRendition(t, db, manager, first.ID, data)
+	seedRendition(t, db, manager, second.ID, data)
+	// The first is the oldest, so it is the one a sweep would take first.
+	if err := db.TouchMediaFile(ctx, second.ID, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	// It is being read: the sweep takes the other one and leaves it.
+	done := manager.beginServing(first.ID)
+	manager.sweep(ctx)
+	if _, err := db.MediaFile(ctx, first.ID); err != nil {
+		t.Errorf("the rendition being read was evicted: %v", err)
+	}
+	if _, err := db.MediaFile(ctx, second.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("the sweep did not fall back to the idle rendition: %v", err)
+	}
+	done()
 }
 
 // A download somebody is waiting to hear takes the pipe: the ones running for
@@ -358,5 +441,63 @@ func TestEnsureGivesUpOnAStalledDownload(t *testing.T) {
 	}
 	if _, statErr := os.Stat(m.pathFor(variant.ID)); !os.IsNotExist(statErr) {
 		t.Errorf("a partial file was left at the destination: %v", statErr)
+	}
+}
+
+// A play must never join a background fetch that is parked on the gate. That
+// fetch is waiting for the pipe, and only a play's own departure opens it, so a
+// play that joins one waits for itself: EnsurePrimary never returns, the hold on
+// the gate it took never lifts, and every fetch behind it waits for the life of
+// the process. The deadlock was exactly this - Ensure of V queued behind another
+// play, then EnsurePrimary of V - and it is why the gate wait happens before the
+// shared call rather than inside it.
+func TestEnsurePrimaryDoesNotJoinAGateBlockedBackground(t *testing.T) {
+	dir := t.TempDir()
+	fixture := tone(t, dir, "fixture.opus", 0.5)
+
+	// Slow enough that the gate is still held while the calls below line up.
+	fake := &fakeProvider{name: "ytmusic", fixture: fixture, delay: 800 * time.Millisecond}
+	m, db := newTestManager(t, fake)
+
+	other := seedVariant(t, db, true, "ytmusic")
+	playing := seedVariant(t, db, true, "ytmusic")
+
+	// A play for one song holds the pipe.
+	otherDone := make(chan error, 1)
+	go func() {
+		_, err := m.EnsurePrimary(context.Background(), other.ID)
+		otherDone <- err
+	}()
+	waitForCalls(t, fake, 1)
+
+	// A background fetch of a different song queues in the gate behind it.
+	queuedDone := make(chan error, 1)
+	go func() {
+		_, err := m.Ensure(context.Background(), playing.ID)
+		queuedDone <- err
+	}()
+	time.Sleep(150 * time.Millisecond)
+
+	// A play for that very song must not wait on a gate only it could open: it
+	// fetches, and answers.
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.EnsurePrimary(context.Background(), playing.ID)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("the play failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("EnsurePrimary hung joining a background fetch parked on the gate")
+	}
+
+	if err := <-otherDone; err != nil {
+		t.Fatalf("the first play failed: %v", err)
+	}
+	if err := <-queuedDone; err != nil {
+		t.Fatalf("the queued background fetch failed: %v", err)
 	}
 }

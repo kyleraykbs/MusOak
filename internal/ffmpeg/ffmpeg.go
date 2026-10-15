@@ -124,6 +124,15 @@ func TrimTo(ctx context.Context, src, dst string, end time.Duration) error {
 // cutting. Anything shorter is the tail of a fade, not a gap.
 const trailingSilenceFloor = 300 * time.Millisecond
 
+// execTimeout bounds one ffmpeg or ffprobe run. Every call goes through run or
+// runCombined, and either can hang: a probe on a file nobody closes, a transcode
+// on a pipe that stops feeding. The caller's own deadline cannot be the bound,
+// because the media fetches probe and trim on a context detached from the
+// request - a client hanging up must not abandon work everybody shares - and a
+// detached context has no deadline at all. This is the ceiling on every run, and
+// it is longer than any song takes to probe or encode.
+const execTimeout = 15 * time.Minute
+
 var (
 	silenceStartPattern = regexp.MustCompile(`silence_start: ([0-9.]+)`)
 	silenceEndPattern   = regexp.MustCompile(`silence_end: ([0-9.]+)`)
@@ -165,6 +174,8 @@ func AudibleEnd(ctx context.Context, path string, duration time.Duration) (time.
 // runCombined runs a command and returns everything it said, whichever stream
 // said it: silencedetect reports on stderr.
 func runCombined(ctx context.Context, bin string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, execTimeout)
+	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, args...)
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -176,6 +187,8 @@ func runCombined(ctx context.Context, bin string, args ...string) (string, error
 }
 
 func run(ctx context.Context, bin string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, execTimeout)
+	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

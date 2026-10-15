@@ -8,6 +8,7 @@
 package media
 
 import (
+	"container/list"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -58,6 +59,19 @@ type Status struct {
 	Path       string
 }
 
+// Resolved is what a media request has already looked up: the variant, for the
+// provider its bytes come from and the name the answer carries, and its finished
+// file when there is one. A serve path used to fetch the same two rows again -
+// one per query, one per stat - before the first byte; resolving them once at the
+// edge and handing them down is what removes that.
+type Resolved struct {
+	Variant *store.Variant
+	File    *store.MediaFile
+	// FileErr is what the file lookup returned, so that a serve can tell a
+	// variant with no rendition apart from a lookup that failed.
+	FileErr error
+}
+
 // Store is the slice of the repository the manager needs.
 type Store interface {
 	store.MediaRepo
@@ -96,14 +110,28 @@ type Manager struct {
 	// primary is the pipe a person's play holds: see EnsurePrimary.
 	primary primaryGate
 
-	mu               sync.Mutex
-	status           map[uuid.UUID]Status
+	mu          sync.Mutex
+	status      map[uuid.UUID]Status
+	statusLRU   *list.List
+	statusItems map[uuid.UUID]*list.Element
+	// serving counts the requests reading a variant's finished file, so a sweep
+	// does not delete the bytes a listener is in the middle of.
+	serving map[uuid.UUID]int
+	// streams counts a variant's source fetches: see maxStreamsPerVariant.
+	streams map[uuid.UUID]int
 	// downloadTimeout is how long one attempt may take; see downloadTimeout.
-	downloadTimeout time.Duration
+	downloadTimeout  time.Duration
 	background       map[uuid.UUID]backgroundFetch
 	paused           []uuid.UUID
 	downloadAttempts int
 	downloadBackoff  time.Duration
+
+	// evictMu guards evicting: a sweep runs at most one at a time, and never on
+	// the request that grew the cache. evictAgain carries a request that arrived
+	// while one was running, so no request is lost to coalescing.
+	evictMu    sync.Mutex
+	evicting   bool
+	evictAgain bool
 }
 
 // backgroundFetch is a download nobody is waiting on: how to stop it, and when
@@ -135,6 +163,8 @@ func New(dir string, quotaBytes int64, db Store, providers *provider.Registry, l
 		logger:           logger,
 		sf:               &singleflight.Group{},
 		status:           make(map[uuid.UUID]Status),
+		statusLRU:        list.New(),
+		statusItems:      make(map[uuid.UUID]*list.Element),
 		downloadAttempts: downloadAttempts,
 		downloadBackoff:  downloadBackoff,
 		downloadTimeout:  downloadTimeout,
@@ -177,10 +207,28 @@ func (m *Manager) ensure(ctx context.Context, variantID uuid.UUID, primary bool)
 		// about to begin waits instead of competing with it.
 		m.enterPrimary(variantID)
 		defer m.leavePrimary()
+	} else {
+		// A person's play has the pipe. The wait is here, before the
+		// singleflight, and not inside the shared call: a play arriving for this
+		// very variant must never join a call that is parked on the gate, because
+		// it would wait on a gate only its own departure could open. And it is
+		// the caller's context that ends it, so a request - or the prefetcher's
+		// pass - that gives up stops waiting rather than holding a place for the
+		// rest of the session.
+		if err := m.primary.wait(ctx); err != nil {
+			return "", err
+		}
+		// The file may have landed while this waited.
+		if path, ok := m.ready(ctx, variantID); ok {
+			return path, nil
+		}
 	}
 
 	// The download outlives whichever caller started it: a client hanging up
-	// must not abort a shared transfer for everybody else.
+	// must not abort a shared transfer for everybody else. It is still bounded -
+	// each attempt has its own deadline, and the probe and transcode that follow
+	// are bounded inside ffmpeg - which is what keeps a stalled provider or a
+	// wedged binary from pinning the variant for the rest of the session.
 	detached := context.WithoutCancel(ctx)
 
 	v, err, _ := m.sf.Do(variantID.String(), func() (any, error) {
@@ -192,26 +240,30 @@ func (m *Manager) ensure(ctx context.Context, variantID uuid.UUID, primary bool)
 	return v.(string), nil
 }
 
+// Resolve looks up the two rows a media request needs: the variant, and its
+// finished file when there is one. The request resolves them once and hands the
+// result to Stream and ServeFile, so neither looks the same rows up again on the
+// way to the first byte. A variant that cannot be read is left nil rather than
+// failing the lookup: the name and the serve are decided from what is there.
+func (m *Manager) Resolve(ctx context.Context, variantID uuid.UUID) Resolved {
+	variant, _ := m.db.Variant(ctx, variantID)
+	file, fileErr := m.db.MediaFile(ctx, variantID)
+	return Resolved{Variant: variant, File: file, FileErr: fileErr}
+}
+
 // fetch downloads, probes and stores one variant. It runs at most once per
 // variant at a time (singleflight).
 //
-// A background fetch waits for the pipe (see EnsurePrimary) and is registered
-// while it runs, so that a play arriving can stop it. The fetch that is itself a
-// play does neither: it never waits, and nothing cancels it.
+// A background fetch registers itself while it runs, so a play arriving can
+// pause it. It does not wait for the pipe here: ensure waited before entering the
+// singleflight, so by the time any fetch runs nobody can join a call that is
+// parked on the gate. The fetch that is itself a play neither waits nor
+// registers: it holds the gate from ensure and nothing cancels it.
 func (m *Manager) fetch(ctx context.Context, variantID uuid.UUID, primary bool) (string, error) {
 	if path, ok := m.ready(ctx, variantID); ok {
 		return path, nil
 	}
 	if !primary {
-		// A person's play has the pipe. The caller's context is what ends the
-		// wait, so a request that gives up does not stay queued behind it.
-		if err := m.primary.wait(ctx); err != nil {
-			return "", err
-		}
-		// It may have arrived while this waited.
-		if path, ok := m.ready(ctx, variantID); ok {
-			return path, nil
-		}
 		var unregister func()
 		ctx, unregister = m.registerBackground(ctx, variantID)
 		defer unregister()
@@ -458,9 +510,65 @@ func (m *Manager) SetDownloadTimeout(d time.Duration) {
 	m.mu.Unlock()
 }
 
-// evict brings the media directory back under its quota, least recently served
-// first.
+// evictionTimeout bounds one sweep, so a database that stops answering cannot
+// leave the sweep marked as running for ever.
+const evictionTimeout = time.Minute
+
+// evictionPasses is how many times one sweep may ask for a fresh list of
+// victims. A rendition somebody is listening to is skipped, so one pass can
+// land short of the quota; more than a couple of passes means the cache is
+// almost entirely in use, and waiting for the next download is better than
+// spinning.
+const evictionPasses = 3
+
+// evict asks for a quota sweep. It is called from the paths that grow the cache -
+// a finished download, an import - and returns at once: the sweep itself runs
+// off the request, one at a time, because re-reading the whole media table twice
+// while a request is served is work nobody is waiting for. A request that arrives
+// while a sweep runs is remembered rather than dropped: the running sweep may
+// already have read the table, and the file this request added has to be looked
+// at.
 func (m *Manager) evict(ctx context.Context) {
+	if m.quotaBytes <= 0 {
+		return
+	}
+	m.evictMu.Lock()
+	if m.evicting {
+		m.evictAgain = true
+		m.evictMu.Unlock()
+		return
+	}
+	m.evicting = true
+	m.evictMu.Unlock()
+	go m.sweepLoop(ctx)
+}
+
+func (m *Manager) sweepLoop(ctx context.Context) {
+	for {
+		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), evictionTimeout)
+		m.sweep(sctx)
+		cancel()
+		// The exit and the flag reset are one critical section, so an evict that
+		// arrives as this finishes sees either "still running" - and is carried
+		// by the loop - or "not running" - and starts a new one. Neither loses a
+		// request.
+		m.evictMu.Lock()
+		if m.evictAgain {
+			m.evictAgain = false
+			m.evictMu.Unlock()
+			continue
+		}
+		m.evicting = false
+		m.evictMu.Unlock()
+		return
+	}
+}
+
+// sweep brings the media directory back under its quota, least recently served
+// first. It skips anything a request is reading: the bytes may be somebody's
+// song half way through, and deleting them is a listener cut off mid-word that
+// the next request pays for again.
+func (m *Manager) sweep(ctx context.Context) {
 	if m.quotaBytes <= 0 {
 		return
 	}
@@ -473,26 +581,115 @@ func (m *Manager) evict(ctx context.Context) {
 		return
 	}
 
-	files, err := m.db.MediaFilesByLastUse(ctx)
-	if err != nil {
-		m.logger.Warn("media: eviction list failed", "error", err)
-		return
+	// The list is asked for the excess, not the whole cache: the store's window
+	// query stops once the running total of the least recently served files
+	// covers it, so an eviction reads the rows it is about to delete rather
+	// than every rendition the household owns.
+	//
+	// A rendition being served is skipped, which can leave a pass short - or
+	// with nothing to remove at all, when the whole window is in use. A pass
+	// that frees nothing widens the window by what it saw and asks again, so
+	// the next one reaches past the files somebody is listening to instead of
+	// re-reading them. The passes are bounded: a cache that is almost entirely
+	// in use waits for the next download rather than spinning.
+	excess := total - m.quotaBytes
+	for pass := 0; pass < evictionPasses && total > m.quotaBytes && ctx.Err() == nil; pass++ {
+		files, err := m.db.MediaEvictionCandidates(ctx, excess)
+		if err != nil {
+			m.logger.Warn("media: eviction list failed", "error", err)
+			return
+		}
+		if len(files) == 0 {
+			return
+		}
+		freed := int64(0)
+		seen := int64(0)
+		for _, file := range files {
+			seen += file.Bytes
+			if total-freed <= m.quotaBytes || ctx.Err() != nil {
+				break
+			}
+			if m.isServing(file.VariantID) {
+				continue
+			}
+			if err := os.Remove(file.Path); err != nil && !os.IsNotExist(err) {
+				m.logger.Warn("media: could not remove", "path", file.Path, "error", err)
+				continue
+			}
+			if err := m.db.DeleteMediaFile(ctx, file.VariantID); err != nil {
+				m.logger.Warn("media: could not forget", "variant", file.VariantID, "error", err)
+				continue
+			}
+			freed += file.Bytes
+			m.logger.Info("media: evicted the least recently used rendition",
+				"variant", file.VariantID, "bytes", file.Bytes, "remaining", total-freed)
+		}
+		if freed == 0 {
+			excess += seen
+			continue
+		}
+		total -= freed
+		excess = total - m.quotaBytes
 	}
-	for _, file := range files {
-		if total <= m.quotaBytes {
-			break
+}
+
+// beginServing records that a request is reading a variant's file, and returns
+// the function that says it is done. A sweep will not touch the file in between.
+func (m *Manager) beginServing(variantID uuid.UUID) func() {
+	m.mu.Lock()
+	if m.serving == nil {
+		m.serving = make(map[uuid.UUID]int)
+	}
+	m.serving[variantID]++
+	m.mu.Unlock()
+	return func() {
+		m.mu.Lock()
+		if n := m.serving[variantID]; n <= 1 {
+			delete(m.serving, variantID)
+		} else {
+			m.serving[variantID] = n - 1
 		}
-		if err := os.Remove(file.Path); err != nil && !os.IsNotExist(err) {
-			m.logger.Warn("media: could not remove", "path", file.Path, "error", err)
-			continue
-		}
-		if err := m.db.DeleteMediaFile(ctx, file.VariantID); err != nil {
-			m.logger.Warn("media: could not forget", "variant", file.VariantID, "error", err)
-			continue
-		}
-		total -= file.Bytes
-		m.logger.Info("media: evicted the least recently used rendition",
-			"variant", file.VariantID, "bytes", file.Bytes, "remaining", total)
+		m.mu.Unlock()
+	}
+}
+
+// isServing reports whether a request is reading a variant's file right now.
+func (m *Manager) isServing(variantID uuid.UUID) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.serving[variantID] > 0
+}
+
+// maxStreamsPerVariant caps how many source fetches one variant has in flight at
+// once. Every stream is its own yt-dlp process, so without a cap N listeners on
+// one song run N of them for the same bytes; past the cap the next listener is
+// told to come back rather than starting another, and by then the download
+// behind them has the file.
+const maxStreamsPerVariant = 2
+
+// beginStream takes one of a variant's stream slots, or reports false when they
+// are all taken.
+func (m *Manager) beginStream(variantID uuid.UUID) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.streams[variantID] >= maxStreamsPerVariant {
+		return false
+	}
+	if m.streams == nil {
+		m.streams = make(map[uuid.UUID]int)
+	}
+	m.streams[variantID]++
+	return true
+}
+
+// endStream gives a stream slot back.
+func (m *Manager) endStream(variantID uuid.UUID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if n := m.streams[variantID]; n <= 1 {
+		delete(m.streams, variantID)
+	} else {
+		m.streams[variantID] = n - 1
 	}
 }
 
@@ -518,25 +715,52 @@ func (m *Manager) ready(ctx context.Context, variantID uuid.UUID) (string, bool)
 }
 
 // Status reports what is known about a variant without starting any work.
+//
+// A known variant is answered from memory: a client watching a download polls
+// this endpoint until it is ready, and a query per poll is a query per poll per
+// listener. The first look at a variant still asks the database, so a file that
+// was here before this process started is found, and the answer is remembered.
 func (m *Manager) Status(ctx context.Context, variantID uuid.UUID) Status {
-	if _, ok := m.ready(ctx, variantID); ok {
-		return m.getStatus(variantID)
-	}
 	if s, ok := m.lookupStatus(variantID); ok {
 		return s
 	}
-	return Status{VariantID: variantID, State: StateNone}
+	if _, ok := m.ready(ctx, variantID); ok {
+		return m.getStatus(variantID)
+	}
+	s := Status{VariantID: variantID, State: StateNone}
+	m.setStatus(s)
+	return s
 }
+
+// statusCap is how many variants the in-memory status map remembers. It is a
+// cache of what the database already knows, so dropping the coldest entry is
+// always safe: the next Status for it looks the row up again.
+const statusCap = 4096
 
 func (m *Manager) setStatus(s Status) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.status[s.VariantID] = s
+	if el, ok := m.statusItems[s.VariantID]; ok {
+		m.statusLRU.MoveToFront(el)
+	} else {
+		m.statusItems[s.VariantID] = m.statusLRU.PushFront(s.VariantID)
+	}
+	for m.statusLRU.Len() > statusCap {
+		oldest := m.statusLRU.Back()
+		id := oldest.Value.(uuid.UUID)
+		m.statusLRU.Remove(oldest)
+		delete(m.statusItems, id)
+		delete(m.status, id)
+	}
 }
 
 func (m *Manager) getStatus(variantID uuid.UUID) Status {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if el, ok := m.statusItems[variantID]; ok {
+		m.statusLRU.MoveToFront(el)
+	}
 	return m.status[variantID]
 }
 
@@ -544,6 +768,9 @@ func (m *Manager) lookupStatus(variantID uuid.UUID) (Status, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s, ok := m.status[variantID]
+	if el, ok := m.statusItems[variantID]; ok {
+		m.statusLRU.MoveToFront(el)
+	}
 	return s, ok
 }
 

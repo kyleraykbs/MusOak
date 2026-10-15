@@ -52,7 +52,7 @@ func TestServeFileRangeAndETag(t *testing.T) {
 			mutate(req)
 		}
 		rec := httptest.NewRecorder()
-		m.ServeFile(rec, req, id)
+		m.ServeFile(rec, req, id, m.Resolve(req.Context(), id))
 		return rec
 	}
 
@@ -110,7 +110,8 @@ func TestServeFileRejectsIncompleteMedia(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec := httptest.NewRecorder()
-	m.ServeFile(rec, httptest.NewRequest(http.MethodGet, "/media", nil), variant.ID)
+	req := httptest.NewRequest(http.MethodGet, "/media", nil)
+	m.ServeFile(rec, req, variant.ID, m.Resolve(req.Context(), variant.ID))
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", rec.Code)
 	}
