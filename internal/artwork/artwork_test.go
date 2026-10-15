@@ -28,6 +28,7 @@ type imageServer struct {
 	status int
 	body   []byte
 	ctype  string
+	delay  time.Duration
 }
 
 // pngBytes is a 1x1 PNG, which is enough for the cache to treat it as an image.
@@ -51,6 +52,13 @@ func newImageServer(t *testing.T) *imageServer {
 		if r.Header.Get("User-Agent") == "" {
 			http.Error(w, "no user agent", http.StatusForbidden)
 			return
+		}
+		if image.delay > 0 {
+			select {
+			case <-time.After(image.delay):
+			case <-r.Context().Done():
+				return
+			}
 		}
 		if image.status != http.StatusOK {
 			http.Error(w, "nope", image.status)
@@ -318,5 +326,75 @@ func TestCachedServesTheNewestOfAStalePair(t *testing.T) {
 	}
 	if item.Path != gifPath {
 		t.Errorf("serving found %s, want the file stored last (%s)", filepath.Base(item.Path), filepath.Base(gifPath))
+	}
+}
+
+// A page asks for a dozen covers at once, and over HTTP/1.1 the browser serves
+// them on six connections: a request that waits for the whole download makes
+// one slow cover delay every other image on the page. So a request waits what a
+// working CDN takes and no longer, and the fetch carries on without it.
+func TestFetchDoesNotWaitForASlowCover(t *testing.T) {
+	image := newImageServer(t)
+	image.delay = 400 * time.Millisecond
+	f := newFixture(t)
+	f.fetcher.wait = 50 * time.Millisecond
+	ctx := context.Background()
+	trackID := f.trackWithArtwork(t, image.server.URL+"/slow.png")
+
+	started := time.Now()
+	_, err := f.fetcher.Fetch(ctx, store.ArtworkTrack, trackID)
+	if !errors.Is(err, ErrPending) {
+		t.Fatalf("a slow cover: err = %v, want ErrPending", err)
+	}
+	if waited := time.Since(started); waited > image.delay {
+		t.Errorf("the request waited %s for a cover that was not ready in %s", waited, f.fetcher.wait)
+	}
+
+	// The fetch kept going, so the next render is served from disk.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		item, err := f.fetcher.Fetch(ctx, store.ArtworkTrack, trackID)
+		if err == nil {
+			if item.Bytes != int64(len(pngBytes)) {
+				t.Errorf("bytes = %d, want %d", item.Bytes, len(pngBytes))
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the cover never landed: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A room repaints its rows and asks for the same covers again. A CDN that just
+// refused must not be asked, at twenty seconds a time, once a second.
+func TestFetchRemembersARefusal(t *testing.T) {
+	image := newImageServer(t)
+	image.status = http.StatusForbidden
+	f := newFixture(t)
+	ctx := context.Background()
+	trackID := f.trackWithArtwork(t, image.server.URL+"/gone.png")
+
+	if _, err := f.fetcher.Fetch(ctx, store.ArtworkTrack, trackID); !errors.Is(err, ErrFetch) {
+		t.Fatalf("the first ask: err = %v, want ErrFetch", err)
+	}
+	asked := image.hits.Load()
+	if _, err := f.fetcher.Fetch(ctx, store.ArtworkTrack, trackID); !errors.Is(err, ErrPending) {
+		t.Fatalf("the next ask: err = %v, want ErrPending", err)
+	}
+	if got := image.hits.Load(); got != asked {
+		t.Errorf("the CDN was asked %d times, want it left alone at %d", got, asked)
+	}
+
+	// A cover that arrives later is served: a missing one is not permanent.
+	f.fetcher.forgetFailure(image.server.URL + "/gone.png")
+	image.status = http.StatusOK
+	item, err := f.fetcher.Fetch(ctx, store.ArtworkTrack, trackID)
+	if err != nil {
+		t.Fatalf("after the CDN came back: %v", err)
+	}
+	if item.Bytes != int64(len(pngBytes)) {
+		t.Errorf("bytes = %d, want %d", item.Bytes, len(pngBytes))
 	}
 }

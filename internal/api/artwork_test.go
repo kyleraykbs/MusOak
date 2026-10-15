@@ -91,6 +91,11 @@ func TestArtworkEndpointServesAndCachesCovers(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("artwork for a track without one = %d, want 404", rec.Code)
 	}
+	// A cover can be learned later, and a CDN that is down comes back: a miss
+	// the browser keeps is an image nothing can fix short of a hard reload.
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("a missing cover: Cache-Control = %q, want no-store", got)
+	}
 
 	// Kinds and ids are validated.
 	if rec := c.do(http.MethodGet, "/api/v1/artwork/nonsense/"+track.ID, "", nil); rec.Code != http.StatusBadRequest {
