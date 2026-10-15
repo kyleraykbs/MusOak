@@ -588,19 +588,19 @@ func (a *App) roomJoin(ctx context.Context, roomID string) error {
 	defer sink.Close()
 
 	participant := client.NewParticipant(room, a.cache, sink, a.logger)
-	participant.OnTrack = func(track client.SinkTrack) {
-		version := track.VariantID
-		if len(version) > 8 {
-			version = version[:8]
-		}
-		a.printf("playing %s (from %s, %s in)\n", version,
-			track.Path, formatDuration(track.PositionMs))
-	}
 	participant.OnEvent = func(event client.Event) {
 		a.logger.Debug("room event", "type", event.Type)
 	}
 
 	a.printf("joined %s as %s; Ctrl-C to leave\n", roomID, room.MemberID)
+
+	// The member's own line: what the room is playing, where this client is in
+	// it, and what the rendition in hand is doing - the server's stream arriving
+	// while its download runs behind it, or the file once it has landed.
+	ui := newRoomPlayer(a.out, participant, a.client.MediaStatus)
+	participant.OnTrack = ui.track
+	ui.start(ctx)
+	defer ui.stop()
 
 	// Following the same participant across reconnects is what keeps the file
 	// playing: it still holds the item it loaded and the sink was never
@@ -610,6 +610,7 @@ func (a *App) roomJoin(ctx context.Context, roomID string) error {
 	for {
 		err := participant.Run(ctx)
 		if errors.Is(err, client.ErrRoomClosed) {
+			ui.stop()
 			a.printf("the room closed\n")
 			return nil
 		}
@@ -620,6 +621,7 @@ func (a *App) roomJoin(ctx context.Context, roomID string) error {
 		// is retried the same way. The room being gone entirely is the one
 		// thing worth giving up on, and the server answers that with a 404.
 		if client.IsNotFound(err) {
+			ui.stop()
 			a.printf("the room is gone\n")
 			return nil
 		}

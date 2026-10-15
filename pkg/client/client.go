@@ -72,8 +72,20 @@ func (c *Client) BaseURL() string { return c.baseURL }
 // media GET uses. A player that speaks HTTP (mpv does) can be handed it
 // directly, so playback of a rendition the server is still preparing can begin
 // before the download has finished.
-func (c *Client) MediaURL(variantID string) string {
-	return c.baseURL + "/api/v1/media/" + variantID
+//
+// startMs, when positive, asks a stream of a not-yet-downloaded variant to
+// begin that far into the track and run to the end: a listener joining a song
+// already under way hears the rest of it rather than its head. Zero is the
+// whole track from the beginning, which is also what a file that is already on
+// disk answers - there the offset is a seek, not a query.
+func (c *Client) MediaURL(variantID string, startMs int64) string {
+	media := c.baseURL + "/api/v1/media/" + variantID
+	if startMs <= 0 {
+		return media
+	}
+	query := url.Values{}
+	query.Set("start", strconv.FormatInt(startMs, 10))
+	return media + "?" + query.Encode()
 }
 
 // Token returns the current bearer token, empty for a guest.

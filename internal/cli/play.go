@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -15,6 +16,16 @@ import (
 // from the server over HTTP. As soon as its download lands, the playing track
 // is swapped to the local file without losing its position.
 func (a *App) cmdPlay(ctx context.Context, args []string) error {
+	set := flag.NewFlagSet("play", flag.ContinueOnError)
+	set.SetOutput(a.out)
+	start := set.Int64("start", 0, "begin the first track this many milliseconds in")
+	if err := set.Parse(args); err != nil {
+		return err
+	}
+	if *start < 0 {
+		return errors.New("musoak: --start needs a position in milliseconds")
+	}
+
 	queue := a.state.Queue
 	if len(queue) == 0 {
 		return errors.New("musoak: the queue is empty; add tracks with \"musoak queue add\"")
@@ -28,6 +39,7 @@ func (a *App) cmdPlay(ctx context.Context, args []string) error {
 
 	ui := newPlayer(a.out, sink, queue)
 	ui.mediaStatus = a.client.MediaStatus
+	ui.streamInfo = a.client.MediaStreamInfo
 	ui.start(ctx)
 	defer ui.stop()
 
@@ -74,7 +86,13 @@ func (a *App) cmdPlay(ctx context.Context, args []string) error {
 			a.printf("%3d. %s\n", queued, current.item.Title)
 		}
 
-		item := a.slotItem(current)
+		// Only the first track is started part-way in: a position names where
+		// in this song the listener is, and the songs behind it begin at theirs.
+		itemStart := int64(0)
+		if queued == 0 {
+			itemStart = *start
+		}
+		item := a.slotItem(current, itemStart)
 		if queued == 0 {
 			if err := ui.startTrack(ctx, item); err != nil {
 				return err
@@ -118,6 +136,14 @@ type playbackItem struct {
 	// ready yields the local copy when the download lands. It is nil when the
 	// copy was already on disk (source is then the local path).
 	ready <-chan client.CacheEntry
+	// positionMs is where in the track playback should begin. For a local file
+	// it is a seek; for a stream it is folded into the URL as ?start=, because
+	// a stream that has not finished has no length to seek within.
+	positionMs int64
+	// durationMs is the track's length when it is known before the file
+	// exists - the figure a stream carries in a header rather than in its own
+	// bytes - so the status line can draw a timeline while the song arrives.
+	durationMs int64
 }
 
 // startSlot resolves one queue entry and makes sure a local copy exists. The
@@ -175,18 +201,25 @@ func (a *App) startSlot(ctx context.Context, item queueItem, order func(context.
 // slotItem turns a resolved slot into what the player should play. It never
 // waits: a rendition that is not on disk yet is delivered as its stream URL
 // and the local copy is handed over later through ready.
-func (a *App) slotItem(s *slot) playbackItem {
+//
+// startMs is where in the track playback should begin. A not-downloaded
+// rendition is streamed from there - the URL carries the offset, so the server
+// hands over the rest of the song and no seeking is needed - while a local copy
+// is handed to mpv with the position to seek to.
+func (a *App) slotItem(s *slot, startMs int64) playbackItem {
 	if entry, ok := a.cache.Lookup(s.variantID); ok {
 		return playbackItem{
-			variantID: s.variantID,
-			source:    entry.Path,
-			localPath: entry.Path,
+			variantID:  s.variantID,
+			source:     entry.Path,
+			localPath:  entry.Path,
+			positionMs: startMs,
 		}
 	}
 	return playbackItem{
-		variantID: s.variantID,
-		source:    a.client.MediaURL(s.variantID),
-		ready:     s.local,
+		variantID:  s.variantID,
+		source:     a.client.MediaURL(s.variantID, startMs),
+		ready:      s.local,
+		positionMs: startMs,
 	}
 }
 

@@ -131,7 +131,7 @@ func (a *App) usage() {
 
 Usage:
   musoak search <query>                 search every provider, merged per track
-  musoak play                           play the local queue, gaplessly
+  musoak play [--start <ms>]            play the local queue, gaplessly
   musoak queue add <track-id|index>     append to the queue
   musoak queue list                     show the queue
   musoak queue rm <index>               remove a queue entry

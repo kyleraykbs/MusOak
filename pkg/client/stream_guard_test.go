@@ -17,8 +17,66 @@ import (
 
 func TestMediaURLMatchesMediaGet(t *testing.T) {
 	c := client.New("http://localhost:4420/")
-	if got, want := c.MediaURL("variant-1"), "http://localhost:4420/api/v1/media/variant-1"; got != want {
+	if got, want := c.MediaURL("variant-1", 0), "http://localhost:4420/api/v1/media/variant-1"; got != want {
 		t.Errorf("MediaURL = %q, want %q", got, want)
+	}
+}
+
+// TestMediaURLCarriesTheStartOffset pins the URL a listener joining a song at
+// 45 s gets: the stream must begin there and run to the end, so the offset is a
+// query on the same media URL - never a seek, which a stream without a length
+// cannot honour.
+func TestMediaURLCarriesTheStartOffset(t *testing.T) {
+	c := client.New("http://localhost:4420")
+	if got, want := c.MediaURL("variant-1", 45_000), "http://localhost:4420/api/v1/media/variant-1?start=45000"; got != want {
+		t.Errorf("MediaURL = %q, want %q", got, want)
+	}
+}
+
+// TestMediaStreamInfoReadsTheStreamHeaders pins the probe that tells a client
+// what a stream says about itself before any of its bytes are read: that it is
+// a stream, and the track's length, which the audio itself cannot report.
+func TestMediaStreamInfoReadsTheStreamHeaders(t *testing.T) {
+	var gotStart, gotMethod string
+	server := mediaServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotStart = r.URL.Query().Get("start")
+		gotMethod = r.Method
+		w.Header().Set("X-Musoak-Stream", "1")
+		w.Header().Set("X-Musoak-Duration", "213000")
+		_, _ = w.Write([]byte("the song, arriving"))
+	})
+
+	info, err := client.New(server.URL).MediaStreamInfo(context.Background(), "v1", 45_000)
+	if err != nil {
+		t.Fatalf("MediaStreamInfo: %v", err)
+	}
+	if !info.Streaming {
+		t.Error("Streaming = false, want the stream marker to be read")
+	}
+	if info.DurationMs != 213_000 {
+		t.Errorf("DurationMs = %d, want 213000", info.DurationMs)
+	}
+	if gotStart != "45000" {
+		t.Errorf("start query = %q, want it carried on the probe", gotStart)
+	}
+	if gotMethod != http.MethodGet {
+		t.Errorf("method = %s, want GET: a HEAD never starts the source", gotMethod)
+	}
+}
+
+// TestMediaStreamInfoOnAFinishedFile checks that a stored rendition is not
+// mistaken for a stream and reports no length of its own: mpv gets that from
+// the file.
+func TestMediaStreamInfoOnAFinishedFile(t *testing.T) {
+	server := mediaServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("finished"))
+	})
+	info, err := client.New(server.URL).MediaStreamInfo(context.Background(), "v1", 0)
+	if err != nil {
+		t.Fatalf("MediaStreamInfo: %v", err)
+	}
+	if info.Streaming || info.DurationMs != 0 {
+		t.Errorf("info = %+v, want a plain file", info)
 	}
 }
 

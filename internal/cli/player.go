@@ -39,6 +39,12 @@ type player struct {
 	// player with no server to ask, which then says nothing about downloads.
 	mediaStatus func(ctx context.Context, variantID string) (*client.MediaStatus, error)
 
+	// streamInfo reads what a variant's stream says about itself, the length
+	// above all: a stream carries none of its own, and the status line needs
+	// one for the song that is arriving. It is nil for a player with no server
+	// to ask.
+	streamInfo func(ctx context.Context, variantID string, startMs int64) (client.StreamInfo, error)
+
 	interactive bool
 	keys        *keyReader
 	restoreTerm func()
@@ -253,11 +259,12 @@ func (p *player) skip(ctx context.Context, direction int) {
 // startTrack loads the first entry. When its local copy is not on disk yet it
 // is streamed from its URL, and the copy is swapped in when it lands.
 func (p *player) startTrack(ctx context.Context, item playbackItem) error {
-	if err := p.sink.StartFile(ctx, item.source, 0); err != nil {
+	if err := p.sink.StartFile(ctx, item.source, item.seekMs()); err != nil {
 		return err
 	}
 	index := p.addItem(item)
 	p.loaded++
+	p.watchDuration(ctx, index, item)
 	p.watchLocal(ctx, index, item.ready)
 	p.applyPendingSkip(ctx)
 	return nil
@@ -272,9 +279,49 @@ func (p *player) appendTrack(ctx context.Context, item playbackItem) error {
 	}
 	index := p.addItem(item)
 	p.loaded++
+	p.watchDuration(ctx, index, item)
 	p.watchLocal(ctx, index, item.ready)
 	p.applyPendingSkip(ctx)
 	return nil
+}
+
+// seekMs is where mpv should start the source. A stream already begins where
+// the listener asked - the server starts the source there - so mpv plays it
+// from zero; a local file is seeked to the position.
+func (i playbackItem) seekMs() int64 {
+	if i.ready != nil {
+		return 0
+	}
+	return i.positionMs
+}
+
+// streamed reports whether the entry is still the stream, not yet the file on
+// disk. mpv's playhead is then relative to where the stream began, and the
+// entry's position is that beginning.
+func (i playbackItem) streamed() bool {
+	return i.ready != nil && i.source != i.localPath
+}
+
+// watchDuration learns a streamed entry's length from the stream's own header
+// and records it, so the status line can draw a timeline for a song whose bytes
+// have no length of their own. It only runs for a streaming entry: a local file
+// reports its length through mpv, and a length already known needs no probe.
+func (p *player) watchDuration(ctx context.Context, index int, item playbackItem) {
+	if item.ready == nil || item.durationMs > 0 || p.streamInfo == nil {
+		return
+	}
+	go func() {
+		info, err := p.streamInfo(ctx, item.variantID, item.positionMs)
+		if err != nil || info.DurationMs <= 0 {
+			return
+		}
+		p.mu.Lock()
+		if index < len(p.items) {
+			p.items[index].durationMs = info.DurationMs
+		}
+		p.mu.Unlock()
+		p.draw()
+	}()
 }
 
 // addItem records an entry in playlist order and returns its index.
@@ -332,8 +379,17 @@ func (p *player) watchLocal(ctx context.Context, index int, ready <-chan client.
 func (p *player) swapToLocal(ctx context.Context, index int) {
 	p.mu.Lock()
 	var path string
+	var offset int64
 	if index < len(p.items) {
-		path = p.items[index].localPath
+		item := p.items[index]
+		path = item.localPath
+		// A stream asked to begin at a position carries the rest of the song,
+		// and mpv's playhead is relative to where that stream started. The
+		// local copy is the whole song, so the playhead is shifted by the
+		// offset the stream began at before it is seeked.
+		if item.streamed() {
+			offset = item.positionMs
+		}
 	}
 	p.mu.Unlock()
 	if path == "" {
@@ -345,7 +401,7 @@ func (p *player) swapToLocal(ctx context.Context, index int) {
 		return
 	}
 	where, _ := p.sink.process.positionMs(ctx)
-	if err := p.sink.process.loadReplace(ctx, path, where); err != nil {
+	if err := p.sink.process.loadReplace(ctx, path, where+offset); err != nil {
 		return
 	}
 	if paused {
@@ -397,10 +453,18 @@ func (p *player) refresh(ctx context.Context) {
 		p.volume = volume
 	}
 	p.positionMs = where
-	if duration > 0 {
-		p.durationMs = duration
-	} else if position >= 0 && position < len(p.queue) {
-		p.durationMs = 0
+	p.durationMs = duration
+	if position >= 0 && position < len(p.items) {
+		item := p.items[position]
+		if item.streamed() {
+			// The stream began at the offset; its playhead is relative to it.
+			p.positionMs = where + item.positionMs
+		}
+		if duration <= 0 {
+			// A stream has no length for mpv to report; the header's figure is
+			// what the timeline is drawn from until the local copy lands.
+			p.durationMs = item.durationMs
+		}
 	}
 	p.paused = paused
 	if position >= 0 && position < len(p.queue) {
@@ -566,6 +630,15 @@ func formatStatus(s status) string {
 func downloadLabel(s *client.MediaStatus) string {
 	if s == nil {
 		return ""
+	}
+	if s.State == client.MediaFailed {
+		// A download that failed says so where its progress was: a stage that
+		// stops moving without a word is the silence this line exists to end,
+		// and the song behind it is not coming.
+		if s.Error != "" {
+			return "the download failed: " + s.Error
+		}
+		return "the download failed"
 	}
 	switch s.Stage {
 	case client.MediaStageDownload:

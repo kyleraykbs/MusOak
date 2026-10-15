@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -47,11 +48,11 @@ func TestSlotItemStreamsUncachedTrackAsURL(t *testing.T) {
 	s := &slot{item: queueItem{TrackID: "t1"}, variantID: "v1", local: make(chan client.CacheEntry, 1)}
 
 	done := make(chan playbackItem, 1)
-	go func() { done <- app.slotItem(s) }()
+	go func() { done <- app.slotItem(s, 0) }()
 
 	select {
 	case item := <-done:
-		if want := app.client.MediaURL("v1"); item.source != want {
+		if want := app.client.MediaURL("v1", 0); item.source != want {
 			t.Errorf("source = %q, want the stream URL %q", item.source, want)
 		}
 		if item.ready != s.local {
@@ -78,7 +79,7 @@ func TestSlotItemUsesLocalPathWhenCached(t *testing.T) {
 	}
 
 	s := &slot{item: queueItem{TrackID: "t1"}, variantID: "v1", local: make(chan client.CacheEntry, 1)}
-	item := app.slotItem(s)
+	item := app.slotItem(s, 0)
 	if item.source != path {
 		t.Errorf("source = %q, want the local path %q", item.source, path)
 	}
@@ -88,6 +89,111 @@ func TestSlotItemUsesLocalPathWhenCached(t *testing.T) {
 	if item.ready != nil {
 		t.Error("a cached track needs no handover channel")
 	}
+}
+
+// TestSlotItemStreamsFromTheRequestedPosition pins the whole point: a song that
+// is not on disk, started at 45 s, is delivered as a stream URL that begins
+// there, and the player is told the position so it neither seeks (a stream has
+// nothing to seek within) nor draws the timeline from zero.
+func TestSlotItemStreamsFromTheRequestedPosition(t *testing.T) {
+	app := newSlotApp(t, "http://127.0.0.1:1")
+	s := &slot{item: queueItem{TrackID: "t1"}, variantID: "v1", local: make(chan client.CacheEntry, 1)}
+
+	item := app.slotItem(s, 45_000)
+	if want := app.client.MediaURL("v1", 45_000); item.source != want {
+		t.Errorf("source = %q, want %q", item.source, want)
+	}
+	if item.source != "http://127.0.0.1:1/api/v1/media/v1?start=45000" {
+		t.Errorf("source = %q, want the stream to begin at 45 s", item.source)
+	}
+	if item.positionMs != 45_000 {
+		t.Errorf("positionMs = %d, want 45000", item.positionMs)
+	}
+	if item.seekMs() != 0 {
+		t.Errorf("seekMs = %d, want 0: the stream already starts there", item.seekMs())
+	}
+}
+
+// TestSlotItemSeeksALocalCopyToThePosition is the other half: a copy already on
+// disk is played directly, and the position is a seek.
+func TestSlotItemSeeksALocalCopyToThePosition(t *testing.T) {
+	app := newSlotApp(t, "http://127.0.0.1:1")
+	path := app.cache.Path("v1")
+	if err := os.WriteFile(path, []byte("tone"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.cache.Put(client.CacheEntry{VariantID: "v1", TrackID: "t1", Path: path}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &slot{item: queueItem{TrackID: "t1"}, variantID: "v1", local: make(chan client.CacheEntry, 1)}
+	item := app.slotItem(s, 45_000)
+	if item.source != path {
+		t.Errorf("source = %q, want the local path %q", item.source, path)
+	}
+	if item.seekMs() != 45_000 {
+		t.Errorf("seekMs = %d, want 45000", item.seekMs())
+	}
+}
+
+// TestPlayerReadsStreamDurationFromTheHeader checks that a streamed entry's
+// length comes from the stream's own header - the only place it exists before
+// the file does - and is recorded for the status line.
+func TestPlayerReadsStreamDurationFromTheHeader(t *testing.T) {
+	ctx := context.Background()
+	p := newPlayer(io.Discard, nil, []queueItem{{TrackID: "t1", Title: "Song"}})
+	asked := make(chan struct{}, 1)
+	p.streamInfo = func(ctx context.Context, variantID string, startMs int64) (client.StreamInfo, error) {
+		if variantID != "v1" || startMs != 45_000 {
+			t.Errorf("probe(%q, %d), want v1 at 45000", variantID, startMs)
+		}
+		asked <- struct{}{}
+		return client.StreamInfo{Streaming: true, DurationMs: 213_000}, nil
+	}
+
+	item := playbackItem{variantID: "v1", source: "http://s/media/v1?start=45000", positionMs: 45_000, ready: make(chan client.CacheEntry)}
+	index := p.addItem(item)
+	p.watchDuration(ctx, index, item)
+
+	select {
+	case <-asked:
+	case <-time.After(time.Second):
+		t.Fatal("the stream was never asked for its length")
+	}
+	waitForCondition(t, ctx, "the header's length to be recorded", func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.items[index].durationMs == 213_000
+	})
+}
+
+// TestPlayerDrawsAStreamedSongFromItsOffset checks that the status line counts
+// a stream's playhead from where the stream began: mpv reports time relative to
+// the bytes it was handed, and the offset is what makes the number the position
+// in the song.
+func TestPlayerDrawsAStreamedSongFromItsOffset(t *testing.T) {
+	dir := t.TempDir()
+	stream := tone(t, dir, "stream.opus", 3.0)
+
+	p, cancel := newTestPlayer(t, stream)
+	defer cancel()
+	ctx := context.Background()
+
+	// Delivered as a stream (ready is non-nil) that began 45 s in, so mpv is
+	// handed it at zero and the offset is added back for the status line.
+	ready := make(chan client.CacheEntry, 1)
+	if err := p.startTrack(ctx, playbackItem{
+		variantID: "v1", source: stream, ready: ready, positionMs: 45_000,
+	}); err != nil {
+		t.Fatalf("startTrack: %v", err)
+	}
+
+	waitForCondition(t, ctx, "the playhead to be counted from the offset", func() bool {
+		p.refresh(ctx)
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.positionMs >= 45_000 && p.positionMs < 46_000
+	})
 }
 
 // TestPlayerSwapsToLocalWhenPlayingCopyLands checks the handover: when the

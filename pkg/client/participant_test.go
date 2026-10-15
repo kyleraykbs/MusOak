@@ -542,6 +542,20 @@ func TestAuthFlowOverSDK(t *testing.T) {
 	}
 }
 
+// playedSongs is the tracks a sink was handed, in order, with a song's repeats
+// collapsed: a stream handing over to the file that just landed is one song
+// being played, not the order moving on.
+func playedSongs(played []client.SinkTrack) []string {
+	var songs []string
+	for _, slot := range played {
+		if len(songs) > 0 && songs[len(songs)-1] == slot.TrackID {
+			continue
+		}
+		songs = append(songs, slot.TrackID)
+	}
+	return songs
+}
+
 func waitFor(t *testing.T, timeout time.Duration, what string, condition func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -633,9 +647,9 @@ func TestAQueueChangeIsAppliedNotRefetched(t *testing.T) {
 	// The room plays through, and the follower's own player follows the order
 	// it was told about - the second song it plays is the master's next.
 	waitFor(t, 25*time.Second, "the follower to reach the second song", func() bool {
-		return len(sink.recorded()) >= 2
+		return len(playedSongs(sink.recorded())) >= 2
 	})
-	if got := sink.recorded()[1].TrackID; got != tracks[1] {
+	if got := playedSongs(sink.recorded())[1]; got != tracks[1] {
 		t.Errorf("second song = %s, want %s (the order the event carried)", got, tracks[1])
 	}
 
