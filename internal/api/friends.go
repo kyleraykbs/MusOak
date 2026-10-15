@@ -159,24 +159,21 @@ func (s *Server) buildShare(ctx context.Context, viewerID uuid.UUID, share store
 	return out, nil
 }
 
-// buildTrackList resolves track ids, skipping the ones deleted since.
+// buildTrackList resolves track ids, skipping the ones deleted since. The
+// tracks and their credits are read in a few queries rather than one per row,
+// and the caller's order - a playlist's, a history's - is put back afterwards.
 func (s *Server) buildTrackList(ctx context.Context, ids []uuid.UUID) ([]trackResponse, error) {
-	tracks := make([]trackResponse, 0, len(ids))
-	for _, id := range ids {
-		track, err := s.store.Track(ctx, id)
-		if errors.Is(err, store.ErrNotFound) {
-			continue // gone from the library, but it was there once
-		}
-		if err != nil {
-			return nil, err
-		}
-		response, err := s.buildTrack(ctx, *track)
-		if err != nil {
-			return nil, err
-		}
-		tracks = append(tracks, response)
+	byID, err := s.store.TracksFor(ctx, ids)
+	if err != nil {
+		return nil, err
 	}
-	return tracks, nil
+	tracks := make([]store.Track, 0, len(ids))
+	for _, id := range ids {
+		if track, ok := byID[id]; ok {
+			tracks = append(tracks, track)
+		}
+	}
+	return s.buildTracks(ctx, tracks)
 }
 
 // recentTrackIDs reads the tracks out of a stored playback document: what is

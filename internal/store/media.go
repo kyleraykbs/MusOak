@@ -127,15 +127,51 @@ func (d *DB) MediaFiles(ctx context.Context) ([]MediaFile, error) {
 	return d.queryMediaFiles(ctx, `SELECT `+mediaColumns+` FROM media_files ORDER BY downloaded_at`)
 }
 
-// MediaFilesByLastUse lists the files an eviction may remove, least recently
-// served first: that is the order it removes them in. A rendition fetched from
-// a provider can be fetched again; one that came off this disk - an upload, a
-// file from the local library - is somebody's only copy and is never listed.
-func (d *DB) MediaFilesByLastUse(ctx context.Context) ([]MediaFile, error) {
-	return d.queryMediaFiles(ctx,
+// MediaFilesFor returns the stored files of a set of renditions, keyed by
+// variant id; a rendition with no file has no entry. It is MediaFile for a
+// whole listing, so rendering one does not read the files one at a time.
+func (d *DB) MediaFilesFor(ctx context.Context, variantIDs []uuid.UUID) (map[uuid.UUID]MediaFile, error) {
+	if len(variantIDs) == 0 {
+		return map[uuid.UUID]MediaFile{}, nil
+	}
+	rows, err := d.db.QueryContext(ctx,
 		`SELECT `+mediaColumns+` FROM media_files
-		 WHERE variant_id IN (SELECT id FROM variants WHERE provider NOT IN (?, ?))
-		 ORDER BY accessed_at, downloaded_at`, LocalProvider, UploadProvider)
+		 WHERE variant_id IN (`+placeholders(len(variantIDs))+`)`,
+		uuidStrings(variantIDs)...)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+
+	out := make(map[uuid.UUID]MediaFile, len(variantIDs))
+	for rows.Next() {
+		file, err := d.scanMediaFile(rows)
+		if err != nil {
+			return nil, err
+		}
+		out[file.VariantID] = *file
+	}
+	return out, mapErr(rows.Err())
+}
+
+// MediaEvictionCandidates lists the files an eviction may remove, least
+// recently served first, and only as many as it takes to cover excessBytes: the
+// query sums sizes in that order and stops once the running total reaches the
+// excess, so an eviction reads the rows it will delete rather than the whole
+// cache. A non-positive excess asks for nothing.
+func (d *DB) MediaEvictionCandidates(ctx context.Context, excessBytes int64) ([]MediaFile, error) {
+	if excessBytes <= 0 {
+		return nil, nil
+	}
+	return d.queryMediaFiles(ctx, `
+		SELECT `+mediaColumns+` FROM (
+			SELECT `+mediaColumns+`,
+			       SUM(bytes) OVER (ORDER BY accessed_at, downloaded_at) AS freed
+			FROM media_files
+			WHERE variant_id IN (SELECT id FROM variants WHERE provider NOT IN (?, ?))
+		)
+		WHERE freed - bytes < ?
+		ORDER BY accessed_at, downloaded_at`, LocalProvider, UploadProvider, excessBytes)
 }
 
 func (d *DB) queryMediaFiles(ctx context.Context, query string, args ...any) ([]MediaFile, error) {

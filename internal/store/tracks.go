@@ -122,6 +122,32 @@ func (d *DB) Track(ctx context.Context, id uuid.UUID) (*Track, error) {
 	return scanTrack(row)
 }
 
+// TracksFor returns the tracks named by ids, keyed by id; an id that names no
+// track has no entry. It is Track for a whole page, so rendering a list does
+// not read the tracks one at a time.
+func (d *DB) TracksFor(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]Track, error) {
+	if len(ids) == 0 {
+		return map[uuid.UUID]Track{}, nil
+	}
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT `+trackColumns+` FROM tracks WHERE id IN (`+placeholders(len(ids))+`)`,
+		uuidStrings(ids)...)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+
+	out := make(map[uuid.UUID]Track, len(ids))
+	for rows.Next() {
+		track, err := scanTrack(rows)
+		if err != nil {
+			return nil, err
+		}
+		out[track.ID] = *track
+	}
+	return out, mapErr(rows.Err())
+}
+
 // TrackByISRC returns the canonical track owning a variant with this ISRC.
 func (d *DB) TrackByISRC(ctx context.Context, isrc string) (*Track, error) {
 	isrc = strings.ToUpper(strings.TrimSpace(isrc))
@@ -145,11 +171,15 @@ func (d *DB) CandidateTracks(ctx context.Context, durationMs, toleranceMs int64,
 	if limit <= 0 {
 		limit = defaultCandidateLimit
 	}
+	// `duration_ms = 0 OR duration_ms BETWEEN low AND high` says the same thing
+	// as `ABS(duration_ms - ?) <= ?` but the range can use an index where the
+	// function cannot, and with tracks_created the ORDER BY is read from the
+	// index rather than sorting the whole table into a temporary one.
 	rows, err := d.db.QueryContext(ctx, `
 		SELECT id, title, duration_ms, created_at, artwork_url FROM tracks
-		WHERE ? <= 0 OR duration_ms = 0 OR ABS(duration_ms - ?) <= ?
+		WHERE ? <= 0 OR duration_ms = 0 OR duration_ms BETWEEN ? AND ?
 		ORDER BY created_at DESC
-		LIMIT ?`, durationMs, durationMs, toleranceMs, limit)
+		LIMIT ?`, durationMs, durationMs-toleranceMs, durationMs+toleranceMs, limit)
 	if err != nil {
 		return nil, mapErr(err)
 	}

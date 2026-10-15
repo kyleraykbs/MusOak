@@ -69,6 +69,13 @@ const uploadFrom = `FROM uploads u
 	JOIN users us ON us.id = u.user_id`
 
 func scanUpload(row rowScanner) (*Upload, error) {
+	return scanUploadRow(row, nil)
+}
+
+// scanUploadRow reads one upload row and, when extra is given, one trailing
+// column that is not part of the upload - the content hash the duplicate
+// grouping reads alongside each row.
+func scanUploadRow(row rowScanner, extra any) (*Upload, error) {
 	var (
 		u                     Upload
 		id, variantID, userID string
@@ -77,11 +84,15 @@ func scanUpload(row rowScanner) (*Upload, error) {
 		artistsJSON           string
 		downloadable, solo    int
 	)
-	if err := row.Scan(&id, &variantID, &userID, &u.Filename, &created,
+	dest := []any{&id, &variantID, &userID, &u.Filename, &created,
 		&vID, &vTrackID, &u.Variant.Provider, &u.Variant.ProviderTrackID,
 		&u.Variant.Title, &artistsJSON, &u.Variant.Album, &u.Variant.DurationMs,
 		&downloadable, &u.Variant.ISRC, &vCreated,
-		&u.Uploader.Username, &u.Uploader.DisplayName, &solo); err != nil {
+		&u.Uploader.Username, &u.Uploader.DisplayName, &solo}
+	if extra != nil {
+		dest = append(dest, extra)
+	}
+	if err := row.Scan(dest...); err != nil {
 		return nil, mapErr(err)
 	}
 	var err error
@@ -196,11 +207,19 @@ func (d *DB) UploadsForUser(ctx context.Context, userID uuid.UUID) ([]Upload, er
 }
 
 // AllUploads lists every user's uploads, newest first: uploaded songs are
-// visible to every user.
-func (d *DB) AllUploads(ctx context.Context) ([]Upload, error) {
+// visible to every user. limit bounds the page: the list is an inspection view
+// over a table that has no natural end, so it is read a page at a time rather
+// than whole.
+func (d *DB) AllUploads(ctx context.Context, limit int) ([]Upload, error) {
+	if limit <= 0 {
+		limit = defaultAllUploadsLimit
+	}
 	return d.queryUploads(ctx,
-		`SELECT `+uploadColumns+` `+uploadFrom+` ORDER BY u.created_at DESC`)
+		`SELECT `+uploadColumns+` `+uploadFrom+` ORDER BY u.created_at DESC LIMIT ?`, limit)
 }
+
+// defaultAllUploadsLimit bounds a listing whose caller gives no limit.
+const defaultAllUploadsLimit = 500
 
 // UploadGroup is a set of one user's uploads whose stored bytes are identical,
 // keyed by the content hash they share.
@@ -213,45 +232,42 @@ type UploadGroup struct {
 // one holds, keeping only the hashes more than one upload shares. The create
 // endpoint refuses bytes it already has, so this finds the copies stored before
 // that check existed.
+//
+// One query reads every duplicate row with the hash it was grouped by; the
+// grouping happens here, where the rows already are, rather than as a second
+// query per distinct hash.
 func (d *DB) DuplicateUploads(ctx context.Context, userID uuid.UUID) ([]UploadGroup, error) {
 	rows, err := d.db.QueryContext(ctx, `
-		SELECT m.sha256
-		FROM uploads u
+		SELECT `+uploadColumns+`, m.sha256 `+uploadFrom+`
 		JOIN media_files m ON m.variant_id = u.variant_id
-		WHERE u.user_id = ?
-		GROUP BY m.sha256
-		HAVING COUNT(*) > 1
-		ORDER BY m.sha256`, userID.String())
+		WHERE u.user_id = ? AND m.sha256 IN (
+			SELECT m2.sha256
+			FROM uploads u2
+			JOIN media_files m2 ON m2.variant_id = u2.variant_id
+			WHERE u2.user_id = ?
+			GROUP BY m2.sha256
+			HAVING COUNT(*) > 1
+		)
+		ORDER BY m.sha256, u.created_at DESC`, userID.String(), userID.String())
 	if err != nil {
 		return nil, mapErr(err)
 	}
 	defer rows.Close()
 
-	var hashes []string
+	var groups []UploadGroup
 	for rows.Next() {
 		var hash string
-		if err := rows.Scan(&hash); err != nil {
-			return nil, mapErr(err)
-		}
-		hashes = append(hashes, hash)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, mapErr(err)
-	}
-
-	var groups []UploadGroup
-	for _, hash := range hashes {
-		uploads, err := d.queryUploads(ctx, `
-			SELECT `+uploadColumns+` `+uploadFrom+`
-			JOIN media_files m ON m.variant_id = u.variant_id
-			WHERE u.user_id = ? AND m.sha256 = ?
-			ORDER BY u.created_at DESC`, userID.String(), hash)
+		upload, err := scanUploadRow(rows, &hash)
 		if err != nil {
 			return nil, err
 		}
-		groups = append(groups, UploadGroup{SHA256: hash, Uploads: uploads})
+		if len(groups) == 0 || groups[len(groups)-1].SHA256 != hash {
+			groups = append(groups, UploadGroup{SHA256: hash})
+		}
+		last := len(groups) - 1
+		groups[last].Uploads = append(groups[last].Uploads, *upload)
 	}
-	return groups, nil
+	return groups, mapErr(rows.Err())
 }
 
 // SearchUploads finds user uploads whose own metadata mentions the query,

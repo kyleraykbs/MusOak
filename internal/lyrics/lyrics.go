@@ -68,6 +68,10 @@ type Store interface {
 const (
 	sourceLRCLIB             = "lrclib"
 	sourceLRCLIBInstrumental = "lrclib-instrumental"
+	// sourceLRCLIBNone is the source of the answer "asked and there are none":
+	// a real answer, unlike a failed lookup, and cached so a song without words
+	// is not fetched again on every open.
+	sourceLRCLIBNone = "lrclib-none"
 )
 
 // Service resolves one rendition's lyrics and caches the answer.
@@ -83,9 +87,11 @@ func New(store Store, fetcher Fetcher, logger *slog.Logger) *Service {
 	return &Service{store: store, fetcher: fetcher, logger: logger}
 }
 
-// Resolve returns one rendition's lyrics, or nil when there are none. A source
-// that fails or answers nothing is not an error: playing a song must never
-// depend on a lyrics lookup, and a failure is not an answer worth caching.
+// Resolve returns one rendition's lyrics, or nil when the lookup failed. A
+// source that answers nothing is an answer - this song has no words - and it is
+// cached like an instrumental, so a song without lyrics is not asked about
+// again on every open. A source that fails is not an answer at all: nothing is
+// cached, and the next open tries again.
 //
 // The only errors that leave this method are the store's: an unknown track, or
 // a cache that could not be read.
@@ -119,7 +125,18 @@ func (s *Service) Resolve(ctx context.Context, trackID, variantID uuid.UUID) (*s
 	}
 	plain := strings.TrimSpace(result.Plain)
 	if len(result.Synced) == 0 && plain == "" {
-		return nil, nil
+		// The source was asked and had nothing. That is an answer, and it is
+		// cached under its own source so the cache hit above short-circuits the
+		// next open instead of paying the fetch again.
+		found := &store.Lyrics{
+			TrackID:    trackID,
+			VariantID:  variantID,
+			DurationMs: query.DurationMs,
+			Source:     sourceLRCLIBNone,
+			FetchedAt:  time.Now(),
+		}
+		s.save(ctx, found)
+		return found, nil
 	}
 	found := &store.Lyrics{
 		TrackID:    trackID,

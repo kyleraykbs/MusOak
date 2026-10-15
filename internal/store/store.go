@@ -144,6 +144,9 @@ type TrackRepo interface {
 	// TrackArtistsFor and TrackAlbumsFor are the batch reads matching uses:
 	// one query for a whole candidate set, rather than one per candidate.
 	TrackArtistsFor(ctx context.Context, trackIDs []uuid.UUID) (map[uuid.UUID][]Artist, error)
+	// TracksFor is the batch read a listing uses: a page of songs is one query
+	// rather than one per row.
+	TracksFor(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]Track, error)
 	SetTrackArtists(ctx context.Context, id uuid.UUID, names []string) error
 	TrackAlbums(ctx context.Context, id uuid.UUID) ([]Album, error)
 	TrackAlbumsFor(ctx context.Context, trackIDs []uuid.UUID) (map[uuid.UUID][]Album, error)
@@ -178,13 +181,22 @@ type MediaRepo interface {
 	MediaFileBySHA256(ctx context.Context, sha256 string) (*MediaFile, error)
 	DeleteMediaFile(ctx context.Context, variantID uuid.UUID) error
 	MediaFiles(ctx context.Context) ([]MediaFile, error)
+	// MediaFilesFor is the batch read a listing uses: which of a set of
+	// renditions already have a file on disk, in one query rather than one
+	// per row.
+	MediaFilesFor(ctx context.Context, variantIDs []uuid.UUID) (map[uuid.UUID]MediaFile, error)
 	// TouchMediaFile records that a file was served, which is what the LRU
 	// eviction order is based on.
 	TouchMediaFile(ctx context.Context, variantID uuid.UUID, at time.Time) error
-	// MediaFilesByLastUse lists files least recently used first.
-	MediaFilesByLastUse(ctx context.Context) ([]MediaFile, error)
 	// MediaBytes is the total size of the media cache.
 	MediaBytes(ctx context.Context) (int64, error)
+	// MediaEvictionCandidates lists only the files an eviction has to remove to
+	// free excessBytes, least recently served first: an eviction reads the rows
+	// it will delete rather than the whole cache. A rendition fetched from a
+	// provider can be fetched again; one that came off this disk - an upload, a
+	// file from the local library - is somebody's only copy and is never
+	// listed.
+	MediaEvictionCandidates(ctx context.Context, excessBytes int64) ([]MediaFile, error)
 }
 
 // UserRepo stores accounts.
@@ -270,6 +282,12 @@ type execer interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
+// dbMaxConns is the size of the connection pool a file database gets. SQLite
+// admits one writer at a time, so this is really a reader budget: enough to
+// keep requests moving alongside the writer, few enough that writes do not
+// spend their time waiting on each other.
+const dbMaxConns = 8
+
 // Open opens the SQLite database at path and applies pending migrations.
 // path is a filesystem path, ":memory:", or a full DSN such as
 // "file:test?mode=memory&cache=shared".
@@ -300,7 +318,12 @@ func Open(path string) (*DB, error) {
 	}
 	dsn += sep + "_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
 	if !memory {
-		dsn += "&_pragma=journal_mode(WAL)"
+		// WAL commits still fsync unless synchronous is relaxed, and the library
+		// is rewritten constantly by matching, downloads and uploads; NORMAL
+		// spares each commit a full flush. The page cache and mmap sizes are
+		// what those repeated reads are served from instead of the file.
+		dsn += "&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)" +
+			"&_pragma=cache_size(-16000)&_pragma=mmap_size(268435456)"
 	}
 
 	sqlDB, err := sql.Open("sqlite", dsn)
@@ -311,6 +334,13 @@ func Open(path string) (*DB, error) {
 		// An in-memory database lives inside its connections; a single
 		// pooled connection keeps it alive and consistent.
 		sqlDB.SetMaxOpenConns(1)
+	} else {
+		// database/sql otherwise opens as many connections as callers ask for,
+		// and SQLite admits one writer at a time: a crowd of them only becomes
+		// lock contention. A small pool lets readers run while the writer does,
+		// which is what WAL makes cheap.
+		sqlDB.SetMaxOpenConns(dbMaxConns)
+		sqlDB.SetMaxIdleConns(dbMaxConns)
 	}
 
 	ctx := context.Background()
@@ -350,6 +380,19 @@ func storageRoot(path string, memory bool) string {
 	return dir
 }
 
+// schemaV21 adds the indexes the hot reads were missing. Each one backs a
+// query that already exists: the candidate search orders by created_at, so its
+// ORDER BY is answered from the index instead of sorting the whole table;
+// uploads and imports look a media file up by content hash; an artist's albums
+// join album_artists by artist; and the eviction subqueries filter variants by
+// provider.
+const schemaV21 = `
+CREATE INDEX IF NOT EXISTS tracks_created ON tracks(created_at);
+CREATE INDEX IF NOT EXISTS media_files_sha256 ON media_files(sha256);
+CREATE INDEX IF NOT EXISTS album_artists_artist_id ON album_artists(artist_id);
+CREATE INDEX IF NOT EXISTS variants_provider ON variants(provider);
+`
+
 type migration struct {
 	version int
 	name    string
@@ -378,6 +421,7 @@ var migrations = []migration{
 	{version: 18, name: "play history", sql: schemaV18},
 	{version: 19, name: "lyrics", sql: schemaV19},
 	{version: 20, name: "media paths relative to the storage directory", sql: schemaV20},
+	{version: 21, name: "read indexes", sql: schemaV21},
 }
 
 func (d *DB) migrate(ctx context.Context) error {
@@ -468,8 +512,11 @@ func (d *DB) execRetry(ctx context.Context, query string, args ...any) (sql.Resu
 }
 
 // busyAttempts is how many times a write is retried while the database is busy,
-// and busyBackoff how long to wait between tries.
-const busyAttempts = 4
+// and busyBackoff how long to wait between tries. The driver already sits out
+// busy_timeout inside each attempt, so a retry can cost seconds; two attempts
+// bound a contending write at about ten seconds rather than the twenty the old
+// budget allowed.
+const busyAttempts = 2
 
 func busyBackoff(attempt int) time.Duration {
 	return time.Duration(20*(1<<attempt)) * time.Millisecond

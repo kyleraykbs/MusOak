@@ -143,7 +143,7 @@ func TestUploadListsAndLookup(t *testing.T) {
 	if len(mineList) != 2 || mineList[0].ID != second.ID || mineList[1].ID != first.ID {
 		t.Fatalf("UploadsForUser = %+v", mineList)
 	}
-	all, err := db.AllUploads(ctx)
+	all, err := db.AllUploads(ctx, 0)
 	if err != nil {
 		t.Fatalf("AllUploads: %v", err)
 	}

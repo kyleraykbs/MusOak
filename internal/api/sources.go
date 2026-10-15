@@ -112,10 +112,17 @@ func (s *Server) handleTrackSources(w http.ResponseWriter, r *http.Request) {
 	}
 	ordered := ranking.OrderVariants(order, variants, uploaders, counts, caller)
 
+	// Which of the picker's renditions already have a file is one read for the
+	// whole list; only the rest ask the manager about a transfer in flight.
+	ready, err := s.store.MediaFilesFor(r.Context(), variantIDs(ordered))
+	if err != nil {
+		ready = nil
+	}
+
 	sources := make([]sourceResponse, 0, len(ordered))
 	for _, variant := range ordered {
 		votes := counts[variant.ID]
-		status := s.media.Status(r.Context(), variant.ID)
+		status := s.variantMediaStatus(r.Context(), variant.ID, ready)
 		source := sourceResponse{
 			VariantID:    variant.ID.String(),
 			Provider:     variant.Provider,
@@ -125,7 +132,7 @@ func (s *Server) handleTrackSources(w http.ResponseWriter, r *http.Request) {
 			Album:        variant.Album,
 			DurationMs:   variant.DurationMs,
 			Downloadable: variant.Downloadable,
-			MediaState:   string(status.State),
+			MediaState:   status.State,
 			Official:     variant.Provider != store.UploadProvider,
 			Upvotes:      votes.Up,
 			Downvotes:    votes.Down,

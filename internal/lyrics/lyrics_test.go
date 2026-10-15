@@ -202,15 +202,36 @@ func TestResolveFetchFailureIsNotAnAnswer(t *testing.T) {
 	if len(fs.saves) != 0 {
 		t.Errorf("a failure was cached: %+v", fs.saves)
 	}
+}
 
-	// Nothing found is likewise no answer and nothing to cache.
-	fetcher = &fakeFetcher{result: Result{}}
-	got, err = New(fs, fetcher, nil).Resolve(context.Background(), trackID, uuid.Nil)
-	if err != nil || got != nil {
-		t.Errorf("no result: got (%+v, %v), want (nil, nil)", got, err)
+// The source was asked and had nothing. That is an answer, not a failure, and
+// it is cached so the song is not fetched again on every open.
+func TestResolveCachesAnEmptyAnswer(t *testing.T) {
+	trackID := uuid.New()
+	variantID := uuid.New()
+	fetcher := &fakeFetcher{result: Result{}}
+	fs := &fakeStore{track: testTrack(trackID)}
+
+	got, err := New(fs, fetcher, nil).Resolve(context.Background(), trackID, variantID)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
 	}
-	if len(fs.saves) != 0 {
-		t.Errorf("an empty answer was cached: %+v", fs.saves)
+	if got == nil || got.Source != "lrclib-none" {
+		t.Fatalf("got %+v, want a cached no-lyrics answer", got)
+	}
+	if len(got.Synced) != 0 || got.Plain != "" {
+		t.Errorf("a no-lyrics answer has no words: %+v", got)
+	}
+	if len(fs.saves) != 1 {
+		t.Fatalf("saves = %d, want 1", len(fs.saves))
+	}
+
+	// It is remembered, so the second ask does not fetch again.
+	if _, err := New(fs, fetcher, nil).Resolve(context.Background(), trackID, variantID); err != nil {
+		t.Fatalf("second Resolve: %v", err)
+	}
+	if len(fetcher.calls) != 1 {
+		t.Errorf("fetched %d times, want 1", len(fetcher.calls))
 	}
 }
 

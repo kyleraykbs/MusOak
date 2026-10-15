@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kyleraykbs/MusOak/internal/match"
+	"github.com/kyleraykbs/MusOak/internal/media"
 	"github.com/kyleraykbs/MusOak/internal/provider"
 	"github.com/kyleraykbs/MusOak/internal/ranking"
 	"github.com/kyleraykbs/MusOak/internal/store"
@@ -65,7 +66,43 @@ func (s *Server) buildTrack(ctx context.Context, track store.Track) (trackRespon
 	if err != nil {
 		return trackResponse{}, err
 	}
+	// The header may have been read before the cover was learned, so fall back
+	// to a lookup rather than pretending the track has no artwork.
+	artwork := track.ArtworkURL
+	if artwork == "" {
+		if url, err := s.store.TrackArtwork(ctx, track.ID); err == nil {
+			artwork = url
+		}
+	}
+	return trackResponseFor(track, artists, albums, artwork), nil
+}
 
+// buildTracks fills in the artists, albums and artwork of a whole listing in a
+// few queries rather than one set per row: a page of two hundred songs must not
+// cost six hundred round trips to render.
+func (s *Server) buildTracks(ctx context.Context, tracks []store.Track) ([]trackResponse, error) {
+	ids := make([]uuid.UUID, len(tracks))
+	for i := range tracks {
+		ids[i] = tracks[i].ID
+	}
+	artists, err := s.store.TrackArtistsFor(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	albums, err := s.store.TrackAlbumsFor(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]trackResponse, 0, len(tracks))
+	for i := range tracks {
+		track := tracks[i]
+		out = append(out, trackResponseFor(track, artists[track.ID], albums[track.ID], track.ArtworkURL))
+	}
+	return out, nil
+}
+
+// trackResponseFor shapes one track from credits and artwork already read.
+func trackResponseFor(track store.Track, artists []store.Artist, albums []store.Album, artwork string) trackResponse {
 	out := trackResponse{
 		ID:         track.ID.String(),
 		Title:      track.Title,
@@ -74,14 +111,6 @@ func (s *Server) buildTrack(ctx context.Context, track store.Track) (trackRespon
 		ArtistIDs:  make([]string, 0, len(artists)),
 		Albums:     make([]string, 0, len(albums)),
 		CreatedAt:  track.CreatedAt,
-	}
-	// The header may have been read before the cover was learned, so fall back
-	// to a lookup rather than pretending the track has no artwork.
-	artwork := track.ArtworkURL
-	if artwork == "" {
-		if url, err := s.store.TrackArtwork(ctx, track.ID); err == nil {
-			artwork = url
-		}
 	}
 	if artwork != "" {
 		out.ArtworkURL = artworkPath(store.ArtworkTrack, track.ID)
@@ -93,12 +122,16 @@ func (s *Server) buildTrack(ctx context.Context, track store.Track) (trackRespon
 	for _, album := range albums {
 		out.Albums = append(out.Albums, album.Title)
 	}
-	return out, nil
+	return out
 }
 
 // buildVariant attaches the current download state.
 func (s *Server) buildVariant(ctx context.Context, variant store.Variant) variantResponse {
-	status := s.media.Status(ctx, variant.ID)
+	return variantResponseFrom(variant, mediaStatusResponseFrom(s.media.Status(ctx, variant.ID)))
+}
+
+// variantResponseFrom shapes one variant from a download state already known.
+func variantResponseFrom(variant store.Variant, status mediaStatusResponse) variantResponse {
 	out := variantResponse{
 		ID:              variant.ID.String(),
 		TrackID:         variant.TrackID.String(),
@@ -110,14 +143,7 @@ func (s *Server) buildVariant(ctx context.Context, variant store.Variant) varian
 		DurationMs:      variant.DurationMs,
 		Downloadable:    variant.Downloadable,
 		ISRC:            variant.ISRC,
-		Media: mediaStatusResponse{
-			VariantID:  status.VariantID.String(),
-			State:      string(status.State),
-			Progress:   status.Progress,
-			Error:      status.Err,
-			DurationMs: status.DurationMs,
-			Bytes:      status.Bytes,
-		},
+		Media:           status,
 	}
 	if out.Artists == nil {
 		out.Artists = []string{}
@@ -125,12 +151,56 @@ func (s *Server) buildVariant(ctx context.Context, variant store.Variant) varian
 	return out
 }
 
+// buildVariants renders a whole rendition list. One read answers which of them
+// already have a file on disk; only the rest ask the media manager, where a
+// transfer in flight is known, so a list is not a query per row.
 func (s *Server) buildVariants(ctx context.Context, variants []store.Variant) []variantResponse {
+	ready, err := s.store.MediaFilesFor(ctx, variantIDs(variants))
+	if err != nil {
+		// A listing is still worth answering; the manager below fills every row.
+		ready = nil
+	}
 	out := make([]variantResponse, 0, len(variants))
 	for _, variant := range variants {
-		out = append(out, s.buildVariant(ctx, variant))
+		out = append(out, variantResponseFrom(variant, s.variantMediaStatus(ctx, variant.ID, ready)))
 	}
 	return out
+}
+
+// variantMediaStatus answers one rendition's download state, preferring the
+// stored file already read for the listing over a second look.
+func (s *Server) variantMediaStatus(ctx context.Context, variantID uuid.UUID, ready map[uuid.UUID]store.MediaFile) mediaStatusResponse {
+	if file, ok := ready[variantID]; ok {
+		return mediaStatusResponse{
+			VariantID:  file.VariantID.String(),
+			State:      string(media.StateReady),
+			Progress:   1,
+			DurationMs: file.DurationMs,
+			Bytes:      file.Bytes,
+		}
+	}
+	return mediaStatusResponseFrom(s.media.Status(ctx, variantID))
+}
+
+// mediaStatusResponseFrom renders a manager status in the API's shape.
+func mediaStatusResponseFrom(status media.Status) mediaStatusResponse {
+	return mediaStatusResponse{
+		VariantID:  status.VariantID.String(),
+		State:      string(status.State),
+		Progress:   status.Progress,
+		Error:      status.Err,
+		DurationMs: status.DurationMs,
+		Bytes:      status.Bytes,
+	}
+}
+
+// variantIDs collects the ids of a rendition list.
+func variantIDs(variants []store.Variant) []uuid.UUID {
+	ids := make([]uuid.UUID, len(variants))
+	for i := range variants {
+		ids[i] = variants[i].ID
+	}
+	return ids
 }
 
 // withPlays annotates tracks with how often the caller played each one. One

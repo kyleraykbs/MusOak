@@ -262,8 +262,11 @@ type Matcher struct {
 	threshold float64
 	logger    *slog.Logger
 
-	// mu serialises attach operations so two simultaneous hits for one
-	// recording cannot create two canonical tracks.
+	// mu serialises the write half of attaching: creating a canonical track and
+	// the rendition rows under it. The library search that decides what to
+	// write runs outside it, so one slow match no longer queues every other
+	// search behind it; the variant's (provider, provider id) uniqueness is
+	// what actually settles two attaches racing for the same rendition.
 	mu sync.Mutex
 
 	// background bounds how many songs are being matched against the other
@@ -294,9 +297,7 @@ func New(db Store, providers *provider.Registry, threshold float64, logger *slog
 // picked, and a search result that costs a dozen provider round trips is a
 // search result that feels broken.
 func (m *Matcher) Attach(ctx context.Context, providerName string, hit provider.Track) (*store.Track, *store.Variant, error) {
-	m.mu.Lock()
-	track, variant, err := m.attachLocked(ctx, providerName, hit)
-	m.mu.Unlock()
+	track, variant, err := m.attach(ctx, providerName, hit)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -306,26 +307,56 @@ func (m *Matcher) Attach(ctx context.Context, providerName string, hit provider.
 	return track, variant, nil
 }
 
-// attachLocked is Attach without the lock, so Resolve can call it while it
-// already holds one.
-func (m *Matcher) attachLocked(ctx context.Context, providerName string, hit provider.Track) (*store.Track, *store.Variant, error) {
-	// Already known: this exact provider track has a variant. The hit may
-	// still teach the track something it never learned (a cover, a duration).
-	if existing, err := m.db.VariantByProviderTrack(ctx, providerName, hit.ProviderTrackID); err == nil {
-		track, err := m.db.Track(ctx, existing.TrackID)
-		if err != nil {
-			return nil, nil, err
-		}
-		m.learnLocked(ctx, track, existing, hit)
-		return track, existing, nil
-	} else if !errors.Is(err, store.ErrNotFound) {
+// attach finds or creates the canonical track for a hit and stores it as a
+// variant. The library is read outside the attach mutex: the candidate search
+// is a scan of every track, and holding the lock across it queued every other
+// search, import and room resolve behind one slow match. Only the writes take
+// the lock, and the rendition's own (provider, provider id) uniqueness is what
+// settles two attaches arriving for the same one.
+func (m *Matcher) attach(ctx context.Context, providerName string, hit provider.Track) (*store.Track, *store.Variant, error) {
+	if track, variant, ok, err := m.knownRendition(ctx, providerName, hit.ProviderTrackID); err != nil {
 		return nil, nil, err
+	} else if ok {
+		m.learn(ctx, track, variant, hit)
+		return track, variant, nil
 	}
 
-	track, err := m.findTrack(ctx, hit)
+	match, err := m.findTrack(ctx, hit)
 	if err != nil {
 		return nil, nil, err
 	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.attachFound(ctx, providerName, hit, match)
+}
+
+// attachFound stores a hit as a variant of match, or of a new canonical track
+// when match is nil. The caller holds the attach mutex; the re-check inside it
+// is what catches an attach that stored this rendition - or the track it
+// belongs to - while the caller was reading the library.
+func (m *Matcher) attachFound(ctx context.Context, providerName string, hit provider.Track, match *store.Track) (*store.Track, *store.Variant, error) {
+	if track, variant, ok, err := m.knownRendition(ctx, providerName, hit.ProviderTrackID); err != nil {
+		return nil, nil, err
+	} else if ok {
+		m.learn(ctx, track, variant, hit)
+		return track, variant, nil
+	}
+
+	if match == nil {
+		// A scan that found nothing is what a brand new recording looks like,
+		// and also what two attaches of one recording racing each other look
+		// like. Creating the canonical row must not be a guess, so the scan is
+		// repeated under the lock; that is the only step this lock still
+		// guards, and it is paid only where a row is about to be created.
+		again, err := m.findTrack(ctx, hit)
+		if err != nil {
+			return nil, nil, err
+		}
+		match = again
+	}
+
+	track := match
 	if track == nil {
 		track = &store.Track{Title: hit.Title, DurationMs: hit.DurationMs}
 		if err := m.db.CreateTrack(ctx, track); err != nil {
@@ -365,14 +396,32 @@ func (m *Matcher) attachLocked(ctx context.Context, providerName string, hit pro
 		return nil, nil, err
 	}
 
-	m.learnLocked(ctx, track, variant, hit)
+	m.learn(ctx, track, variant, hit)
 	return track, variant, nil
 }
 
-// learnLocked records what a hit teaches the canonical track and its rendition,
-// and refreshes the structs the caller receives so a response never reads a
-// stale row.
-func (m *Matcher) learnLocked(ctx context.Context, track *store.Track, variant *store.Variant, hit provider.Track) {
+// knownRendition returns the track and variant of a (provider, provider track)
+// pair already stored, or ok=false when there is none. It only reads, so a
+// caller can ask before deciding whether the lock is worth taking.
+func (m *Matcher) knownRendition(ctx context.Context, providerName, providerTrackID string) (*store.Track, *store.Variant, bool, error) {
+	existing, err := m.db.VariantByProviderTrack(ctx, providerName, providerTrackID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, nil, false, nil
+		}
+		return nil, nil, false, err
+	}
+	track, err := m.db.Track(ctx, existing.TrackID)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	return track, existing, true, nil
+}
+
+// learn records what a hit teaches the canonical track and its rendition, and
+// refreshes the structs the caller receives so a response never reads a stale
+// row.
+func (m *Matcher) learn(ctx context.Context, track *store.Track, variant *store.Variant, hit provider.Track) {
 	if hit.DurationMs > 0 && track.DurationMs == 0 {
 		if err := m.db.SetTrackDuration(ctx, track.ID, hit.DurationMs); err != nil {
 			m.logger.Warn("match: set track duration", "track", track.ID, "error", err)
@@ -443,7 +492,7 @@ func (m *Matcher) attachToTrack(ctx context.Context, trackID uuid.UUID, provider
 			}
 			return kept, moved, nil
 		}
-		m.learnLocked(ctx, track, existing, hit)
+		m.learn(ctx, track, existing, hit)
 		return track, existing, nil
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return nil, nil, err
@@ -495,7 +544,7 @@ func (m *Matcher) attachToTrack(ctx context.Context, trackID uuid.UUID, provider
 		return nil, nil, err
 	}
 
-	m.learnLocked(ctx, track, variant, hit)
+	m.learn(ctx, track, variant, hit)
 	return track, variant, nil
 }
 
@@ -868,6 +917,13 @@ func (m *Matcher) Resolve(ctx context.Context, trackID uuid.UUID) ([]store.Varia
 			continue
 		}
 
+		// The library scan is a read; it happens before the lock so another
+		// match is not queued behind it.
+		match, err := m.findTrack(ctx, *best)
+		if err != nil {
+			return nil, err
+		}
+
 		m.mu.Lock()
 		current, err := m.db.VariantsForTrack(ctx, trackID)
 		if err != nil {
@@ -879,7 +935,7 @@ func (m *Matcher) Resolve(ctx context.Context, trackID uuid.UUID) ([]store.Varia
 			m.mu.Unlock()
 			return current, nil
 		}
-		other, _, attachErr := m.attachLocked(ctx, p.Name(), *best)
+		other, _, attachErr := m.attachFound(ctx, p.Name(), *best, match)
 		m.mu.Unlock()
 		if attachErr != nil {
 			return nil, attachErr

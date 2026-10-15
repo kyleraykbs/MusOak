@@ -140,7 +140,9 @@ func TestMigrationMakesExistingPathsRelative(t *testing.T) {
 		`UPDATE media_files SET path = ? WHERE variant_id = ?`, elsewhere, variantID.String()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version = 20`); err != nil {
+	// Forget the path migration and everything applied after it, so opening
+	// again replays the one this test is about.
+	if _, err := db.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version >= 20`); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {

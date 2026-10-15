@@ -27,7 +27,10 @@ type lyricsResponse struct {
 	VariantID  string            `json:"variantId"`
 }
 
-// handleTrackLyrics returns one rendition's words, or null when there are none.
+// handleTrackLyrics returns one rendition's words, or null when the lookup
+// failed. A song the source had nothing for is a real answer and comes back as
+// an entry with no lines, so the client draws nothing while the cache remembers
+// not to ask again.
 //
 // A source being unreachable is not an error: the honest answer is that there
 // are no words for this one, and the client says so plainly.

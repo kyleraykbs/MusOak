@@ -264,6 +264,45 @@ func TestMediaFileUpsertAndDelete(t *testing.T) {
 	}
 }
 
+// An eviction asks for the excess, not the cache: the listing stops at the
+// least recently served rows whose bytes cover it.
+func TestMediaEvictionCandidatesFreeTheExcess(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	tr := mustTrack(t, db, "Song")
+
+	base := time.UnixMilli(1_000_000)
+	put := func(providerTrack string, hash string, at time.Time) {
+		v := mustVariant(t, db, tr.ID, "ytmusic", providerTrack)
+		if err := db.UpsertMediaFile(ctx, &MediaFile{
+			VariantID:    v.ID,
+			Path:         "media/" + v.ID.String() + ".opus",
+			SHA256:       hash,
+			Bytes:        100,
+			DownloadedAt: at,
+			AccessedAt:   at,
+		}); err != nil {
+			t.Fatalf("UpsertMediaFile: %v", err)
+		}
+	}
+	put("a", "aa", base)
+	put("b", "bb", base.Add(time.Second))
+	put("c", "cc", base.Add(2*time.Second))
+
+	got, err := db.MediaEvictionCandidates(ctx, 150)
+	if err != nil {
+		t.Fatalf("MediaEvictionCandidates: %v", err)
+	}
+	if len(got) != 2 || got[0].SHA256 != "aa" || got[1].SHA256 != "bb" {
+		t.Fatalf("candidates = %+v, want the two least recently served", got)
+	}
+
+	// Nothing to free is nothing to list.
+	if none, err := db.MediaEvictionCandidates(ctx, 0); err != nil || len(none) != 0 {
+		t.Errorf("no excess: got (%+v, %v), want none", none, err)
+	}
+}
+
 func TestMediaFileForeignKeyIsEnforced(t *testing.T) {
 	db := newTestDB(t)
 	m := &MediaFile{VariantID: uuid.New(), Path: "/x.opus"}

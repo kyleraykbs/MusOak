@@ -430,10 +430,14 @@ func (s *Server) handleUploadList(w http.ResponseWriter, r *http.Request) {
 	s.writeUploads(w, r, uploads)
 }
 
+// uploadListLimit caps the inspection listing of every upload; it is a bound,
+// not paging - the list has no cursor yet and this keeps the response finite.
+const uploadListLimit = 500
+
 // handleUploadListAll lists every user's uploads: uploaded songs are visible
 // to every user, and this is the inspection view of them.
 func (s *Server) handleUploadListAll(w http.ResponseWriter, r *http.Request) {
-	uploads, err := s.store.AllUploads(r.Context())
+	uploads, err := s.store.AllUploads(r.Context(), uploadListLimit)
 	if err != nil {
 		writeStoreError(w, err, "uploads unavailable")
 		return
