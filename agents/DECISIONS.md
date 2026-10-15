@@ -1,5 +1,22 @@
 # Decisions
 
+## [2026-10-14] A cover request waits two seconds, and a source that just refused is remembered
+- Decision: `artwork.Fetch` no longer waits for the whole download. It waits `waitForImage` (2 s), then answers `ErrPending` (404 + `Cache-Control: no-store`) while the fetch carries on unattended on a context that outlives the request; the next render is served from disk. The provider transfers are queued through a 4-slot semaphore, and a source that failed is left alone for `failedTTL` (5 min, bounded map, dropped on the next success). Every way a cover can be absent — nothing known, still fetching, the CDN refusing — is now answered `no-store`.
+- Why: covers are asked for by `<img>` elements, a page asks for a dozen at once, and the handler held the request for up to `fetchTimeout` (20 s). Over HTTP/1.1 the browser answers that by blocking every other image on the same six connections behind it, so one slow cover made the page's artwork — the cached covers included — arrive after it, and a room repainting its rows re-attempted a dead CDN at twenty seconds a time, once a second. A miss the browser keeps is also a cover that cannot appear when the CDN comes back.
+- Also: `ErrFetch` still answers 502 on the first failure, so a genuinely broken source is still visible in the log and the client; only repeats inside the TTL are answered as "not here yet".
+- Reversible: yes
+
+## [2026-10-14] The frontend's own files are cached and revalidated, not re-fetched
+- Decision: the Go frontend server compresses a body only when it writes one (a 304 carries no `Content-Encoding`), memoises each asset's bytes and its tag, computes the frontend digest once for the embedded copy (2 s TTL for `-web-dir`), and marks *versioned* asset URLs (`?v=`, the stamped stylesheet) `public, max-age=31536000, immutable` while the unversioned ones stay `no-cache` so they revalidate. The service worker makes navigation (`/`, `/index.html`) network-first with the last good copy as the fallback, and serves every other shell file cache-first while revalidating it in the background — no `cache: "reload"`, and no timeout on a request that has no cached copy to fall back to.
+- Why: `cache: "reload"` on every shell file bypassed both the browser's cache and the server's ETag, so a reload re-downloaded ~600 KB of modules, the font and the icon in full — the "long refresh" the worker was written to remove — and the server's revalidation path was unreachable from a browser. Marking *unversioned* module URLs immutable was rejected: a client without the worker would freeze on one revision for a year.
+- Also: the page's `<link rel="icon">` and the brand mark point at a 64 px `icon-64.png` (5 KB) and `apple-touch-icon.png` (25 KB) instead of the 1080 px `icon.png` (357 KB) that is now only the `og:image` a crawler reads; the brand was drawing a 357 KB image at 26 px.
+- Reversible: yes
+
+## [2026-10-14] The room's play order is last-turn, and the server sends it
+- Decision: the pending play order is rebuilt by who last had a turn — the member whose last turn is oldest goes first, a member who has never played goes before everybody who has, and equally old turns fall back to join order — replacing the played-count-first rule. The order rides every `queue_updated` event as `master` (not the once-a-second `playback` heartbeat), and clients render it rather than deriving one.
+- Why: the client derived its own order (round-robin across members in join order) and it disagreed with the server's fairness rule, so after any queue event it advanced to songs the server never chose — the skip that thrashed. Giving the order one authority removes the divergence; last-turn is the rule the user asked for.
+- Reversible: yes
+
 ## [2026-09-30] Module path
 - Decision: `github.com/kyleraykbs/MusOak`, renamed from the v1 path along with the rest of the project.
 - Why: the project is called MusOak now, and the SDK import path follows it.

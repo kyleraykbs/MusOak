@@ -36,10 +36,12 @@ Go module `github.com/kyleraykbs/MusOak`.
   policy.
 - `internal/ranking` — per-user provider order, cached mean-position aggregate,
   `Pick` for variant selection.
-- `internal/rooms` — per-member queues mixed round-robin, a server-held clock
-  that advances past finished songs and republishes the anchored position once a
-  second, votes and skip rules, the event bus, and socket-presence grace. The
-  server is the room's only clock; the host keeps only its command authority.
+- `internal/rooms` — per-member queues mixed by last turn (whoever last played
+  longest ago is next), a server-held clock that advances past finished songs and
+  republishes the anchored position once a second, votes and skip rules, the
+  event bus, and socket-presence grace. The server is the room's only clock and
+  the play order's only author: the order rides every queue change as `master`.
+  The host keeps only its command authority.
 - `internal/api` — REST + WebSocket surface, OpenAPI document (embedded and
   served), rate limits, auth middleware. `routeTable` is the single list of
   routes and is checked against the spec by a test.
