@@ -183,17 +183,26 @@ musoak serve                           run the server in the foreground
 
 ### Player keys
 
-`musoak play` keeps a status line while it plays, and takes single keys without
-Enter:
+Two players take these, and it is deliberately the same set: `musoak play` keeps
+a status line while it plays, and the web player `musoak serve` hands out
+answers them anywhere on the page that is not a field being typed into. Single
+keys, without Enter:
 
-| key | action |
-| --- | --- |
-| `k` / `↑` | volume up |
-| `j` / `↓` | volume down |
-| `l` / `→` | next track |
-| `h` / `←` | previous track |
-| `space` | pause / resume |
-| `q` | quit |
+| key | action | who takes it |
+| --- | --- | --- |
+| `k` / `↑` | volume up | both |
+| `j` / `↓` | volume down | both |
+| `l` / `→` | next track | both |
+| `h` / `←` | previous track | both |
+| `space` | pause / resume | both |
+| `m` | mute / unmute | the web player |
+| `q` | quit | the terminal player |
+
+The page keeps its own rules for them: a field you are typing in keeps every
+key, nothing fires while a dialog or a menu is open, and an arrow that skips
+does not also scroll. In a room, `h` / `←` restarts the song the room is on —
+the songs behind it are not history there. `q` is the terminal's alone; a page
+has a tab to close.
 
 Skipping to a track that is still downloading is remembered and applied as soon
 as it is ready. Without a terminal on stdin, playback stays non-interactive and

@@ -133,7 +133,14 @@ type RadioProvider interface {
 type Streamer interface {
 	// Stream starts fetching a track and returns its audio: the bytes, and the
 	// MIME type of the container yt-dlp chose. Closing the reader ends the fetch.
-	Stream(ctx context.Context, providerTrackID string) (io.ReadCloser, string, error)
+	//
+	// startMs is where inside the track the audio should begin: zero is the
+	// whole thing, and anything else starts there and runs to the end. It exists
+	// because a listener who joins a song already playing - a room whose song is
+	// a minute gone, a session picked up where it was left - must hear the rest
+	// of it, not the start of it. A provider that cannot start part-way in may
+	// ignore it and begin at zero; the caller's answer says which it got.
+	Stream(ctx context.Context, providerTrackID string, startMs int64) (io.ReadCloser, string, error)
 }
 
 // audioMIMEByExt maps the container extensions the streaming path understands
@@ -447,7 +454,7 @@ func (r *Registry) Download(ctx context.Context, name, providerTrackID, destPath
 
 // Stream routes a stream to a provider, refusing providers without the
 // capability (Spotify) and unknown names.
-func (r *Registry) Stream(ctx context.Context, name, providerTrackID string) (io.ReadCloser, string, error) {
+func (r *Registry) Stream(ctx context.Context, name, providerTrackID string, startMs int64) (io.ReadCloser, string, error) {
 	p, ok := r.Get(name)
 	if !ok {
 		return nil, "", fmt.Errorf("%w: %s", ErrNotEnabled, name)
@@ -456,7 +463,7 @@ func (r *Registry) Stream(ctx context.Context, name, providerTrackID string) (io
 	if !ok || !p.Capabilities().Stream {
 		return nil, "", fmt.Errorf("%w: %s", ErrStreamUnsupported, name)
 	}
-	return streamer.Stream(ctx, providerTrackID)
+	return streamer.Stream(ctx, providerTrackID, startMs)
 }
 
 // MissingDeps maps provider name to the binaries it needs but cannot find.

@@ -198,14 +198,14 @@ const streamExtPoll = 25 * time.Millisecond
 //
 // ctx is the listener's; cancelling it kills the fetch, which belongs to that
 // one listener and must not disturb the download running alongside it.
-func (p *Provider) Stream(ctx context.Context, providerTrackID string) (io.ReadCloser, string, error) {
+func (p *Provider) Stream(ctx context.Context, providerTrackID string, startMs int64) (io.ReadCloser, string, error) {
 	url := "https://www.youtube.com/watch?v=" + providerTrackID
 
-	body, mimeType, err := p.stream(ctx, url)
+	body, mimeType, err := p.stream(ctx, url, startMs)
 	if err != nil {
 		p.logger.Warn("youtube stream failed with yt-dlp defaults, retrying with the web_embedded client",
 			"provider_track_id", providerTrackID, "error", err)
-		if body, mimeType, err = p.stream(ctx, url, "--extractor-args", playerClient); err != nil {
+		if body, mimeType, err = p.stream(ctx, url, startMs, "--extractor-args", playerClient); err != nil {
 			return nil, "", err
 		}
 	}
@@ -217,7 +217,7 @@ func (p *Provider) Stream(ctx context.Context, providerTrackID string) (io.ReadC
 // That report arrives before any audio, so waiting for it both learns the MIME
 // type and proves the fetch really started; until then a failure is still an
 // ordinary error rather than a truncated stream.
-func (p *Provider) stream(ctx context.Context, url string, extra ...string) (io.ReadCloser, string, error) {
+func (p *Provider) stream(ctx context.Context, url string, startMs int64, extra ...string) (io.ReadCloser, string, error) {
 	extFile, err := os.CreateTemp("", "musoak-youtube-ext-*")
 	if err != nil {
 		return nil, "", fmt.Errorf("youtube stream %s: ext file: %w", url, err)
@@ -227,6 +227,20 @@ func (p *Provider) stream(ctx context.Context, url string, extra ...string) (io.
 	defer os.Remove(extPath)
 
 	args := p.ytdlpArgs(extra...)
+	if startMs > 0 {
+		// Fetch from `startMs` to the end, and let yt-dlp's own cutter do it:
+		// it knows the container and the timestamps, and asking for a section
+		// is the tool's own way of starting part-way through. Without it a
+		// listener joining a song already playing would be handed bytes from
+		// the beginning and have to buffer a minute of music to reach the
+		// second they are on.
+		//
+		// The cost is a second tool: a section is cut with ffmpeg, which seeks
+		// the source (a range request where the host allows one). So a start
+		// part-way in waits for that seek, where starting at zero does not -
+		// which is why a whole track is asked for without this flag at all.
+		args = append(args, "--download-sections", "*"+provider.SectionTimestamp(startMs)+"-inf")
+	}
 	args = append(args, "-o", "-", "--print-to-file", "%(ext)s", extPath, url)
 
 	cmd := exec.CommandContext(ctx, p.ytdlp, args...)

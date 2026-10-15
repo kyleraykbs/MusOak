@@ -44,11 +44,135 @@ func (p *streamProvider) Capabilities() provider.Caps {
 	return provider.Caps{Search: true, Download: true, Stream: true}
 }
 
-func (p *streamProvider) Stream(context.Context, string) (io.ReadCloser, string, error) {
+func (p *streamProvider) Stream(context.Context, string, int64) (io.ReadCloser, string, error) {
 	if p.streamErr != nil {
 		return nil, "", p.streamErr
 	}
 	return p.pipe, p.contentType, nil
+}
+
+// startingProvider records where a stream was asked to begin, which is how a
+// room whose song is already a minute gone gets the rest of it.
+type startingProvider struct {
+	streamProvider
+	mu     sync.Mutex
+	starts []int64
+}
+
+func (p *startingProvider) Stream(ctx context.Context, providerTrackID string, startMs int64) (io.ReadCloser, string, error) {
+	p.mu.Lock()
+	p.starts = append(p.starts, startMs)
+	p.mu.Unlock()
+	return p.streamProvider.Stream(ctx, providerTrackID, startMs)
+}
+
+func (p *startingProvider) seen() []int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]int64(nil), p.starts...)
+}
+
+// A listener joining a song already playing asks to start where it is, and what
+// the provider is told is that position - not the beginning, which would make
+// them buffer a minute of music before they heard anything.
+func TestAStreamStartsWhereTheListenerIs(t *testing.T) {
+	tests := []struct {
+		query string
+		want  int64
+	}{
+		{"", 0},
+		{"?start=0", 0},
+		{"?start=45000", 45_000},
+		{"?start=214000", 214_000},
+		{"?start=abc", 0},
+		{"?start=-5", 0},
+		{"?start=", 0},
+	}
+	for _, test := range tests {
+		// A fresh manager per request: the download a stream starts is shared
+		// per variant, and this test is about one request at a time.
+		pr, pw := io.Pipe()
+		source := &startingProvider{streamProvider: streamProvider{
+			fakeProvider: &fakeProvider{name: "ytmusic"},
+			contentType:  "audio/webm",
+			pipe:         pr,
+			writer:       pw,
+			// The download never finishes, so this variant stays a stream.
+			hold: true,
+		}}
+		m, db := newTestManager(t, source)
+		m.SetDownloadRetry(1, time.Millisecond)
+		variant := seedVariant(t, db, true, "ytmusic")
+		srv := serveStream(t, m, variant.ID)
+
+		resp, err := http.Get(srv.URL + "/" + test.query)
+		if err != nil {
+			pw.Close()
+			t.Fatalf("%q: %v", test.query, err)
+		}
+		streamed := resp.Header.Get("X-Musoak-Stream") == "1"
+		resp.Body.Close()
+		pw.Close()
+		srv.Close()
+
+		if !streamed {
+			t.Fatalf("%q: not answered as a stream (status %s)", test.query, resp.Status)
+		}
+		if got := source.seen(); len(got) != 1 || got[0] != test.want {
+			t.Errorf("%q: the provider was asked to start at %v, want [%d]", test.query, got, test.want)
+		}
+	}
+}
+
+// A stream has no length of its own - it is a fetch in progress - so the answer
+// carries the length the server knows. A client's timeline is drawn from it.
+func TestAStreamCarriesTheLengthTheServerKnows(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	p := &streamProvider{
+		fakeProvider: &fakeProvider{name: "ytmusic"},
+		contentType:  "audio/webm",
+		pipe:         pr,
+		writer:       pw,
+	}
+	m, db := newTestManager(t, p)
+	m.SetDownloadRetry(1, time.Millisecond)
+	variant := seedVariant(t, db, true, "ytmusic")
+	if err := db.SetTrackDuration(context.Background(), variant.TrackID, 187_500); err != nil {
+		t.Fatal(err)
+	}
+	srv := serveStream(t, m, variant.ID)
+
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if got := resp.Header.Get("X-Musoak-Duration"); got != "187500" {
+		t.Errorf("X-Musoak-Duration = %q, want the variant's length 187500", got)
+	}
+}
+
+func TestStartOffset(t *testing.T) {
+	tests := []struct {
+		query string
+		want  int64
+	}{
+		{"", 0},
+		{"start=", 0},
+		{"start=0", 0},
+		{"start=1500", 1500},
+		{"start=214000", 214000},
+		{"start=-1", 0},
+		{"start=abc", 0},
+		{"start=1.5", 0},
+	}
+	for _, test := range tests {
+		request := httptest.NewRequest(http.MethodGet, "/?"+test.query, nil)
+		if got := startOffset(request); got != test.want {
+			t.Errorf("startOffset(%q) = %d, want %d", test.query, got, test.want)
+		}
+	}
 }
 
 func (p *streamProvider) Download(ctx context.Context, id, dest string, progress provider.ProgressFunc) error {

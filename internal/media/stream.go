@@ -37,6 +37,14 @@ const (
 // from a URL resolved for somebody else to fetch: YouTube refuses those, and the
 // fetch a download already uses is the one that works.
 //
+// `?start=<ms>` says where inside the track the listener is: a room whose song
+// is a minute gone, a session picked up where it was left. The provider starts
+// there and runs to the end, so what arrives is the rest of the song rather than
+// its beginning - a listener is never handed the head of a track to buffer
+// through before they hear anything. `X-Musoak-Duration` carries the length when
+// the server knows it, so a client can draw a timeline for audio whose own
+// length is unknown while it is still arriving.
+//
 // A streamed answer is marked `X-Musoak-Stream: 1`, carries no ETag, no length
 // and no ranges, because it is not the rendition this URL names: it is a copy of
 // the source, arriving now. Clients that store renditions check for that marker
@@ -105,7 +113,8 @@ func (m *Manager) Stream(w http.ResponseWriter, r *http.Request, variantID uuid.
 	}
 	defer m.endStream(variantID)
 
-	body, contentType, err := m.providers.Stream(r.Context(), variant.Provider, variant.ProviderTrackID)
+	startMs := startOffset(r)
+	body, contentType, err := m.providers.Stream(r.Context(), variant.Provider, variant.ProviderTrackID, startMs)
 	if err != nil {
 		// A provider that cannot stream is not an error the listener has to see:
 		// the request falls through to the file, and the status endpoint says how
@@ -121,6 +130,12 @@ func (m *Manager) Stream(w http.ResponseWriter, r *http.Request, variantID uuid.
 	// keep this response, and it must never be validated as the file.
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Musoak-Stream", "1")
+	if length := m.streamLength(r.Context(), variant); length > 0 {
+		// The length the server knows, for a client that wants a timeline: the
+		// audio still arriving has no length of its own, and a bar drawn from
+		// nothing is a bar that cannot show where the song is.
+		w.Header().Set("X-Musoak-Duration", strconv.FormatInt(length, 10))
+	}
 	w.WriteHeader(http.StatusOK)
 	// The headers go out on their own: a player waiting for the first byte
 	// should be waiting for audio, not for a header buffer to fill.
@@ -263,4 +278,38 @@ func (m *Manager) copyStream(w http.ResponseWriter, r *http.Request, body io.Rea
 			return
 		}
 	}
+}
+
+// startOffset is where inside a track a stream should begin: the `start` query
+// parameter in milliseconds, clamped to something sane. Anything a client sends
+// that is not a number is the whole track from the beginning, which is the
+// answer that always works.
+func startOffset(r *http.Request) int64 {
+	raw := strings.TrimSpace(r.URL.Query().Get("start"))
+	if raw == "" {
+		return 0
+	}
+	ms, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || ms <= 0 {
+		return 0
+	}
+	return ms
+}
+
+// streamLength is how long the track is, from whichever row knows: the variant
+// carries the provider's own figure, and the canonical track usually has one
+// even when a fresh variant's is still zero. Zero means nobody knows, and the
+// answer then carries no length at all.
+func (m *Manager) streamLength(ctx context.Context, variant *store.Variant) int64 {
+	if variant.DurationMs > 0 {
+		return variant.DurationMs
+	}
+	if variant.TrackID == uuid.Nil {
+		return 0
+	}
+	track, err := m.db.Track(ctx, variant.TrackID)
+	if err != nil || track == nil {
+		return 0
+	}
+	return track.DurationMs
 }

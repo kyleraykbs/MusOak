@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -165,4 +166,24 @@ func (r *YtdlpProgressReporter) Line(line string) {
 	}
 	r.last, r.at = p, time.Now()
 	r.report(p)
+}
+
+// SectionTimestamp is a time inside a track the way yt-dlp's --download-sections
+// wants it: hours:minutes:seconds, with milliseconds only when there are any.
+//
+// A listener's position is milliseconds, and the tool reads a clock; this is the
+// one place that translation happens, so a section that starts where somebody is
+// is the same number everywhere.
+func SectionTimestamp(ms int64) string {
+	if ms < 0 {
+		ms = 0
+	}
+	hours := ms / 3_600_000
+	minutes := (ms % 3_600_000) / 60_000
+	seconds := (ms % 60_000) / 1000
+	millis := ms % 1000
+	if millis == 0 {
+		return fmt.Sprintf("%d:%02d:%02d", hours, minutes, seconds)
+	}
+	return fmt.Sprintf("%d:%02d:%02d.%03d", hours, minutes, seconds, millis)
 }

@@ -30,7 +30,7 @@ func (f *fakeProvider) Download(ctx context.Context, id, dest string, _ Progress
 	return f.err
 }
 
-func (f *fakeProvider) Stream(ctx context.Context, id string) (io.ReadCloser, string, error) {
+func (f *fakeProvider) Stream(ctx context.Context, id string, _ int64) (io.ReadCloser, string, error) {
 	f.calls++
 	return f.streamBody, f.streamMIME, f.err
 }
@@ -231,7 +231,7 @@ func TestStreamRouting(t *testing.T) {
 	reg.Register(meta)
 	reg.Register(noIface)
 
-	body, mimeType, err := reg.Stream(context.Background(), "ytmusic", "id")
+	body, mimeType, err := reg.Stream(context.Background(), "ytmusic", "id", 0)
 	if err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
@@ -252,7 +252,7 @@ func TestStreamRouting(t *testing.T) {
 
 	// A provider without the capability is refused even though it carries the
 	// interface, and is never asked.
-	if _, _, err := reg.Stream(context.Background(), "spotify", "id"); !errors.Is(err, ErrStreamUnsupported) {
+	if _, _, err := reg.Stream(context.Background(), "spotify", "id", 0); !errors.Is(err, ErrStreamUnsupported) {
 		t.Errorf("spotify stream: err = %v, want ErrStreamUnsupported", err)
 	}
 	if meta.calls != 0 {
@@ -260,11 +260,11 @@ func TestStreamRouting(t *testing.T) {
 	}
 
 	// A provider that does not implement Streamer at all is refused the same way.
-	if _, _, err := reg.Stream(context.Background(), "plain", "id"); !errors.Is(err, ErrStreamUnsupported) {
+	if _, _, err := reg.Stream(context.Background(), "plain", "id", 0); !errors.Is(err, ErrStreamUnsupported) {
 		t.Errorf("plain stream: err = %v, want ErrStreamUnsupported", err)
 	}
 
-	if _, _, err := reg.Stream(context.Background(), "deezer", "id"); !errors.Is(err, ErrNotEnabled) {
+	if _, _, err := reg.Stream(context.Background(), "deezer", "id", 0); !errors.Is(err, ErrNotEnabled) {
 		t.Errorf("unknown provider: err = %v, want ErrNotEnabled", err)
 	}
 }

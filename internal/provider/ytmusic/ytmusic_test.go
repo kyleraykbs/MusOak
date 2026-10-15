@@ -82,7 +82,7 @@ func TestStreamPipesAudioWithDownloadFlags(t *testing.T) {
 	p.ytdlp = stubStreamYtdlp(t, record, "webm")
 	p.cookiesFile = "/home/you/cookies.txt"
 
-	body, mimeType, err := p.Stream(context.Background(), "abc")
+	body, mimeType, err := p.Stream(context.Background(), "abc", 0)
 	if err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestStreamMapsContainerToMIME(t *testing.T) {
 	} {
 		p := testProvider(t, stubPython(t, `exit 0`))
 		p.ytdlp = stubStreamYtdlp(t, filepath.Join(t.TempDir(), "args"), tc.ext)
-		body, mimeType, err := p.Stream(context.Background(), "abc")
+		body, mimeType, err := p.Stream(context.Background(), "abc", 0)
 		if err != nil {
 			t.Fatalf("Stream(%s): %v", tc.ext, err)
 		}
@@ -147,7 +147,7 @@ func TestStreamRejectsUnknownContainer(t *testing.T) {
 	p := testProvider(t, stubPython(t, `exit 0`))
 	p.ytdlp = stubStreamYtdlp(t, filepath.Join(t.TempDir(), "args"), "flv")
 
-	body, _, err := p.Stream(context.Background(), "abc")
+	body, _, err := p.Stream(context.Background(), "abc", 0)
 	if err == nil {
 		if body != nil {
 			body.Close()
@@ -164,7 +164,7 @@ func TestStreamRejectsUnknownContainer(t *testing.T) {
 func TestStreamFailsWhenContainerIsNeverReported(t *testing.T) {
 	p := testProvider(t, stubPython(t, `exit 0`))
 	p.ytdlp = stubSilentYtdlp(t)
-	if body, _, err := p.Stream(context.Background(), "abc"); err == nil {
+	if body, _, err := p.Stream(context.Background(), "abc", 0); err == nil {
 		if body != nil {
 			body.Close()
 		}
@@ -177,7 +177,7 @@ func TestStreamFailsWhenContainerIsNeverReported(t *testing.T) {
 func TestStreamFailsCleanlyWithoutYtdlp(t *testing.T) {
 	p := testProvider(t, stubPython(t, `exit 0`))
 	p.ytdlp = filepath.Join(t.TempDir(), "missing-yt-dlp")
-	if body, _, err := p.Stream(context.Background(), "abc"); err == nil {
+	if body, _, err := p.Stream(context.Background(), "abc", 0); err == nil {
 		body.Close()
 		t.Fatal("want error, got nil")
 	}
@@ -203,7 +203,7 @@ exec sleep 60
 	p := testProvider(t, stubPython(t, `exit 0`))
 	p.ytdlp = path
 
-	body, _, err := p.Stream(context.Background(), "abc")
+	body, _, err := p.Stream(context.Background(), "abc", 0)
 	if err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
@@ -631,5 +631,44 @@ class YTMusic:
 		if album.Tracks[i].DurationMs != duration {
 			t.Errorf("%s duration = %d, want %d", album.Tracks[i].Title, album.Tracks[i].DurationMs, duration)
 		}
+	}
+}
+
+// A listener who joins a song already playing gets the rest of it: yt-dlp is
+// asked for the section that begins where they are and runs to the end, which is
+// the tool's own way of starting part-way through a track.
+func TestAStreamFromAPositionAsksYtDlpForThatSection(t *testing.T) {
+	record := filepath.Join(t.TempDir(), "args")
+	p := testProvider(t, stubPython(t, `exit 0`))
+	p.ytdlp = stubYtdlp(t, record)
+
+	// The stub reports no container, so the stream fails; the command is what
+	// this test is about.
+	_, _, _ = p.Stream(context.Background(), "abc", 45_000)
+
+	got, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("yt-dlp was not run: %v", err)
+	}
+	args := string(got)
+	for _, want := range []string{"--download-sections", "*0:00:45-inf"} {
+		if !strings.Contains(args, want) {
+			t.Errorf("yt-dlp was not given %q:\n%s", want, args)
+		}
+	}
+}
+
+// The whole track needs no section: the flag costs a second tool (ffmpeg cuts
+// it), so a listener starting at the beginning is not made to pay for one.
+func TestAStreamFromTheStartAsksForTheWholeTrack(t *testing.T) {
+	record := filepath.Join(t.TempDir(), "args")
+	p := testProvider(t, stubPython(t, `exit 0`))
+	p.ytdlp = stubYtdlp(t, record)
+
+	_, _, _ = p.Stream(context.Background(), "abc", 0)
+
+	got, _ := os.ReadFile(record)
+	if args := string(got); strings.Contains(args, "--download-sections") {
+		t.Errorf("a stream from the start was sectioned:\n%s", args)
 	}
 }
