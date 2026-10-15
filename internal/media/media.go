@@ -72,6 +72,17 @@ const (
 	downloadBackoff  = 2 * time.Second
 )
 
+// downloadTimeout bounds one attempt at fetching a variant.
+//
+// The fetch runs on a context detached from its caller's - a client hanging up
+// must not abort a transfer everybody is sharing - and detached also means no
+// deadline at all. A provider that stalls (a yt-dlp run on a bad line, a socket
+// nobody closes) then held the variant in "downloading" for the rest of the
+// session, with every member of the room waiting on a file that was never
+// coming. Ten minutes is longer than any song takes and shorter than anybody
+// will wait.
+const downloadTimeout = 10 * time.Minute
+
 // Manager downloads, stores and serves renditions.
 type Manager struct {
 	dir        string
@@ -87,6 +98,8 @@ type Manager struct {
 
 	mu               sync.Mutex
 	status           map[uuid.UUID]Status
+	// downloadTimeout is how long one attempt may take; see downloadTimeout.
+	downloadTimeout time.Duration
 	background       map[uuid.UUID]backgroundFetch
 	paused           []uuid.UUID
 	downloadAttempts int
@@ -124,6 +137,7 @@ func New(dir string, quotaBytes int64, db Store, providers *provider.Registry, l
 		status:           make(map[uuid.UUID]Status),
 		downloadAttempts: downloadAttempts,
 		downloadBackoff:  downloadBackoff,
+		downloadTimeout:  downloadTimeout,
 	}
 }
 
@@ -398,7 +412,12 @@ func (m *Manager) downloadWithRetry(ctx context.Context, providerName, providerT
 	delay := backoff
 	var err error
 	for attempt := 1; attempt <= attempts; attempt++ {
-		err = m.providers.Download(ctx, providerName, providerTrackID, dest)
+		// Each attempt gets its own deadline: a provider that stalls is dropped
+		// and tried again rather than waiting for ever, and the retry night is
+		// not shortened by the time the last one burned.
+		attemptCtx, cancel := context.WithTimeout(ctx, m.downloadDeadline())
+		err = m.providers.Download(attemptCtx, providerName, providerTrackID, dest)
+		cancel()
 		if err == nil {
 			return nil
 		}
@@ -419,6 +438,24 @@ func (m *Manager) downloadWithRetry(ctx context.Context, providerName, providerT
 		delay *= 2
 	}
 	return err
+}
+
+// downloadDeadline is how long one attempt may take.
+func (m *Manager) downloadDeadline() time.Duration {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.downloadTimeout <= 0 {
+		return downloadTimeout
+	}
+	return m.downloadTimeout
+}
+
+// SetDownloadTimeout tunes how long one download attempt may take. Tests use it
+// to make a stalled provider fail in milliseconds rather than minutes.
+func (m *Manager) SetDownloadTimeout(d time.Duration) {
+	m.mu.Lock()
+	m.downloadTimeout = d
+	m.mu.Unlock()
 }
 
 // evict brings the media directory back under its quota, least recently served

@@ -327,3 +327,36 @@ func TestEnsurePrimaryPausesAndPutsBack(t *testing.T) {
 		t.Errorf("downloads = %d, want the paused one asked for again (1 warming, 1 play, 1 put back)", got)
 	}
 }
+
+// A provider that stalls must not hold a variant in "downloading" for the rest
+// of the session. The fetch runs on a context detached from its caller's - a
+// client hanging up must not abort a transfer others are sharing - and detached
+// also means no deadline, so a stalled yt-dlp left every member of a room
+// waiting on a file that was never coming. Each attempt is bounded now.
+func TestEnsureGivesUpOnAStalledDownload(t *testing.T) {
+	dir := t.TempDir()
+	fixture := tone(t, dir, "fixture.opus", 0.5)
+	fake := &fakeProvider{name: "ytmusic", fixture: fixture, delay: time.Hour}
+	m, db := newTestManager(t, fake)
+	m.SetDownloadTimeout(80 * time.Millisecond)
+	// The retry schedule is the other half of how long this takes: a stall is
+	// worth one more try, and the test does not wait for the real backoff.
+	m.SetDownloadRetry(2, 10*time.Millisecond)
+
+	variant := seedVariant(t, db, true, "ytmusic")
+
+	started := time.Now()
+	_, err := m.Ensure(context.Background(), variant.ID)
+	if err == nil {
+		t.Fatal("a stalled download was reported as a success")
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Errorf("gave up after %s, want it bounded by the attempts and their timeout", elapsed)
+	}
+	if state := m.Status(context.Background(), variant.ID).State; state != StateFailed {
+		t.Errorf("state = %s, want %s", state, StateFailed)
+	}
+	if _, statErr := os.Stat(m.pathFor(variant.ID)); !os.IsNotExist(statErr) {
+		t.Errorf("a partial file was left at the destination: %v", statErr)
+	}
+}
