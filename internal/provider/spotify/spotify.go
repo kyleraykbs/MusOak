@@ -100,7 +100,7 @@ func (p *Provider) MissingDeps() []string { return nil }
 
 // Download always fails: Spotify audio cannot be fetched, so the server must
 // never pretend it can.
-func (p *Provider) Download(ctx context.Context, providerTrackID, destPath string) error {
+func (p *Provider) Download(ctx context.Context, providerTrackID, destPath string, _ provider.ProgressFunc) error {
 	return fmt.Errorf("%w: spotify streams are DRM-protected; resolve the track to a downloadable variant instead",
 		provider.ErrDownloadUnsupported)
 }

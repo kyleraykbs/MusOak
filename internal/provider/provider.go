@@ -164,8 +164,43 @@ type Provider interface {
 	Search(ctx context.Context, q string, opts SearchOpts) ([]Track, error)
 	// Download writes an Ogg/Opus file at destPath, whose parent directory
 	// must exist. It is only called when Capabilities().Download is true.
-	Download(ctx context.Context, providerTrackID, destPath string) error
+	//
+	// progress is how the provider says what it is doing while it works; it may
+	// be nil, it is called from the download goroutine, and it must not block.
+	// A provider that has nothing to report simply never calls it, and the
+	// manager falls back to watching the file grow.
+	Download(ctx context.Context, providerTrackID, destPath string, progress ProgressFunc) error
 }
+
+// Progress is how a provider describes its own work while it fetches a track.
+//
+// Only the provider can answer this: it is the one running yt-dlp, and it is
+// the one that knows how large the file is going to be and when it has moved
+// from fetching to converting. The manager used to guess instead - three
+// invented fractions for "started", "fetched" and "done" - which is why a
+// progress bar in a client had nothing to show.
+//
+// Stage names the work: "download" while bytes are arriving, "convert" while
+// the file is being written from the fetched source. Done and Total are in that
+// stage's unit - bytes for a download, milliseconds for a conversion - and
+// Total <= 0 means there is no count to give (a live stream with no length
+// reported, a conversion of an unknown length).
+type Progress struct {
+	Stage string
+	Done  int64
+	Total int64
+}
+
+// ProgressFunc receives a provider's progress reports. Nil is allowed.
+type ProgressFunc func(Progress)
+
+// Stages a download passes through, as a client sees them. The provider owns
+// the first two; the manager reports the last.
+const (
+	StageDownload = "download"
+	StageConvert  = "convert"
+	StageStore    = "store"
+)
 
 // DependencyChecker is implemented by providers that shell out to binaries, so
 // the daemon can report missing tooling at startup.
@@ -399,7 +434,7 @@ func (r PlaylistResult) IsSearchable() bool { return !errors.Is(r.Err, errNotSea
 
 // Download routes a download to a provider, refusing providers without the
 // capability (Spotify) and unknown names.
-func (r *Registry) Download(ctx context.Context, name, providerTrackID, destPath string) error {
+func (r *Registry) Download(ctx context.Context, name, providerTrackID, destPath string, progress ProgressFunc) error {
 	p, ok := r.Get(name)
 	if !ok {
 		return fmt.Errorf("%w: %s", ErrNotEnabled, name)
@@ -407,7 +442,7 @@ func (r *Registry) Download(ctx context.Context, name, providerTrackID, destPath
 	if !p.Capabilities().Download {
 		return fmt.Errorf("%w: %s", ErrDownloadUnsupported, name)
 	}
-	return p.Download(ctx, providerTrackID, destPath)
+	return p.Download(ctx, providerTrackID, destPath, progress)
 }
 
 // Stream routes a stream to a provider, refusing providers without the

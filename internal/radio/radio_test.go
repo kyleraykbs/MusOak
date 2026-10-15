@@ -36,7 +36,7 @@ func (f *fakeRadio) Capabilities() provider.Caps { return f.caps }
 func (f *fakeRadio) Search(ctx context.Context, q string, opts provider.SearchOpts) ([]provider.Track, error) {
 	return nil, nil
 }
-func (f *fakeRadio) Download(ctx context.Context, id, dest string) error { return nil }
+func (f *fakeRadio) Download(ctx context.Context, id, dest string, _ provider.ProgressFunc) error { return nil }
 
 func (f *fakeRadio) Radio(ctx context.Context, seed provider.Track, limit int) ([]provider.Track, error) {
 	f.calls++

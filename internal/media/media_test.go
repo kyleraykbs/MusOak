@@ -62,7 +62,7 @@ func (f *fakeProvider) Search(ctx context.Context, q string, opts provider.Searc
 	return nil, nil
 }
 
-func (f *fakeProvider) Download(ctx context.Context, id, dest string) error {
+func (f *fakeProvider) Download(ctx context.Context, id, dest string, _ provider.ProgressFunc) error {
 	f.calls.Add(1)
 	f.destMu.Lock()
 	f.dests = append(f.dests, dest)
@@ -285,12 +285,18 @@ func TestStatusTransitions(t *testing.T) {
 		_, _ = m.Ensure(context.Background(), variant.ID)
 	}()
 
+	// A provider that says nothing: the honest answer while its bytes are
+	// somewhere this manager cannot see is "no count", and -1 is what a client
+	// draws as a sweep instead of an invented fill.
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		status := m.Status(context.Background(), variant.ID)
 		if status.State == StateDownloading {
-			if status.Progress <= 0 || status.Progress >= 1 {
-				t.Errorf("progress = %v, want a phase value in (0,1)", status.Progress)
+			if status.Progress != progressUnknown {
+				t.Errorf("progress = %v, want %v while nothing has been reported", status.Progress, progressUnknown)
+			}
+			if status.Stage != provider.StageDownload {
+				t.Errorf("stage = %q, want %q", status.Stage, provider.StageDownload)
 			}
 			break
 		}
@@ -304,6 +310,62 @@ func TestStatusTransitions(t *testing.T) {
 	status := m.Status(context.Background(), variant.ID)
 	if status.State != StateReady || status.Progress != 1 || status.DurationMs < 900 {
 		t.Errorf("final status = %+v", status)
+	}
+}
+
+// reportingProvider says how its own download is going, which is what a bar
+// draws. A manager that invented fractions instead is why this exists.
+type reportingProvider struct {
+	fakeProvider
+	done  int64
+	total int64
+}
+
+func (p *reportingProvider) Download(ctx context.Context, id, dest string, progress provider.ProgressFunc) error {
+	if progress != nil {
+		for _, done := range []int64{p.total / 4, p.total / 2, p.total} {
+			progress(provider.Progress{Stage: provider.StageDownload, Done: done, Total: p.total})
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	return p.fakeProvider.Download(ctx, id, dest, progress)
+}
+
+func TestAProvidersReportsReachTheStatus(t *testing.T) {
+	dir := t.TempDir()
+	fixture := tone(t, dir, "fixture.opus", 0.5)
+	fake := &reportingProvider{
+		fakeProvider: fakeProvider{name: "ytmusic", fixture: fixture, delay: 200 * time.Millisecond},
+		total:        4096,
+	}
+	m, db := newTestManager(t, fake)
+	variant := seedVariant(t, db, true, "ytmusic")
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = m.Ensure(context.Background(), variant.ID)
+	}()
+
+	// The fractions the provider reported have to appear, in order, with the
+	// numbers beside them: a client's bar is drawn from exactly these.
+	var seen []float64
+	deadline := time.Now().Add(2 * time.Second)
+	for len(seen) < 3 && time.Now().Before(deadline) {
+		status := m.Status(context.Background(), variant.ID)
+		if status.TotalBytes == fake.total && status.Progress >= 0 {
+			if len(seen) == 0 || seen[len(seen)-1] != status.Progress {
+				seen = append(seen, status.Progress)
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	<-done
+	if len(seen) < 3 {
+		t.Fatalf("saw %v, want the reported fractions 0.25, 0.5 and 1", seen)
+	}
+	if seen[0] != 0.25 || seen[1] != 0.5 || seen[2] != 1 {
+		t.Errorf("progress went %v, want [0.25 0.5 1]", seen)
 	}
 }
 

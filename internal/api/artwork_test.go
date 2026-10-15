@@ -21,7 +21,9 @@ func (a *artworkProvider) Name() string { return a.name }
 func (a *artworkProvider) Capabilities() provider.Caps {
 	return provider.Caps{Search: true, Download: true}
 }
-func (a *artworkProvider) Download(ctx context.Context, id, dest string) error { return nil }
+func (a *artworkProvider) Download(ctx context.Context, id, dest string, _ provider.ProgressFunc) error {
+	return nil
+}
 
 func (a *artworkProvider) Search(ctx context.Context, q string, opts provider.SearchOpts) ([]provider.Track, error) {
 	a.searches.Add(1)

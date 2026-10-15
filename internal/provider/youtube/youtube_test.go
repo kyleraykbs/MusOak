@@ -150,7 +150,7 @@ func TestDownloadPassesConfiguredCookies(t *testing.T) {
 
 	// The stub writes no audio, so this fails at the end; the command it ran is
 	// what this test is about.
-	_ = p.Download(context.Background(), "abc", filepath.Join(t.TempDir(), "out.opus"))
+	_ = p.Download(context.Background(), "abc", filepath.Join(t.TempDir(), "out.opus"), nil)
 
 	args, err := os.ReadFile(record)
 	if err != nil {
@@ -168,12 +168,32 @@ func TestDownloadPassesConfiguredCookies(t *testing.T) {
 
 func TestDownloadFailsCleanlyWithoutYtdlp(t *testing.T) {
 	p := testProvider(t, filepath.Join(t.TempDir(), "missing-yt-dlp"))
-	err := p.Download(context.Background(), "abc", filepath.Join(t.TempDir(), "out.opus"))
+	err := p.Download(context.Background(), "abc", filepath.Join(t.TempDir(), "out.opus"), nil)
 	if err == nil {
 		t.Fatal("want error, got nil")
 	}
 	if !strings.Contains(err.Error(), "yt-dlp") {
 		t.Errorf("error should mention yt-dlp, got %v", err)
+	}
+}
+
+// The fetch is where a download spends its time, and it is where the bar used
+// to sit still: yt-dlp's own progress lines have to come back as the bytes they
+// count.
+func TestFetchReportsYtdlpProgress(t *testing.T) {
+	dir := t.TempDir()
+	p := testProvider(t, stubYtdlp(t,
+		`printf '[download]  50.0%% of    4.00MiB at   2.10MiB/s ETA 00:02\n'`+
+			"\n"+`printf 'audio' > `+filepath.Join(dir, "abc.webm")))
+
+	var got []provider.Progress
+	if _, err := p.fetch(context.Background(), "https://www.youtube.com/watch?v=abc", dir,
+		func(pr provider.Progress) { got = append(got, pr) }); err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	want := provider.Progress{Stage: provider.StageDownload, Done: 2097152, Total: 4194304}
+	if len(got) != 1 || got[0] != want {
+		t.Errorf("progress = %+v, want one report of %+v", got, want)
 	}
 }
 

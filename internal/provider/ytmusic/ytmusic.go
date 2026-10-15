@@ -3,6 +3,7 @@
 package ytmusic
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -442,7 +443,11 @@ type searchHit struct {
 
 // Download fetches the best available audio and leaves an Ogg/Opus file at
 // destPath. The parent directory must exist.
-func (p *Provider) Download(ctx context.Context, providerTrackID, destPath string) error {
+//
+// progress hears from both halves of the work: the bytes yt-dlp is taking, and
+// the milliseconds the transcode has written. A download is mostly the fetch,
+// and before this the fetch said nothing at all.
+func (p *Provider) Download(ctx context.Context, providerTrackID, destPath string, progress provider.ProgressFunc) error {
 	tmpDir, err := os.MkdirTemp(filepath.Dir(destPath), ".ytmusic-*")
 	if err != nil {
 		return fmt.Errorf("ytmusic download: temp dir: %w", err)
@@ -451,19 +456,35 @@ func (p *Provider) Download(ctx context.Context, providerTrackID, destPath strin
 
 	url := "https://music.youtube.com/watch?v=" + providerTrackID
 
-	src, err := p.fetch(ctx, url, tmpDir)
+	src, err := p.fetch(ctx, url, tmpDir, progress)
 	if err != nil {
 		p.logger.Warn("ytmusic download failed with yt-dlp defaults, retrying with the web_embedded client",
 			"provider_track_id", providerTrackID, "error", err)
-		if src, err = p.fetch(ctx, url, tmpDir, "--extractor-args", playerClient); err != nil {
+		if src, err = p.fetch(ctx, url, tmpDir, progress, "--extractor-args", playerClient); err != nil {
 			return err
 		}
 	}
 
-	if err := ffmpeg.ToOpus(ctx, src, destPath); err != nil {
+	if err := ffmpeg.ToOpusWithProgress(ctx, src, destPath, convertProgress(progress)); err != nil {
 		return fmt.Errorf("ytmusic download %s: transcode: %w", providerTrackID, err)
 	}
 	return nil
+}
+
+// convertProgress adapts ffmpeg's own millisecond readings to the provider
+// contract. A nil progress stays nil, so a caller with nobody to tell gets the
+// plain transcode rather than a callback that goes nowhere.
+func convertProgress(progress provider.ProgressFunc) ffmpeg.ProgressFunc {
+	if progress == nil {
+		return nil
+	}
+	return func(done, total time.Duration) {
+		progress(provider.Progress{
+			Stage: provider.StageConvert,
+			Done:  done.Milliseconds(),
+			Total: total.Milliseconds(),
+		})
+	}
 }
 
 // streamExtWait bounds how long Stream waits for yt-dlp to report the container
@@ -637,16 +658,41 @@ func (p *Provider) ytdlpArgs(extra ...string) []string {
 	return append(args, extra...)
 }
 
-// fetch runs yt-dlp into dir and returns the produced audio file.
-func (p *Provider) fetch(ctx context.Context, url, dir string, extra ...string) (string, error) {
+// fetch runs yt-dlp into dir and returns the produced audio file, reporting the
+// bytes it takes as it takes them.
+//
+// --newline --progress makes yt-dlp write a progress line per chunk to stdout.
+// The flags go on here rather than in the shared list because the streaming path
+// writes the audio itself to stdout, and the shared "--no-progress" is what
+// keeps the two apart: a later --progress wins.
+func (p *Provider) fetch(ctx context.Context, url, dir string, progress provider.ProgressFunc, extra ...string) (string, error) {
 	args := p.ytdlpArgs(extra...)
-	args = append(args, "-o", filepath.Join(dir, "%(id)s.%(ext)s"), url)
+	args = append(args, "--newline", "--progress", "-o", filepath.Join(dir, "%(id)s.%(ext)s"), url)
 
 	cmd := exec.CommandContext(ctx, p.ytdlp, args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", fmt.Errorf("yt-dlp %s: %w", url, err)
+	}
+	// stderr is where a failure is reported, so it is kept whole for the error
+	// below even though progress is read off stdout.
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("yt-dlp %s: %w", url, err)
+	}
+
+	reporter := provider.NewYtdlpProgressReporter(progress)
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		reporter.Line(scanner.Text())
+	}
+	scanErr := scanner.Err()
+	if err := cmd.Wait(); err != nil {
 		return "", fmt.Errorf("yt-dlp %s: %w: %s", url, err, strings.TrimSpace(stderr.String()))
+	}
+	if scanErr != nil {
+		return "", fmt.Errorf("yt-dlp %s: read the progress it printed: %w", url, scanErr)
 	}
 	return firstAudioFile(dir)
 }

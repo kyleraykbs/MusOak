@@ -309,12 +309,24 @@ type Variant struct {
 
 // MediaStatus is a variant's download state.
 type MediaStatus struct {
-	VariantID  string  `json:"variantId"`
-	State      string  `json:"state"`
-	Progress   float64 `json:"progress"`
-	Error      string  `json:"error,omitempty"`
-	DurationMs int64   `json:"durationMs,omitempty"`
-	Bytes      int64   `json:"bytes,omitempty"`
+	VariantID string `json:"variantId"`
+	State     string `json:"state"`
+	// Stage is what the download is doing right now, one of the Media stages,
+	// and empty when nothing is running.
+	Stage string `json:"stage,omitempty"`
+	// Progress is the fraction of the current stage that is done, and -1 when
+	// there is nothing to count: a length the provider never reported, or a
+	// stage with no bytes. A -1 is a caller's cue to show the stage's own
+	// numbers instead of a percentage.
+	Progress float64 `json:"progress"`
+	Error    string  `json:"error,omitempty"`
+	// DurationMs is the finished rendition's length, once it is known.
+	DurationMs int64 `json:"durationMs,omitempty"`
+	// Bytes and TotalBytes are the current stage's own numbers: bytes for the
+	// download stage, milliseconds for the conversion. TotalBytes <= 0 means
+	// unknown.
+	Bytes      int64 `json:"bytes,omitempty"`
+	TotalBytes int64 `json:"totalBytes,omitempty"`
 }
 
 // Media states.
@@ -323,6 +335,17 @@ const (
 	MediaDownloading = "downloading"
 	MediaReady       = "ready"
 	MediaFailed      = "failed"
+)
+
+// Media stages: what a download is doing between "downloading" and "ready".
+const (
+	// MediaStageDownload means bytes are arriving from the provider.
+	MediaStageDownload = "download"
+	// MediaStageConvert means the fetched source is being written as the stored
+	// rendition, so Bytes/TotalBytes are milliseconds there.
+	MediaStageConvert = "convert"
+	// MediaStageStore means the finished file is being probed and put in place.
+	MediaStageStore = "store"
 )
 
 // SearchGroup is a canonical track with the variants that matched onto it.

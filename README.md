@@ -199,6 +199,12 @@ Skipping to a track that is still downloading is remembered and applied as soon
 as it is ready. Without a terminal on stdin, playback stays non-interactive and
 prints one line per track.
 
+While the playing track is still coming down, the status line says what the
+download is doing: `downloading 3.1 of 8.4 MB`, `converting 45%`,
+`storing the file`. When the server has no count to give — a provider that never
+said how large the file is — the line shows the bytes so far instead of a made-up
+percentage.
+
 Headless machines can play through a null sink:
 `MUSOAK_MPV_ARGS="--ao=null --no-video" musoak play`.
 

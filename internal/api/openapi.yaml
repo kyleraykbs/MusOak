@@ -2619,14 +2619,37 @@ components:
         state:
           type: string
           enum: [none, downloading, ready, failed]
+        stage:
+          type: string
+          description: |
+            What a download is doing: `download` while bytes are arriving,
+            `convert` while the file is written from the fetched source, `store`
+            while it is probed and put in place. Empty when nothing is running.
+          enum: [download, convert, store, ""]
         progress:
           type: number
           format: double
-          minimum: 0
+          description: |
+            How far through `stage` the work is, 0 to 1, or **-1 when there is
+            nothing to count** - a provider that has not reported a length, a
+            stage with no bytes of its own. A client sweeps its bar on -1
+            rather than drawing a fill that would be invented.
+          minimum: -1
           maximum: 1
+        bytes:
+          type: integer
+          format: int64
+          description: |
+            The stage's own count so far: bytes fetched for `download`,
+            milliseconds written for `convert`.
+        totalBytes:
+          type: integer
+          format: int64
+          description: |
+            What `bytes` is heading for, in the same unit. Omitted or 0 means
+            the total is not known, which is why `progress` is -1.
         error: { type: string }
         durationMs: { type: integer, format: int64 }
-        bytes: { type: integer, format: int64 }
 
     RankedVariant:
       type: object

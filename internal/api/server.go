@@ -170,6 +170,12 @@ func (s *Server) registerProviders() {
 	// which needs no account, and those names are all an import needs to find
 	// the same songs somewhere playable. Credentials, when the config has them,
 	// are used - the API answers with more than the embed does.
+	// Extra providers exist only in test builds: `provider.Extras` is empty in
+	// a released binary and returns the fake ones under `-tags e2e`, which is
+	// how the browser suite gets a download slow enough to watch.
+	for _, p := range provider.Extras() {
+		s.providers.Register(p)
+	}
 	if !s.cfg.Providers.Spotify.Enabled {
 		s.providers.RegisterBrowsing("spotify", func() (provider.Provider, error) {
 			return spotify.New(s.cfg.Providers.Spotify.ClientID, s.cfg.Providers.Spotify.ClientSecret, s.logger), nil

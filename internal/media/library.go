@@ -8,11 +8,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/dhowden/tag"
 	"github.com/google/uuid"
 
 	"github.com/kyleraykbs/MusOak/internal/ffmpeg"
+	"github.com/kyleraykbs/MusOak/internal/provider"
 	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
@@ -62,8 +64,29 @@ func (m *Manager) Import(ctx context.Context, path string) (*store.Variant, erro
 	if err := os.MkdirAll(m.dir, 0o755); err != nil {
 		return nil, fmt.Errorf("media: create dir: %w", err)
 	}
+
+	// The variant's id is minted before its file exists so the conversion can
+	// report against the variant a client will read once the import lands: an
+	// import that converts for a minute used to show nothing at all.
+	variantID := uuid.New()
 	tmp := filepath.Join(m.dir, ".import-"+uuid.NewString()+".opus.part")
-	if err := ffmpeg.ToOpus(ctx, abs, tmp); err != nil {
+	m.setStatus(Status{
+		VariantID: variantID,
+		State:     StateDownloading,
+		Stage:     provider.StageConvert,
+		Progress:  progressUnknown,
+	})
+	if err := ffmpeg.ToOpusWithProgress(ctx, abs, tmp, func(done, total time.Duration) {
+		ms, totalMs := done.Milliseconds(), total.Milliseconds()
+		m.setStatus(Status{
+			VariantID:  variantID,
+			State:      StateDownloading,
+			Stage:      provider.StageConvert,
+			Bytes:      ms,
+			TotalBytes: totalMs,
+			Progress:   fraction(ms, totalMs),
+		})
+	}); err != nil {
 		_ = os.Remove(tmp)
 		return nil, fmt.Errorf("media: import %s: %w", path, err)
 	}
@@ -80,6 +103,7 @@ func (m *Manager) Import(ctx context.Context, path string) (*store.Variant, erro
 		return nil, err
 	}
 	variant := &store.Variant{
+		ID:              variantID,
 		TrackID:         track.ID,
 		Provider:        store.LocalProvider,
 		ProviderTrackID: "sha256:" + sum,

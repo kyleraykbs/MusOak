@@ -408,7 +408,9 @@ func (p *capsStubProvider) Capabilities() provider.Caps { return p.caps }
 func (p *capsStubProvider) Search(context.Context, string, provider.SearchOpts) ([]provider.Track, error) {
 	return nil, nil
 }
-func (p *capsStubProvider) Download(context.Context, string, string) error { return nil }
+func (p *capsStubProvider) Download(context.Context, string, string, provider.ProgressFunc) error {
+	return nil
+}
 
 func TestAttachTrackSource(t *testing.T) {
 	c := newHTTPTestServer(t, nil)

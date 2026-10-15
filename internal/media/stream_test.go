@@ -51,9 +51,9 @@ func (p *streamProvider) Stream(context.Context, string) (io.ReadCloser, string,
 	return p.pipe, p.contentType, nil
 }
 
-func (p *streamProvider) Download(ctx context.Context, id, dest string) error {
+func (p *streamProvider) Download(ctx context.Context, id, dest string, progress provider.ProgressFunc) error {
 	if !p.hold {
-		return p.fakeProvider.Download(ctx, id, dest)
+		return p.fakeProvider.Download(ctx, id, dest, progress)
 	}
 	if p.started != nil {
 		select {

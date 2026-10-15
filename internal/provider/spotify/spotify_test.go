@@ -224,7 +224,7 @@ func TestSpotifyNeverDownloads(t *testing.T) {
 	if caps := p.Capabilities(); caps.Download {
 		t.Error("Spotify must never advertise downloads")
 	}
-	err := p.Download(context.Background(), "4cOdK2wGLETKBW3PvgPWqT", "/tmp/out.opus")
+	err := p.Download(context.Background(), "4cOdK2wGLETKBW3PvgPWqT", "/tmp/out.opus", nil)
 	if !errors.Is(err, provider.ErrDownloadUnsupported) {
 		t.Fatalf("err = %v, want ErrDownloadUnsupported", err)
 	}
@@ -239,7 +239,7 @@ func TestRegistryRefusesSpotifyDownloads(t *testing.T) {
 	registry := provider.NewRegistry(slog.New(slog.DiscardHandler), time.Second)
 	registry.Register(New("id", "secret", slog.New(slog.DiscardHandler)))
 
-	err := registry.Download(context.Background(), "spotify", "track-id", "/tmp/out.opus")
+	err := registry.Download(context.Background(), "spotify", "track-id", "/tmp/out.opus", nil)
 	if !errors.Is(err, provider.ErrDownloadUnsupported) {
 		t.Fatalf("err = %v, want ErrDownloadUnsupported", err)
 	}

@@ -27,6 +27,7 @@ func (a *App) cmdPlay(ctx context.Context, args []string) error {
 	defer sink.Close()
 
 	ui := newPlayer(a.out, sink, queue)
+	ui.mediaStatus = a.client.MediaStatus
 	ui.start(ctx)
 	defer ui.stop()
 

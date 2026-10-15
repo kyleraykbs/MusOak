@@ -16,9 +16,11 @@ type fakeRadioProvider struct {
 	tracks []provider.Track
 }
 
-func (f *fakeRadioProvider) Name() string                                        { return f.name }
-func (f *fakeRadioProvider) Capabilities() provider.Caps                         { return f.caps }
-func (f *fakeRadioProvider) Download(ctx context.Context, id, dest string) error { return nil }
+func (f *fakeRadioProvider) Name() string                { return f.name }
+func (f *fakeRadioProvider) Capabilities() provider.Caps { return f.caps }
+func (f *fakeRadioProvider) Download(ctx context.Context, id, dest string, _ provider.ProgressFunc) error {
+	return nil
+}
 func (f *fakeRadioProvider) Search(ctx context.Context, q string, opts provider.SearchOpts) ([]provider.Track, error) {
 	return nil, nil
 }

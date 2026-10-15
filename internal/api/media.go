@@ -100,12 +100,23 @@ func (s *Server) handleMediaStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 type mediaStatusResponse struct {
-	VariantID  string  `json:"variantId"`
-	State      string  `json:"state"`
-	Progress   float64 `json:"progress"`
-	Error      string  `json:"error,omitempty"`
-	DurationMs int64   `json:"durationMs,omitempty"`
-	Bytes      int64   `json:"bytes,omitempty"`
+	VariantID string `json:"variantId"`
+	State     string `json:"state"`
+	// Stage is what the download is doing: "download" while bytes arrive,
+	// "convert" while the file is written from the fetched source, "store"
+	// while it is probed and put in place.
+	Stage string `json:"stage,omitempty"`
+	// Progress is the fraction of the current stage that is done, and -1 when
+	// there is nothing to count (no length reported, a stage with no bytes),
+	// which is a client's cue to sweep the bar rather than fill it.
+	Progress float64 `json:"progress"`
+	// Bytes/TotalBytes are the stage's own numbers: the bytes fetched for a
+	// download, the milliseconds converted for a conversion. TotalBytes <= 0
+	// means unknown.
+	Bytes      int64  `json:"bytes,omitempty"`
+	TotalBytes int64  `json:"totalBytes,omitempty"`
+	Error      string `json:"error,omitempty"`
+	DurationMs int64  `json:"durationMs,omitempty"`
 }
 
 func (s *Server) mediaStatus(ctx context.Context, variantID uuid.UUID) mediaStatusResponse {
@@ -113,10 +124,12 @@ func (s *Server) mediaStatus(ctx context.Context, variantID uuid.UUID) mediaStat
 	return mediaStatusResponse{
 		VariantID:  status.VariantID.String(),
 		State:      string(status.State),
+		Stage:      status.Stage,
 		Progress:   status.Progress,
+		Bytes:      status.Bytes,
+		TotalBytes: status.TotalBytes,
 		Error:      status.Err,
 		DurationMs: status.DurationMs,
-		Bytes:      status.Bytes,
 	}
 }
 

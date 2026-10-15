@@ -399,7 +399,9 @@ func (p *uploadStubProvider) Name() string { return p.name }
 func (p *uploadStubProvider) Capabilities() provider.Caps {
 	return provider.Caps{Search: true, Download: true}
 }
-func (p *uploadStubProvider) Download(ctx context.Context, id, dest string) error { return nil }
+func (p *uploadStubProvider) Download(ctx context.Context, id, dest string, _ provider.ProgressFunc) error {
+	return nil
+}
 func (p *uploadStubProvider) Search(ctx context.Context, q string, opts provider.SearchOpts) ([]provider.Track, error) {
 	return []provider.Track{{
 		ProviderTrackID: p.name + "-1",

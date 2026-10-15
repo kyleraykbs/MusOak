@@ -25,7 +25,9 @@ func (f *fakePlaylistProvider) Capabilities() provider.Caps {
 func (f *fakePlaylistProvider) Search(ctx context.Context, q string, opts provider.SearchOpts) ([]provider.Track, error) {
 	return nil, nil
 }
-func (f *fakePlaylistProvider) Download(ctx context.Context, id, dest string) error { return nil }
+func (f *fakePlaylistProvider) Download(ctx context.Context, id, dest string, _ provider.ProgressFunc) error {
+	return nil
+}
 func (f *fakePlaylistProvider) SearchPlaylists(ctx context.Context, q string, opts provider.SearchOpts) ([]provider.Playlist, error) {
 	if f.searchErr != nil {
 		return nil, f.searchErr

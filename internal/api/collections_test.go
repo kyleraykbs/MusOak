@@ -26,7 +26,9 @@ func (f *fakeCollectionsProvider) Capabilities() provider.Caps {
 func (f *fakeCollectionsProvider) Search(ctx context.Context, q string, opts provider.SearchOpts) ([]provider.Track, error) {
 	return nil, nil
 }
-func (f *fakeCollectionsProvider) Download(ctx context.Context, id, dest string) error { return nil }
+func (f *fakeCollectionsProvider) Download(ctx context.Context, id, dest string, _ provider.ProgressFunc) error {
+	return nil
+}
 func (f *fakeCollectionsProvider) SearchAlbums(ctx context.Context, q string, opts provider.SearchOpts) ([]provider.Album, error) {
 	if f.searchErr != nil {
 		return nil, f.searchErr

@@ -25,7 +25,7 @@ type fakeProvider struct {
 func (f *fakeProvider) Name() string          { return f.name }
 func (f *fakeProvider) Capabilities() Caps    { return f.caps }
 func (f *fakeProvider) MissingDeps() []string { return f.deps }
-func (f *fakeProvider) Download(ctx context.Context, id, dest string) error {
+func (f *fakeProvider) Download(ctx context.Context, id, dest string, _ ProgressFunc) error {
 	f.calls++
 	return f.err
 }
@@ -183,14 +183,14 @@ func TestDownloadRouting(t *testing.T) {
 	reg.Register(dl)
 	reg.Register(meta)
 
-	if err := reg.Download(context.Background(), "ytmusic", "id", "/tmp/x.opus"); err != nil {
+	if err := reg.Download(context.Background(), "ytmusic", "id", "/tmp/x.opus", nil); err != nil {
 		t.Fatalf("Download: %v", err)
 	}
 	if dl.calls != 1 {
 		t.Errorf("download calls = %d, want 1", dl.calls)
 	}
 
-	err := reg.Download(context.Background(), "spotify", "id", "/tmp/x.opus")
+	err := reg.Download(context.Background(), "spotify", "id", "/tmp/x.opus", nil)
 	if !errors.Is(err, ErrDownloadUnsupported) {
 		t.Errorf("spotify download: err = %v, want ErrDownloadUnsupported", err)
 	}
@@ -198,7 +198,7 @@ func TestDownloadRouting(t *testing.T) {
 		t.Error("a metadata-only provider must never be asked to download")
 	}
 
-	if err := reg.Download(context.Background(), "deezer", "id", "/tmp/x.opus"); !errors.Is(err, ErrNotEnabled) {
+	if err := reg.Download(context.Background(), "deezer", "id", "/tmp/x.opus", nil); !errors.Is(err, ErrNotEnabled) {
 		t.Errorf("unknown provider: err = %v, want ErrNotEnabled", err)
 	}
 }
@@ -212,7 +212,9 @@ func (b *bareProvider) Capabilities() Caps { return Caps{Search: true} }
 func (b *bareProvider) Search(context.Context, string, SearchOpts) ([]Track, error) {
 	return nil, nil
 }
-func (b *bareProvider) Download(context.Context, string, string) error { return ErrDownloadUnsupported }
+func (b *bareProvider) Download(context.Context, string, string, ProgressFunc) error {
+	return ErrDownloadUnsupported
+}
 
 func TestStreamRouting(t *testing.T) {
 	reg := newTestRegistry(t, time.Second)
@@ -380,12 +382,14 @@ func TestBrowsingProviderIsOnlyForPlaylists(t *testing.T) {
 // fakePlaylistProvider answers a playlist, and nothing else.
 type fakePlaylistProvider struct{}
 
-func (f *fakePlaylistProvider) Name() string             { return "spotify" }
-func (f *fakePlaylistProvider) Capabilities() Caps       { return Caps{Playlists: true} }
+func (f *fakePlaylistProvider) Name() string       { return "spotify" }
+func (f *fakePlaylistProvider) Capabilities() Caps { return Caps{Playlists: true} }
 func (f *fakePlaylistProvider) Search(context.Context, string, SearchOpts) ([]Track, error) {
 	return nil, nil
 }
-func (f *fakePlaylistProvider) Download(context.Context, string, string) error { return nil }
+func (f *fakePlaylistProvider) Download(context.Context, string, string, ProgressFunc) error {
+	return nil
+}
 func (f *fakePlaylistProvider) SearchPlaylists(context.Context, string, SearchOpts) ([]Playlist, error) {
 	return nil, nil
 }

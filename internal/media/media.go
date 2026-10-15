@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -47,16 +48,90 @@ const (
 	StateFailed      State = "failed"
 )
 
-// Status reports a variant's download state and, while downloading, a coarse
-// phase progress in [0,1].
+// Status reports a variant's download state and what it is doing about it.
+//
+// Progress is the fraction of the current Stage that is done, and -1 when
+// there is no count to give: a provider that has not said how large the file
+// will be, or a stage that has nothing to count. Bytes and TotalBytes carry the
+// numbers a client shows beside the bar - the download's bytes, or a
+// conversion's milliseconds - and TotalBytes <= 0 means unknown, which is what
+// makes a bar sweep instead of filling.
 type Status struct {
 	VariantID  uuid.UUID
 	State      State
+	Stage      string
 	Progress   float64
 	Err        string
 	DurationMs int64
 	Bytes      int64
+	TotalBytes int64
 	Path       string
+}
+
+// progressUnknown is the fraction for "nothing countable": a client draws a
+// sweep rather than a fill, which is the honest answer while a provider is
+// starting up or a length is not known.
+const progressUnknown = -1
+
+// fraction is done/total clamped to [0,1], or progressUnknown when there is no
+// total to divide by.
+func fraction(done, total int64) float64 {
+	if total <= 0 {
+		return progressUnknown
+	}
+	value := float64(done) / float64(total)
+	switch {
+	case value < 0:
+		return 0
+	case value > 1:
+		return 1
+	default:
+		return value
+	}
+}
+
+// sizeOf is a path's size, or 0 when it is not there yet.
+func sizeOf(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
+}
+
+// downloadWatchPoll is how often the fallback watches the file grow. A quarter
+// of a second is a bar that moves smoothly and a stat per variant per tick,
+// which is nothing beside the transfer it is watching.
+const downloadWatchPoll = 250 * time.Millisecond
+
+// watchDownloadGrowth reports the size of the file being written, for a
+// provider that says nothing about its own progress. It stops as soon as the
+// provider has spoken - its numbers are the real ones - and when the download
+// is over.
+func (m *Manager) watchDownloadGrowth(variantID uuid.UUID, tmp string, spoke *atomic.Bool, done <-chan struct{}) {
+	ticker := time.NewTicker(downloadWatchPoll)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			if spoke.Load() {
+				return
+			}
+			size := sizeOf(tmp)
+			if size == 0 {
+				continue
+			}
+			status := m.getStatus(variantID)
+			if status.State != StateDownloading {
+				return
+			}
+			status.Bytes = size
+			status.Progress = progressUnknown
+			m.setStatus(status)
+		}
+	}
 }
 
 // Resolved is what a media request has already looked up: the variant, for the
@@ -284,7 +359,7 @@ func (m *Manager) fetch(ctx context.Context, variantID uuid.UUID, primary bool) 
 		return "", m.fail(variantID, fmt.Errorf("%w: %s", ErrLocalFileMissing, variantID))
 	}
 
-	m.setStatus(Status{VariantID: variantID, State: StateDownloading, Progress: 0.10})
+	m.setStatus(Status{VariantID: variantID, State: StateDownloading, Stage: provider.StageDownload, Progress: progressUnknown})
 
 	if err := os.MkdirAll(m.dir, 0o755); err != nil {
 		m.fail(variantID, err)
@@ -295,12 +370,38 @@ func (m *Manager) fetch(ctx context.Context, variantID uuid.UUID, primary bool) 
 	tmp := final + ".part"
 	removeTmp := func() { _ = os.Remove(tmp) }
 
-	if err := m.downloadWithRetry(ctx, variant.Provider, variant.ProviderTrackID, tmp); err != nil {
-		removeTmp()
-		m.fail(variantID, err)
-		return "", err
+	// What the provider is doing reaches the status endpoint through here, and
+	// watching the file grow covers a provider that says nothing: the numbers a
+	// client draws are the provider's when it has them and the file's real size
+	// when it does not, never an invented fraction.
+	var spoke atomic.Bool
+	watchDone := make(chan struct{})
+	go m.watchDownloadGrowth(variantID, tmp, &spoke, watchDone)
+
+	progress := func(p provider.Progress) {
+		spoke.Store(true)
+		m.setStatus(Status{
+			VariantID:  variantID,
+			State:      StateDownloading,
+			Stage:      p.Stage,
+			Bytes:      p.Done,
+			TotalBytes: p.Total,
+			Progress:   fraction(p.Done, p.Total),
+		})
 	}
-	m.setStatus(Status{VariantID: variantID, State: StateDownloading, Progress: 0.70})
+
+	downloadErr := m.downloadWithRetry(ctx, variant.Provider, variant.ProviderTrackID, tmp, progress)
+	close(watchDone)
+	if downloadErr != nil {
+		removeTmp()
+		m.fail(variantID, downloadErr)
+		return "", downloadErr
+	}
+	m.setStatus(Status{
+		VariantID: variantID, State: StateDownloading,
+		Stage: provider.StageStore, Progress: progressUnknown,
+		Bytes: sizeOf(tmp),
+	})
 
 	duration, err := ffmpeg.Duration(ctx, tmp)
 	if err != nil {
@@ -459,7 +560,7 @@ func (m *Manager) ensureAttempts() (int, time.Duration) {
 // downloadWithRetry retries transient provider failures. A provider that cannot
 // download at all (Spotify) is never retried, and neither is a cancelled
 // context.
-func (m *Manager) downloadWithRetry(ctx context.Context, providerName, providerTrackID, dest string) error {
+func (m *Manager) downloadWithRetry(ctx context.Context, providerName, providerTrackID, dest string, progress provider.ProgressFunc) error {
 	attempts, backoff := m.ensureAttempts()
 	delay := backoff
 	var err error
@@ -468,7 +569,7 @@ func (m *Manager) downloadWithRetry(ctx context.Context, providerName, providerT
 		// and tried again rather than waiting for ever, and the retry night is
 		// not shortened by the time the last one burned.
 		attemptCtx, cancel := context.WithTimeout(ctx, m.downloadDeadline())
-		err = m.providers.Download(attemptCtx, providerName, providerTrackID, dest)
+		err = m.providers.Download(attemptCtx, providerName, providerTrackID, dest, progress)
 		cancel()
 		if err == nil {
 			return nil

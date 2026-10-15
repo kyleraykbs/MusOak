@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kyleraykbs/MusOak/pkg/client"
 )
 
 func decodeAll(t *testing.T, input string) []key {
@@ -155,6 +157,151 @@ func TestStatusLine(t *testing.T) {
 	withMessage := formatStatus(status{position: 0, count: 3, title: "Song", volume: 10, message: "next track is still downloading"})
 	if !strings.Contains(withMessage, "next track is still downloading") {
 		t.Errorf("line %q is missing its message", withMessage)
+	}
+
+	downloading := formatStatus(status{position: 0, count: 2, title: "Song", volume: 50, download: "downloading 3.1 of 8.4 MB"})
+	if !strings.Contains(downloading, "0:00/--:--  downloading 3.1 of 8.4 MB") {
+		t.Errorf("line %q is missing the download", downloading)
+	}
+}
+
+// TestDownloadLabel checks what the status line says while a track is coming
+// down: the stage, and whichever of a percentage and a count the numbers
+// honestly support. A -1 fraction means no percentage, never a full bar.
+func TestDownloadLabel(t *testing.T) {
+	tests := map[string]struct {
+		status client.MediaStatus
+		want   string
+	}{
+		"download with a total": {
+			status: client.MediaStatus{Stage: client.MediaStageDownload, Progress: 0.37, Bytes: 3_250_000, TotalBytes: 8_800_000},
+			want:   "downloading 3.1 of 8.4 MB",
+		},
+		"download without a total": {
+			status: client.MediaStatus{Stage: client.MediaStageDownload, Progress: -1, Bytes: 3_250_000},
+			want:   "downloading 3.1 MB",
+		},
+		"download before a byte arrives": {
+			status: client.MediaStatus{Stage: client.MediaStageDownload, Progress: -1},
+			want:   "downloading",
+		},
+		"convert with a fraction": {
+			status: client.MediaStatus{Stage: client.MediaStageConvert, Progress: 0.45, Bytes: 45_000, TotalBytes: 100_000},
+			want:   "converting 45%",
+		},
+		"convert without one": {
+			status: client.MediaStatus{Stage: client.MediaStageConvert, Progress: -1, Bytes: 45_000},
+			want:   "converting 0:45",
+		},
+		"store": {
+			status: client.MediaStatus{Stage: client.MediaStageStore, Progress: -1},
+			want:   "storing the file",
+		},
+		"nothing running": {
+			status: client.MediaStatus{State: client.MediaReady, Progress: -1},
+			want:   "",
+		},
+	}
+
+	for name, test := range tests {
+		if got := downloadLabel(&test.status); got != test.want {
+			t.Errorf("%s: downloadLabel = %q, want %q", name, got, test.want)
+		}
+	}
+}
+
+func TestFormatBytes(t *testing.T) {
+	tests := map[int64]string{
+		0:         "0 B",
+		-1:        "0 B",
+		512:       "512 B",
+		2048:      "2 KB",
+		1 << 20:   "1.0 MB",
+		3_250_000: "3.1 MB",
+	}
+	for n, want := range tests {
+		if got := formatBytes(n); got != want {
+			t.Errorf("formatBytes(%d) = %q, want %q", n, got, want)
+		}
+	}
+
+	// A count and its total share one unit, so the pair reads as one number
+	// beside another rather than two sizes of different scales.
+	pairs := []struct {
+		done, total int64
+		want        string
+	}{
+		{3_250_000, 8_800_000, "3.1 of 8.4 MB"},
+		{512, 4096, "0 of 4 KB"},
+		{120, 512, "120 of 512 B"},
+	}
+	for _, pair := range pairs {
+		if got := formatBytesOf(pair.done, pair.total); got != pair.want {
+			t.Errorf("formatBytesOf(%d, %d) = %q, want %q", pair.done, pair.total, got, pair.want)
+		}
+	}
+}
+
+// TestPlayerAsksAboutThePlayingDownload checks that the player asks the server
+// about the entry still coming down, says its stage, and stops saying anything
+// once the copy has landed.
+func TestPlayerAsksAboutThePlayingDownload(t *testing.T) {
+	dir := t.TempDir()
+	streamed := tone(t, dir, "streamed.opus", 3.0)
+	p, cancel := newTestPlayer(t, streamed)
+	defer cancel()
+	ctx := context.Background()
+
+	asked := make(chan string, 8)
+	p.mediaStatus = func(ctx context.Context, variantID string) (*client.MediaStatus, error) {
+		select {
+		case asked <- variantID:
+		default:
+		}
+		return &client.MediaStatus{Stage: client.MediaStageDownload, Progress: -1, Bytes: 3_250_000}, nil
+	}
+
+	ready := make(chan client.CacheEntry, 1)
+	if err := p.startTrack(ctx, playbackItem{variantID: "v1", source: streamed, ready: ready}); err != nil {
+		t.Fatalf("startTrack: %v", err)
+	}
+
+	waitForCondition(t, ctx, "the download to be asked about", func() bool {
+		p.refresh(ctx)
+		return download(p) != ""
+	})
+	if got := download(p); got != "downloading 3.1 MB" {
+		t.Errorf("download = %q, want the stage's own count", got)
+	}
+	if got := p.statusLine(); !strings.Contains(got, "downloading 3.1 MB") {
+		t.Errorf("status line %q is missing the download", got)
+	}
+	if len(asked) == 0 {
+		t.Error("the player never asked about variant v1")
+	}
+
+	// The copy lands, so there is nothing left to report.
+	ready <- client.CacheEntry{VariantID: "v1", TrackID: "t1", Path: streamed}
+	waitForCondition(t, ctx, "the download to be over", func() bool {
+		p.refresh(ctx)
+		return download(p) == ""
+	})
+}
+
+// download reads the status line's download label.
+func download(p *player) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.download
+}
+
+// TestPlayerWithoutAServerSaysNothingAboutDownloads checks the quiet case: a
+// player with no status reader leaves the line as it was.
+func TestPlayerWithoutAServerSaysNothingAboutDownloads(t *testing.T) {
+	p := newPlayer(io.Discard, nil, nil)
+	p.readDownload(context.Background(), "v1")
+	if got := download(p); got != "" {
+		t.Errorf("download = %q, want nothing", got)
 	}
 }
 

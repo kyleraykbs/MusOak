@@ -57,7 +57,9 @@ func (f *fakeProvider) Search(ctx context.Context, q string, opts provider.Searc
 	return f.hits, nil
 }
 
-func (f *fakeProvider) Download(ctx context.Context, id, dest string) error { return nil }
+func (f *fakeProvider) Download(ctx context.Context, id, dest string, _ provider.ProgressFunc) error {
+	return nil
+}
 
 func TestRuntimeNormalization(t *testing.T) {
 	tests := []struct {

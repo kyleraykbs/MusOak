@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kyleraykbs/MusOak/internal/provider"
 	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
@@ -21,11 +22,11 @@ type flakyProvider struct {
 	calls    atomic.Int32
 }
 
-func (f *flakyProvider) Download(ctx context.Context, id, dest string) error {
+func (f *flakyProvider) Download(ctx context.Context, id, dest string, progress provider.ProgressFunc) error {
 	if f.calls.Add(1) <= f.failures {
 		return errors.New("transient provider failure")
 	}
-	return f.fakeProvider.Download(ctx, id, dest)
+	return f.fakeProvider.Download(ctx, id, dest, progress)
 }
 
 func TestEnsureRetriesTransientFailures(t *testing.T) {

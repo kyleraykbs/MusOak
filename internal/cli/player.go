@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +34,11 @@ type player struct {
 	sink  *MpvSink
 	queue []queueItem
 
+	// mediaStatus reads one variant's download state, which is what the status
+	// line says while the playing track is still coming down. It is nil for a
+	// player with no server to ask, which then says nothing about downloads.
+	mediaStatus func(ctx context.Context, variantID string) (*client.MediaStatus, error)
+
 	interactive bool
 	keys        *keyReader
 	restoreTerm func()
@@ -58,6 +64,9 @@ type player struct {
 	volume      int
 	paused      bool
 	message     string
+	// download is what the playing entry's download is doing, rendered for the
+	// status line and empty when nothing is being fetched.
+	download string
 }
 
 // newPlayer returns a player for the queue.
@@ -401,11 +410,43 @@ func (p *player) refresh(ctx context.Context) {
 	// track is handed over now, the moment that entry is the one playing.
 	swap := positionErr == nil && position >= 0 && position < len(p.items) &&
 		p.items[position].localPath != "" && p.items[position].source != p.items[position].localPath
+
+	// The playing entry that has not landed locally is the only download the
+	// status line can say anything about; anything else has nothing to report.
+	waiting := ""
+	if positionErr == nil && position >= 0 && position < len(p.items) {
+		if item := p.items[position]; item.ready != nil && item.localPath == "" {
+			waiting = item.variantID
+		}
+	}
+	if waiting == "" {
+		p.download = ""
+	}
 	p.mu.Unlock()
+
+	if waiting != "" {
+		p.readDownload(readCtx, waiting)
+	}
 
 	if swap {
 		p.swapToLocal(ctx, position)
 	}
+}
+
+// readDownload records what a variant's download is doing, so the status line
+// says the stage and its numbers rather than leaving the listener guessing.
+func (p *player) readDownload(ctx context.Context, variantID string) {
+	if p.mediaStatus == nil {
+		return
+	}
+	status, err := p.mediaStatus(ctx, variantID)
+	label := ""
+	if err == nil {
+		label = downloadLabel(status)
+	}
+	p.mu.Lock()
+	p.download = label
+	p.mu.Unlock()
 }
 
 // wait blocks until mpv has played everything it was given, or the user quits.
@@ -466,6 +507,7 @@ func (p *player) statusLine() string {
 		paused:     p.paused,
 		volume:     p.volume,
 		message:    p.message,
+		download:   p.download,
 	})
 }
 
@@ -478,6 +520,9 @@ type status struct {
 	paused     bool
 	volume     int
 	message    string
+	// download is the playing track's download, already rendered: at most one
+	// of a percentage and a count ever appears in it.
+	download string
 }
 
 func formatStatus(s status) string {
@@ -501,13 +546,86 @@ func formatStatus(s status) string {
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s [%d/%d] %-44s %s/%s  vol [%s] %3d%%",
+	fmt.Fprintf(&b, "%s [%d/%d] %-44s %s/%s",
 		marker, index, s.count, truncate(s.title, 44),
-		where, length, volumeBar(s.volume), s.volume)
+		where, length)
+	if s.download != "" {
+		fmt.Fprintf(&b, "  %s", s.download)
+	}
+	fmt.Fprintf(&b, "  vol [%s] %3d%%", volumeBar(s.volume), s.volume)
 	if s.message != "" {
 		fmt.Fprintf(&b, "  %s", s.message)
 	}
 	return b.String()
+}
+
+// downloadLabel says what a variant's download is doing: the stage, and the
+// number the stage can honestly give. progress is -1 when there is nothing to
+// count, and then the stage's own count is shown rather than a fabricated
+// percentage. It is empty when nothing is running.
+func downloadLabel(s *client.MediaStatus) string {
+	if s == nil {
+		return ""
+	}
+	switch s.Stage {
+	case client.MediaStageDownload:
+		switch {
+		case s.Progress >= 0 && s.TotalBytes > 0:
+			return "downloading " + formatBytesOf(s.Bytes, s.TotalBytes)
+		case s.Bytes > 0:
+			return "downloading " + formatBytes(s.Bytes)
+		default:
+			return "downloading"
+		}
+	case client.MediaStageConvert:
+		switch {
+		case s.Progress >= 0:
+			return fmt.Sprintf("converting %d%%", int(s.Progress*100+0.5))
+		case s.Bytes > 0:
+			// A conversion's numbers are milliseconds, not bytes.
+			return "converting " + formatDuration(s.Bytes)
+		default:
+			return "converting"
+		}
+	case client.MediaStageStore:
+		return "storing the file"
+	default:
+		return ""
+	}
+}
+
+// formatBytes renders a size the one way this program writes them: megabytes to
+// a decimal, kilobytes whole, and the last few hundred bytes as bytes.
+func formatBytes(n int64) string {
+	if n <= 0 {
+		return "0 B"
+	}
+	divisor, unit, decimals := byteScale(n)
+	return strconv.FormatFloat(float64(n)/divisor, 'f', decimals, 64) + " " + unit
+}
+
+// formatBytesOf renders a count against its total, which is stated once in the
+// scale the total calls for: "3.1 of 8.4 MB".
+func formatBytesOf(done, total int64) string {
+	divisor, unit, decimals := byteScale(total)
+	number := func(n int64) string {
+		return strconv.FormatFloat(float64(n)/divisor, 'f', decimals, 64)
+	}
+	return number(done) + " of " + number(total) + " " + unit
+}
+
+// byteScale is the unit a byte count is written in and the decimals it keeps.
+// It is the only place a size is scaled, so two counts - a bar's filled and
+// its total - can never come out in two different units.
+func byteScale(n int64) (divisor float64, unit string, decimals int) {
+	switch {
+	case n >= 1<<20:
+		return 1 << 20, "MB", 1
+	case n >= 1<<10:
+		return 1 << 10, "KB", 0
+	default:
+		return 1, "B", 0
+	}
 }
 
 // formatStatusTime renders a playback time, where zero is a real position.
