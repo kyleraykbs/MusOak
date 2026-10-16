@@ -35,12 +35,17 @@ func (f *fakeResolver) Resolve(_ context.Context, trackID uuid.UUID) (uuid.UUID,
 }
 
 type fakeMedia struct {
-	ready   map[uuid.UUID]bool
-	fail    map[uuid.UUID]bool
+	ready map[uuid.UUID]bool
+	fail  map[uuid.UUID]bool
+	// failed is what the store remembers having tried and lost, which is not
+	// the same as a transfer that failed just now: the pass leaves these alone.
+	failed  map[uuid.UUID]bool
 	ensured []uuid.UUID
 }
 
 func (f *fakeMedia) Ready(_ context.Context, variantID uuid.UUID) bool { return f.ready[variantID] }
+
+func (f *fakeMedia) Failed(_ context.Context, variantID uuid.UUID) bool { return f.failed[variantID] }
 
 func (f *fakeMedia) Ensure(_ context.Context, variantID uuid.UUID) (string, error) {
 	if f.fail[variantID] {
@@ -109,6 +114,26 @@ func TestPassCarriesOnPastFailures(t *testing.T) {
 	}
 	if len(media.ensured) != 1 {
 		t.Fatalf("fetched %d songs, want the one that could be fetched", len(media.ensured))
+	}
+}
+
+// A rendition the server has already tried and lost is not tried again by a
+// pass. The ladder was run for it once; repeating it every interval is the same
+// broken question put to a provider for ever, and it is that work - not the
+// listener's request - that a busy server spends its time on.
+func TestPassLeavesWhatTheStoreHasAlreadyFailed(t *testing.T) {
+	bad, good := uuid.New(), uuid.New()
+	badVariant, goodVariant := uuid.New(), uuid.New()
+	playlists := &fakePlaylists{tracks: []uuid.UUID{bad, good}}
+	resolver := &fakeResolver{
+		variants: map[uuid.UUID]uuid.UUID{bad: badVariant, good: goodVariant},
+	}
+	media := &fakeMedia{failed: map[uuid.UUID]bool{badVariant: true}}
+
+	newTestPrefetcher(t, playlists, resolver, media).pass(context.Background())
+
+	if len(media.ensured) != 1 || media.ensured[0] != goodVariant {
+		t.Fatalf("fetched %v, want only the one that is not already failed", media.ensured)
 	}
 }
 

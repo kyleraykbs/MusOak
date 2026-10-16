@@ -47,6 +47,14 @@ type Resolver interface {
 type Media interface {
 	// Ready reports whether a rendition is already on disk.
 	Ready(ctx context.Context, variantID uuid.UUID) bool
+	// Failed reports whether a rendition's download has been tried and could
+	// not be fetched. A background pass does not try those again: the retry
+	// ladder has already been run for them, and running it every pass is the
+	// same broken question put to a provider for ever - an age-restricted video
+	// costs several seconds and three attempts each time, and the whole
+	// library's worth of them every ten minutes is the server's own load. A
+	// person pressing play still tries: `Ensure` is theirs to call.
+	Failed(ctx context.Context, variantID uuid.UUID) bool
 	// Ensure fetches a rendition, sharing one download with anybody else who
 	// wants the same file.
 	Ensure(ctx context.Context, variantID uuid.UUID) (string, error)
@@ -136,7 +144,7 @@ func (p *Prefetcher) pass(ctx context.Context) {
 		return
 	}
 
-	ready, fetched := 0, 0
+	ready, fetched, failed := 0, 0, 0
 	for _, trackID := range tracks {
 		if ctx.Err() != nil {
 			break
@@ -150,8 +158,23 @@ func (p *Prefetcher) pass(ctx context.Context) {
 			ready++
 			continue
 		}
+		if p.media.Failed(ctx, variantID) {
+			// Tried before and could not be had. The download's own ladder was
+			// run for it then; a pass that repeats the whole ladder every
+			// interval is a provider asked the same unanswerable question for
+			// ever, which is both the server's load and the reason a person's
+			// own request waits behind it.
+			failed++
+			continue
+		}
 		if _, err := p.media.Ensure(ctx, variantID); err != nil {
 			p.logger.Debug("prefetch: could not fetch a playlist song", "variant", variantID, "error", err)
+			// A failure is provider work too, and the next song waits the same
+			// breath as a fetch: a pass over a library full of them is not a
+			// stampede on the provider.
+			if !sleep(ctx, p.options.Gap) {
+				break
+			}
 			continue
 		}
 		fetched++
@@ -161,7 +184,7 @@ func (p *Prefetcher) pass(ctx context.Context) {
 			break
 		}
 	}
-	p.logger.Info("prefetch pass done", "songs", len(tracks), "already here", ready, "fetched", fetched)
+	p.logger.Info("prefetch pass done", "songs", len(tracks), "already here", ready, "fetched", fetched, "failed", failed)
 }
 
 // sleep waits, and reports whether the wait finished rather than being called

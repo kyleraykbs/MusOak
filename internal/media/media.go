@@ -838,6 +838,16 @@ func (m *Manager) Status(ctx context.Context, variantID uuid.UUID) Status {
 	return s
 }
 
+// Failed reports whether this rendition's download has been tried and could not
+// be fetched, as far as this process remembers. A background pass asks this
+// before it tries: the retry ladder has already been run for a failure, and a
+// pass that runs it again every interval is a provider asked the same
+// unanswerable question for ever. A listener's own request does not ask it -
+// `Ensure` still tries, because a person waiting is worth the attempt.
+func (m *Manager) Failed(ctx context.Context, variantID uuid.UUID) bool {
+	return m.Status(ctx, variantID).State == StateFailed
+}
+
 // statusCap is how many variants the in-memory status map remembers. It is a
 // cache of what the database already knows, so dropping the coldest entry is
 // always safe: the next Status for it looks the row up again.

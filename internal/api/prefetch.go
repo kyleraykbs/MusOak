@@ -45,6 +45,10 @@ func (a playlistPrefetch) Ready(ctx context.Context, variantID uuid.UUID) bool {
 	return a.server.media.Status(ctx, variantID).State == media.StateReady
 }
 
+func (a playlistPrefetch) Failed(ctx context.Context, variantID uuid.UUID) bool {
+	return a.server.media.Failed(ctx, variantID)
+}
+
 func (a playlistPrefetch) Ensure(ctx context.Context, variantID uuid.UUID) (string, error) {
 	return a.server.media.Ensure(ctx, variantID)
 }
