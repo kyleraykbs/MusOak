@@ -5,6 +5,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/kyleraykbs/MusOak/internal/api"
+	"github.com/kyleraykbs/MusOak/pkg/client"
+	"math"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -12,9 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/kyleraykbs/MusOak/internal/api"
-	"github.com/kyleraykbs/MusOak/pkg/client"
 )
 
 func parseIndex(raw string) (int, error) {
@@ -521,17 +521,17 @@ func (a *App) roomControl(ctx context.Context, args []string) error {
 	switch args[0] {
 	case "vote":
 		if len(args) < 2 {
-			return errors.New("musoak: usage: musoak room vote <1-5>")
+			return errors.New("musoak: usage: musoak room vote <0.1-5.0>")
 		}
-		score, err := parseIndex(args[1])
-		if err != nil {
-			return fmt.Errorf("musoak: vote must be 1-5")
+		score, err := strconv.ParseFloat(args[1], 64)
+		if err != nil || score < 0.1 || score > 5 || math.Abs(score*10-math.Round(score*10)) > 1e-9 {
+			return fmt.Errorf("musoak: vote must be a tenth between 0.1 and 5.0")
 		}
 		snapshot, err := room.Vote(ctx, score)
 		if err != nil {
 			return err
 		}
-		a.printf("voted %d; mean %.2f (%d votes)\n", score, snapshot.Current.MeanScore, len(snapshot.Current.Votes))
+		a.printf("voted %.1f; mean %.2f (%d votes)\n", score, snapshot.Current.MeanScore, len(snapshot.Current.Votes))
 		return nil
 	case "skip":
 		_, err := room.Skip(ctx)

@@ -500,6 +500,7 @@ paths:
               required: [trackId]
               properties:
                 trackId: { type: string, format: uuid }
+                rating: { type: number, format: double, minimum: 0.1, maximum: 5.0, multipleOf: 0.1 }
       responses:
         "204": { description: Favorited (idempotent). }
         "401": { $ref: "#/components/responses/Unauthorized" }
@@ -2415,7 +2416,8 @@ paths:
               type: object
               required: [score]
               properties:
-                score: { type: integer, minimum: 1, maximum: 5 }
+                score: { type: number, format: double, minimum: 0.1, maximum: 5.0, multipleOf: 0.1 }
+                autoSkip: { type: boolean, default: false }
       responses:
         "200": { $ref: "#/components/responses/RoomState" }
         "400": { $ref: "#/components/responses/BadRequest" }
@@ -2597,7 +2599,7 @@ components:
         id: { type: string, format: uuid }
         title: { type: string }
         durationMs: { type: integer, format: int64 }
-        artists: { type: array, items: { type: string } }
+        rating: { type: number, format: double, minimum: 0, maximum: 5, multipleOf: 0.1 }
         albums: { type: array, items: { type: string } }
         createdAt: { type: string, format: date-time }
         artworkUrl:
@@ -3140,7 +3142,7 @@ components:
           description: The room's song length; the server moves on when it reaches this.
         votes:
           type: object
-          additionalProperties: { type: integer }
+          additionalProperties: { type: number, format: double }
         meanScore: { type: number, format: double }
 
     Room:

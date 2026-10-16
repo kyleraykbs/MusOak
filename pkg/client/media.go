@@ -1115,9 +1115,9 @@ func (p *Participant) LocalPosition(ctx context.Context) (int64, bool) {
 	return p.sinkPosition(ctx)
 }
 
-// Vote scores the current track from 1 (bad) to 5 (great).
-func (p *Participant) Vote(ctx context.Context, score int) error {
-	_, err := p.room.Vote(ctx, score)
+// Vote scores the current track from 0.1 (bad) to 5.0 (great).
+func (p *Participant) Vote(ctx context.Context, score float64, autoSkip ...bool) error {
+	_, err := p.room.Vote(ctx, score, autoSkip...)
 	return err
 }
 

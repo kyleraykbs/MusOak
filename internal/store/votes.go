@@ -8,14 +8,14 @@ import (
 )
 
 // schemaV2 adds room votes: one score per member per track per room, kept for
-// later statistics.
+// later statistics. Scores are decimal ratings in the range 0.1 to 5.0.
 const schemaV2 = `
 CREATE TABLE votes (
     room_id    TEXT NOT NULL,
     track_id   TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
     member_id  TEXT NOT NULL,
     user_id    TEXT REFERENCES users(id) ON DELETE SET NULL,
-    score      INTEGER NOT NULL,
+    score      REAL NOT NULL,
     created_at INTEGER NOT NULL,
     PRIMARY KEY (room_id, track_id, member_id)
 );

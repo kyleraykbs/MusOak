@@ -324,10 +324,20 @@ func (s *Server) handleUserGet(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err, "user unavailable")
 		return
 	}
+	ratings, err := s.store.FavoriteRatings(r.Context(), id)
+	if err != nil {
+		writeStoreError(w, err, "user unavailable")
+		return
+	}
 	favorites, err := s.buildTrackList(r.Context(), favoriteIDs)
 	if err != nil {
 		writeStoreError(w, err, "user unavailable")
 		return
+	}
+	for i := range favorites {
+		if trackID, err := uuid.Parse(favorites[i].ID); err == nil {
+			favorites[i].Rating = float64(ratings[trackID]) / 10
+		}
 	}
 
 	recent := []trackResponse{}

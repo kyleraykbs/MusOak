@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kyleraykbs/MusOak/internal/store"
 	"fmt"
 	"github.com/google/uuid"
+	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
 // friendsUserID looks up a registered account's id by username.

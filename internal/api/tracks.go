@@ -18,21 +18,16 @@ import (
 
 // trackResponse is the canonical track as clients see it.
 type trackResponse struct {
-	ID         string   `json:"id"`
-	Title      string   `json:"title"`
-	DurationMs int64    `json:"durationMs"`
-	Artists    []string `json:"artists"`
-	// ArtistIDs is parallel to Artists, in the same order, so a client can open
-	// an artist's page from a track: the names alone cannot name a page.
-	ArtistIDs []string  `json:"artistIds"`
-	Albums    []string  `json:"albums"`
-	CreatedAt time.Time `json:"createdAt"`
-	// ArtworkURL is a path on this server, empty when nothing is known yet.
-	ArtworkURL string `json:"artworkUrl,omitempty"`
-	// Plays is how many times the calling user played this track: 0 for a guest
-	// and for a song they have never played, so a client can show it without
-	// asking whether it means anything.
-	Plays int `json:"plays"`
+	ID         string    `json:"id"`
+	Title      string    `json:"title"`
+	DurationMs int64     `json:"durationMs"`
+	Artists    []string  `json:"artists"`
+	ArtistIDs  []string  `json:"artistIds"`
+	Albums     []string  `json:"albums"`
+	CreatedAt  time.Time `json:"createdAt"`
+	ArtworkURL string    `json:"artworkUrl,omitempty"`
+	Plays      int       `json:"plays"`
+	Rating     float64   `json:"rating"`
 }
 
 // variantResponse is one provider's rendition of a track, with its download

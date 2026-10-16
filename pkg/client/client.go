@@ -297,6 +297,7 @@ type Track struct {
 	Artists    []string  `json:"artists"`
 	Albums     []string  `json:"albums"`
 	CreatedAt  time.Time `json:"createdAt"`
+	Rating     float64   `json:"rating"`
 }
 
 // Variant is one provider's rendition of a track.
@@ -620,7 +621,7 @@ func (c *Client) Me(ctx context.Context) (*Me, error) {
 	return &out, nil
 }
 
-// Favorites lists the caller's favorited tracks.
+// Favorites lists the caller's favorited tracks, including saved ratings.
 func (c *Client) Favorites(ctx context.Context) ([]Track, error) {
 	var out struct {
 		Tracks []Track `json:"tracks"`
@@ -631,9 +632,17 @@ func (c *Client) Favorites(ctx context.Context) ([]Track, error) {
 	return out.Tracks, nil
 }
 
-// AddFavorite favorites a track; it is idempotent.
-func (c *Client) AddFavorite(ctx context.Context, trackID string) error {
-	return c.do(ctx, http.MethodPost, "/api/v1/me/favorites", map[string]string{"trackId": trackID}, nil)
+// AddFavorite favorites a track with a decimal rating (0.1 to 5.0).
+func (c *Client) AddFavorite(ctx context.Context, trackID string, rating ...float64) error {
+	body := struct {
+		TrackID string   `json:"trackId"`
+		Rating  *float64 `json:"rating,omitempty"`
+	}{TrackID: trackID}
+	if len(rating) > 0 {
+		body.Rating = &rating[0]
+	}
+	return c.do(ctx, http.MethodPost, "/api/v1/me/favorites", body, nil)
+
 }
 
 // RemoveFavorite removes a track from the caller's favorites.

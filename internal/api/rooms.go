@@ -48,7 +48,8 @@ type seekRequest struct {
 }
 
 type voteRequest struct {
-	Score int `json:"score"`
+	Score    float64 `json:"score"`
+	AutoSkip *bool   `json:"autoSkip,omitempty"`
 }
 
 // callerMember builds the member identity for a room command. Authenticated
@@ -307,7 +308,13 @@ func (s *Server) handleRoomVote(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	room, err := s.rooms.Vote(r.Context(), r.PathValue("roomId"), member.ID, req.Score)
+	var room *rooms.Snapshot
+	var err error
+	if req.AutoSkip == nil {
+		room, err = s.rooms.Vote(r.Context(), r.PathValue("roomId"), member.ID, req.Score)
+	} else {
+		room, err = s.rooms.Vote(r.Context(), r.PathValue("roomId"), member.ID, req.Score, *req.AutoSkip)
+	}
 	if err != nil {
 		writeRoomError(w, err)
 		return

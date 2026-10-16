@@ -219,11 +219,12 @@ type SessionRepo interface {
 	DeleteExpiredSessions(ctx context.Context, now time.Time) (int, error)
 }
 
-// FavoriteRepo stores per-user track favorites.
+// FavoriteRepo stores per-user track favorites and their saved ratings. Ratings are integer tenths (1..50).
 type FavoriteRepo interface {
-	AddFavorite(ctx context.Context, userID, trackID uuid.UUID) error
+	AddFavorite(ctx context.Context, userID, trackID uuid.UUID, rating ...int) error
 	RemoveFavorite(ctx context.Context, userID, trackID uuid.UUID) error
 	Favorites(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error)
+	FavoriteRatings(ctx context.Context, userID uuid.UUID) (map[uuid.UUID]int, error)
 }
 
 // RankingRepo stores each user's ordered provider preference.
@@ -239,7 +240,7 @@ type Vote struct {
 	TrackID   uuid.UUID
 	MemberID  string
 	UserID    *uuid.UUID
-	Score     int
+	Score     float64
 	CreatedAt time.Time
 }
 
@@ -422,7 +423,37 @@ var migrations = []migration{
 	{version: 19, name: "lyrics", sql: schemaV19},
 	{version: 20, name: "media paths relative to the storage directory", sql: schemaV20},
 	{version: 21, name: "read indexes", sql: schemaV21},
+	{version: 22, name: "favorite ratings and decimal votes", sql: schemaV22},
 }
+
+// schemaV22 stores favorite ratings in integer tenths and gives room votes
+// REAL affinity while preserving existing integer scores.
+const schemaV22 = `
+CREATE TABLE favorites_new (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    rating INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, track_id)
+);
+INSERT INTO favorites_new (user_id, track_id, created_at) SELECT user_id, track_id, created_at FROM favorites;
+DROP TABLE favorites;
+ALTER TABLE favorites_new RENAME TO favorites;
+CREATE TABLE votes_new (
+    room_id TEXT NOT NULL,
+    track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    member_id TEXT NOT NULL,
+    user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+    score REAL NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (room_id, track_id, member_id)
+);
+INSERT INTO votes_new (room_id, track_id, member_id, user_id, score, created_at)
+SELECT room_id, track_id, member_id, user_id, score, created_at FROM votes;
+DROP TABLE votes;
+ALTER TABLE votes_new RENAME TO votes;
+CREATE INDEX votes_track_id ON votes(track_id);
+`
 
 func (d *DB) migrate(ctx context.Context) error {
 	if _, err := d.db.ExecContext(ctx, `

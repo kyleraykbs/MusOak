@@ -36,14 +36,14 @@ type QueueItem struct {
 // PositionMs is at AtMs on the server clock, so a client can extrapolate
 // between the once-a-second updates.
 type RoomPlayback struct {
-	Item       QueueItem      `json:"item"`
-	PositionMs int64          `json:"positionMs"`
-	AtMs       int64          `json:"atMs"`
-	Started    bool           `json:"started"`
-	Paused     bool           `json:"paused"`
-	DurationMs int64          `json:"durationMs"`
-	Votes      map[string]int `json:"votes"`
-	MeanScore  float64        `json:"meanScore"`
+	Item       QueueItem          `json:"item"`
+	PositionMs int64              `json:"positionMs"`
+	AtMs       int64              `json:"atMs"`
+	Started    bool               `json:"started"`
+	Paused     bool               `json:"paused"`
+	DurationMs int64              `json:"durationMs"`
+	Votes      map[string]float64 `json:"votes"`
+	MeanScore  float64            `json:"meanScore"`
 }
 
 // PositionAt is where the room should be at serverNowMs.
@@ -245,10 +245,16 @@ func (r *RoomClient) Seek(ctx context.Context, positionMs int64) (*Room, error) 
 	return &out, nil
 }
 
-// Vote scores the current track from 1 (bad) to 5 (great).
-func (r *RoomClient) Vote(ctx context.Context, score int) (*Room, error) {
+// Vote scores the current track from 0.1 (bad) to 5.0 (great).
+func (r *RoomClient) Vote(ctx context.Context, score float64, autoSkip ...bool) (*Room, error) {
 	var out Room
-	body := map[string]int{"score": score}
+	body := struct {
+		Score    float64 `json:"score"`
+		AutoSkip bool    `json:"autoSkip,omitempty"`
+	}{Score: score}
+	if len(autoSkip) > 0 {
+		body.AutoSkip = autoSkip[0]
+	}
 	if err := r.client.do(ctx, http.MethodPost, r.path("/vote"), body, &out); err != nil {
 		return nil, err
 	}

@@ -2,6 +2,7 @@ package api
 
 import (
 	"errors"
+	"math"
 	"net/http"
 
 	"github.com/google/uuid"
@@ -10,7 +11,19 @@ import (
 )
 
 type favoriteRequest struct {
-	TrackID string `json:"trackId"`
+	TrackID string   `json:"trackId"`
+	Rating  *float64 `json:"rating"`
+}
+
+func favoriteTenths(rating *float64) (int, error) {
+	if rating == nil {
+		return 0, nil
+	}
+	value := int(math.Round(*rating * 10))
+	if value < 1 || value > 50 || math.Abs(*rating-float64(value)/10) > 1e-9 {
+		return 0, errors.New("rating must be between 0.1 and 5.0 in tenths")
+	}
+	return value, nil
 }
 
 // handleFavoritesList returns the caller's favorited tracks.
@@ -24,12 +37,16 @@ func (s *Server) handleFavoritesList(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err, "favorites unavailable")
 		return
 	}
-
+	ratings, err := s.store.FavoriteRatings(r.Context(), user.ID)
+	if err != nil {
+		writeStoreError(w, err, "favorites unavailable")
+		return
+	}
 	tracks := make([]trackResponse, 0, len(ids))
 	for _, id := range ids {
 		track, err := s.store.Track(r.Context(), id)
 		if errors.Is(err, store.ErrNotFound) {
-			continue // the track was deleted from under the favorite
+			continue
 		}
 		if err != nil {
 			writeStoreError(w, err, "favorites unavailable")
@@ -40,13 +57,14 @@ func (s *Server) handleFavoritesList(w http.ResponseWriter, r *http.Request) {
 			writeStoreError(w, err, "favorites unavailable")
 			return
 		}
+		response.Rating = float64(ratings[id]) / 10
 		tracks = append(tracks, response)
 	}
 	s.withPlays(r.Context(), user, trackRefs(tracks))
 	writeJSON(w, http.StatusOK, map[string]any{"tracks": tracks})
 }
 
-// handleFavoriteAdd favorites a track; it is idempotent.
+// handleFavoriteAdd favorites a track, upserting its optional rating.
 func (s *Server) handleFavoriteAdd(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.requireUser(w, r)
 	if !ok {
@@ -65,7 +83,12 @@ func (s *Server) handleFavoriteAdd(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err, "track not found")
 		return
 	}
-	if err := s.store.AddFavorite(r.Context(), user.ID, trackID); err != nil {
+	rating, err := favoriteTenths(req.Rating)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.store.AddFavorite(r.Context(), user.ID, trackID, rating); err != nil {
 		writeStoreError(w, err, "could not add favorite")
 		return
 	}

@@ -120,12 +120,20 @@ func (d *DB) DeleteExpiredSessions(ctx context.Context, now time.Time) (int, err
 	return int(n), err
 }
 
-// AddFavorite is idempotent: favoriting twice is not an error.
-func (d *DB) AddFavorite(ctx context.Context, userID, trackID uuid.UUID) error {
+// AddFavorite upserts a favorite and its rating in integer tenths. A missing
+// rating keeps compatibility with old callers and stores 0 (unrated).
+func (d *DB) AddFavorite(ctx context.Context, userID, trackID uuid.UUID, ratings ...int) error {
+	rating := 0
+	if len(ratings) > 0 {
+		rating = ratings[0]
+	}
+	if rating < 0 || rating > 50 {
+		return fmt.Errorf("store: favorite rating must be between 0 and 50")
+	}
 	_, err := d.db.ExecContext(ctx, `
-		INSERT INTO favorites (user_id, track_id, created_at) VALUES (?, ?, ?)
-		ON CONFLICT (user_id, track_id) DO NOTHING`,
-		userID.String(), trackID.String(), time.Now().UnixMilli())
+		INSERT INTO favorites (user_id, track_id, created_at, rating) VALUES (?, ?, ?, ?)
+		ON CONFLICT (user_id, track_id) DO UPDATE SET rating = excluded.rating`,
+		userID.String(), trackID.String(), time.Now().UnixMilli(), rating)
 	return mapErr(err)
 }
 
@@ -161,6 +169,29 @@ func (d *DB) Favorites(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, erro
 		ids = append(ids, parsed)
 	}
 	return ids, mapErr(rows.Err())
+}
+
+// FavoriteRatings returns ratings in integer tenths, with 0 for unrated rows.
+func (d *DB) FavoriteRatings(ctx context.Context, userID uuid.UUID) (map[uuid.UUID]int, error) {
+	rows, err := d.db.QueryContext(ctx, `SELECT track_id, rating FROM favorites WHERE user_id = ?`, userID.String())
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+	out := make(map[uuid.UUID]int)
+	for rows.Next() {
+		var raw string
+		var rating int
+		if err := rows.Scan(&raw, &rating); err != nil {
+			return nil, mapErr(err)
+		}
+		id, err := parseUUID(raw)
+		if err != nil {
+			return nil, err
+		}
+		out[id] = rating
+	}
+	return out, mapErr(rows.Err())
 }
 
 // SetRanking replaces a user's ordered provider preference.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"sync"
 	"time"
 
@@ -20,7 +21,7 @@ var (
 	ErrForbidden      = errors.New("only the host may do that")
 	ErrWrongPassword  = errors.New("wrong password")
 	ErrNoPlayback     = errors.New("no track is playing")
-	ErrInvalidVote    = errors.New("vote must be between 1 and 5")
+	ErrInvalidVote    = errors.New("vote must be between 0.1 and 5.0")
 	ErrInvalidOrder   = errors.New("queue order does not match the queue")
 	ErrInvalidSeek    = errors.New("seek position must not be negative")
 	ErrInvalidControl = errors.New("controls must be \"host\" or \"everyone\"")
@@ -75,7 +76,7 @@ type QueueItem struct {
 // the once-a-second updates.
 type playback struct {
 	item       QueueItem
-	votes      map[string]int
+	votes      map[string]float64
 	anchor     int64
 	atMs       int64
 	started    bool
@@ -147,14 +148,14 @@ type room struct {
 // on the server clock; a client computes where the room should be with
 // position + (serverNow - atMs) while Started is true and Paused is false.
 type PlaybackView struct {
-	Item       QueueItem      `json:"item"`
-	PositionMs int64          `json:"positionMs"`
-	AtMs       int64          `json:"atMs"`
-	Started    bool           `json:"started"`
-	Paused     bool           `json:"paused"`
-	DurationMs int64          `json:"durationMs"`
-	Votes      map[string]int `json:"votes"`
-	MeanScore  float64        `json:"meanScore"`
+	Item       QueueItem          `json:"item"`
+	PositionMs int64              `json:"positionMs"`
+	AtMs       int64              `json:"atMs"`
+	Started    bool               `json:"started"`
+	Paused     bool               `json:"paused"`
+	DurationMs int64              `json:"durationMs"`
+	Votes      map[string]float64 `json:"votes"`
+	MeanScore  float64            `json:"meanScore"`
 }
 
 // Snapshot is a room as clients see it.
@@ -1065,8 +1066,7 @@ func (m *Manager) beginLocked(room *room) bool {
 	room.lastPlayedAtMs[item.AddedBy] = m.nowMsLocked()
 	room.current = &playback{
 		item:       item,
-		votes:      map[string]int{},
-		anchor:     0,
+		votes:      map[string]float64{},
 		atMs:       m.nowMsLocked(),
 		durationMs: item.DurationMs,
 		started:    true,
@@ -1248,12 +1248,12 @@ func (m *Manager) Skip(roomID, memberID string) (*Snapshot, error) {
 	return m.snapshotLocked(room), nil
 }
 
-// Vote records a member's score and applies the skip rule.
-func (m *Manager) Vote(ctx context.Context, roomID, memberID string, score int) (*Snapshot, error) {
-	if score < 1 || score > 5 {
+// Vote records a member's score and applies the skip rule. Automatic saved
+// ratings opt into skip evaluation through autoSkip; manual votes always do.
+func (m *Manager) Vote(ctx context.Context, roomID, memberID string, score float64, autoSkip ...bool) (*Snapshot, error) {
+	if score < 0.1 || score > 5.0 || math.Abs(score*10-math.Round(score*10)) > 1e-9 {
 		return nil, ErrInvalidVote
 	}
-
 	m.mu.Lock()
 	room, err := m.roomLocked(roomID)
 	if err != nil {
@@ -1270,10 +1270,12 @@ func (m *Manager) Vote(ctx context.Context, roomID, memberID string, score int) 
 		m.unlock()
 		return nil, ErrNoPlayback
 	}
-
 	current.votes[memberID] = score
-	m.touchedLocked(room)
-	skip := m.shouldSkipLocked(room, current)
+	shouldEvaluateSkip := true
+	if len(autoSkip) > 0 {
+		shouldEvaluateSkip = autoSkip[0]
+	}
+	skip := shouldEvaluateSkip && m.shouldSkipLocked(room, current)
 	trackID := current.item.TrackID
 	if skip {
 		m.advanceLocked(room, "votes", memberID)
@@ -1282,15 +1284,7 @@ func (m *Manager) Vote(ctx context.Context, roomID, memberID string, score int) 
 	}
 	snapshot := m.snapshotLocked(room)
 	m.unlock()
-
-	// Votes outlive the room, so they are recorded for later stats.
-	m.persistVote(ctx, store.Vote{
-		RoomID:   roomID,
-		TrackID:  trackID,
-		MemberID: memberID,
-		UserID:   member.UserID,
-		Score:    score,
-	})
+	m.persistVote(ctx, store.Vote{RoomID: roomID, TrackID: trackID, MemberID: memberID, UserID: member.UserID, Score: score})
 	return snapshot, nil
 }
 
@@ -1484,7 +1478,7 @@ func (m *Manager) viewLocked(room *room, nowMs int64) *PlaybackView {
 	if current == nil {
 		return nil
 	}
-	votes := make(map[string]int, len(current.votes))
+	votes := make(map[string]float64, len(current.votes))
 	for memberID, score := range current.votes {
 		votes[memberID] = score
 	}
@@ -1500,15 +1494,15 @@ func (m *Manager) viewLocked(room *room, nowMs int64) *PlaybackView {
 	}
 }
 
-func meanScore(votes map[string]int) float64 {
+func meanScore(votes map[string]float64) float64 {
 	if len(votes) == 0 {
 		return 0
 	}
-	sum := 0
+	var sum float64
 	for _, score := range votes {
 		sum += score
 	}
-	return float64(sum) / float64(len(votes))
+	return sum / float64(len(votes))
 }
 
 func removeString(values []string, target string) []string {
