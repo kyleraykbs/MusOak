@@ -38,3 +38,29 @@ Open, both needing input from Kyle:
       the narrow store interface, and what it saves is local SQLite point reads
       measured against a provider fan-out in the same handler - seconds against
       milliseconds. The measurement, not the principle, is why it stays.
+
+## What the live server showed (2026-10-15, night)
+
+From `kyle.properties/musoak` (nginx -> musoak-web -> musoakd, over a WAN): the
+round trip is 27 ms and every API call is 0.05-0.2 s, so the slowness a listener
+reports is server-side work on the critical path, not latency.
+
+- The prefetch pass walks every playlist song every ten minutes and ran the
+  whole download retry ladder for the ones already known to have failed, every
+  pass. Fixed: the pass now skips a rendition the store reports as failed (a
+  person pressing play still retries), and paces a failure the way it paces a
+  fetch.
+- `track still has no source after resolving ... hint="the rendition is attached
+  to another track"` was logged for a search that found *nothing above the
+  threshold* as well as for a real duplicate. Fixed: the two say which they are,
+  with the title, so the next reader is not sent looking for duplicates that are
+  not there.
+- Still open, and felt as "a room that never starts": a song whose source cannot
+  be found sits in the room's status line while the client asks again on a short
+  beat. The client's backoff grows now (5 s doubling to 5 min), which stops the
+  hammering, but a room whose *current* song cannot be sourced is still a room
+  with nothing to play - it should be told, and the room should be able to move
+  on.
+- Still open, provider-side: age-restricted tracks fail the ladder every pass
+  (yt-dlp needs cookies). The pass no longer repeats them, but the first attempt
+  still costs ~15 s.
