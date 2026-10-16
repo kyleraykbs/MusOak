@@ -104,6 +104,7 @@ var e2eStreamTracks = []e2eStreamTrack{
 	{ID: "e2e-stream-7", Title: "E2E Stream Seven"},
 	{ID: "e2e-stream-8", Title: "E2E Stream Eight"},
 	{ID: "e2e-stream-9", Title: "E2E Stream Nine"},
+	{ID: "e2e-stream-10", Title: "E2E Stream Ten"},
 }
 
 // e2eTrackByID reports whether the fake answers to a provider track id, which
