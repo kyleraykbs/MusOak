@@ -2,14 +2,11 @@ package youtube
 
 import (
 	"context"
-	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
-	"time"
 
 	"github.com/kyleraykbs/MusOak/internal/provider"
 )
@@ -210,177 +207,8 @@ func TestCapabilitiesAndName(t *testing.T) {
 		t.Errorf("name = %q, want youtube", p.Name())
 	}
 	caps := p.Capabilities()
-	if !caps.Search || !caps.Download || !caps.Stream {
-		t.Errorf("caps = %+v, want search, download and stream", caps)
-	}
-}
-
-// Stream must build the same command Download builds - same format, same
-// cookies, same extractor args - but with -o - sending the audio to stdout and
-// --print-to-file recording the container. The audio reaches the caller as a
-// pipe, and the container maps to a MIME type.
-func TestStreamPipesAudioAndReadsContainer(t *testing.T) {
-	record := filepath.Join(t.TempDir(), "args")
-	p := testProvider(t, stubYtdlp(t, `
-printf '%s\n' "$@" > `+record+`
-while [ $# -gt 0 ]; do
-  if [ "$1" = "--print-to-file" ]; then printf 'webm\n' > "$3"; fi
-  shift
-done
-printf 'streamed-audio-bytes'
-`))
-	p.cookiesFromBrowser = "firefox:/home/you/.librewolf/abc.default-release"
-
-	body, mimeType, err := p.Stream(context.Background(), "abc", 0)
-	if err != nil {
-		t.Fatalf("Stream: %v", err)
-	}
-	defer body.Close()
-	if mimeType != "audio/webm" {
-		t.Errorf("mimeType = %q, want audio/webm", mimeType)
-	}
-	got, err := io.ReadAll(body)
-	if err != nil {
-		t.Fatalf("read stream: %v", err)
-	}
-	if string(got) != "streamed-audio-bytes" {
-		t.Errorf("audio = %q", got)
-	}
-
-	args, err := os.ReadFile(record)
-	if err != nil {
-		t.Fatalf("yt-dlp was not run: %v", err)
-	}
-	for _, want := range []string{
-		"--no-playlist\n",
-		"-f\nbestaudio\n",
-		"-o\n-\n",
-		"--print-to-file\n%(ext)s\n",
-		"--cookies-from-browser\nfirefox:/home/you/.librewolf/abc.default-release\n",
-		"https://www.youtube.com/watch?v=abc\n",
-	} {
-		if !strings.Contains(string(args), want) {
-			t.Errorf("yt-dlp was not given %q:\n%s", strings.TrimSpace(want), args)
-		}
-	}
-	// The embedded client is the fallback: the first attempt - the one that works
-	// in the common case - leaves yt-dlp on its own defaults, which measure at
-	// half the wall time.
-	if strings.Contains(string(args), "youtube:player_client=web_embedded") {
-		t.Errorf("the first attempt used the web_embedded client:\n%s", args)
-	}
-}
-
-// The container yt-dlp reports maps to the MIME type the listener is told.
-func TestStreamMapsM4AContainer(t *testing.T) {
-	p := testProvider(t, stubYtdlp(t, `
-while [ $# -gt 0 ]; do
-  if [ "$1" = "--print-to-file" ]; then printf 'm4a\n' > "$3"; fi
-  shift
-done
-printf 'audio'
-`))
-	body, mimeType, err := p.Stream(context.Background(), "abc", 0)
-	if err != nil {
-		t.Fatalf("Stream: %v", err)
-	}
-	defer body.Close()
-	if mimeType != "audio/mp4" {
-		t.Errorf("mimeType = %q, want audio/mp4", mimeType)
-	}
-}
-
-// A container we cannot map is an error, never a guess.
-func TestStreamRejectsUnknownContainer(t *testing.T) {
-	p := testProvider(t, stubYtdlp(t, `
-while [ $# -gt 0 ]; do
-  if [ "$1" = "--print-to-file" ]; then printf 'flv\n' > "$3"; fi
-  shift
-done
-printf 'audio'
-`))
-	body, _, err := p.Stream(context.Background(), "abc", 0)
-	if err == nil {
-		if body != nil {
-			body.Close()
-		}
-		t.Fatal("want an error for an unknown container, got nil")
-	}
-	if body != nil {
-		t.Errorf("body = %v, want nil alongside the error", body)
-	}
-}
-
-// A fetch that ends before reporting its container is an error, not an empty
-// stream.
-func TestStreamFailsWhenContainerIsNeverReported(t *testing.T) {
-	p := testProvider(t, stubYtdlp(t, `printf 'audio'; exit 0`))
-	body, _, err := p.Stream(context.Background(), "abc", 0)
-	if err == nil {
-		if body != nil {
-			body.Close()
-		}
-		t.Fatal("want an error when the container is never reported")
-	}
-	if !strings.Contains(err.Error(), "container") {
-		t.Errorf("error should mention the container, got %v", err)
-	}
-}
-
-func TestStreamFailsCleanlyWithoutYtdlp(t *testing.T) {
-	p := testProvider(t, filepath.Join(t.TempDir(), "missing-yt-dlp"))
-	if body, _, err := p.Stream(context.Background(), "abc", 0); err == nil {
-		body.Close()
-		t.Fatal("want error, got nil")
-	}
-}
-
-// The reader owns the fetch: Close stops a stream that is still running and
-// reaps the process, so nothing is left behind.
-func TestStreamCloseEndsAndReapsTheProcess(t *testing.T) {
-	pidFile := filepath.Join(t.TempDir(), "pid")
-	p := testProvider(t, stubYtdlp(t, `
-echo $$ > `+pidFile+`
-while [ $# -gt 0 ]; do
-  if [ "$1" = "--print-to-file" ]; then printf 'webm\n' > "$3"; fi
-  shift
-done
-printf 'audio-bytes'
-exec sleep 60
-`))
-
-	body, _, err := p.Stream(context.Background(), "abc", 0)
-	if err != nil {
-		t.Fatalf("Stream: %v", err)
-	}
-	buf := make([]byte, len("audio-bytes"))
-	if _, err := io.ReadFull(body, buf); err != nil {
-		t.Fatalf("read stream: %v", err)
-	}
-
-	start := time.Now()
-	if err := body.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Fatalf("Close took %v; it did not stop the fetch", elapsed)
-	}
-
-	raw, err := os.ReadFile(pidFile)
-	if err != nil {
-		t.Fatalf("read pid: %v", err)
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
-	if err != nil {
-		t.Fatalf("parse pid %q: %v", raw, err)
-	}
-	// A reaped process no longer exists; a zombie would still answer signal 0.
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return
-	}
-	if err := proc.Signal(syscall.Signal(0)); err == nil {
-		t.Errorf("process %d is still alive after Close", pid)
+	if !caps.Search || !caps.Download {
+		t.Errorf("caps = %+v, want search and download", caps)
 	}
 }
 
@@ -394,48 +222,4 @@ func contains(haystack []string, needle string) bool {
 }
 
 var _ provider.Provider = (*Provider)(nil)
-var _ provider.Streamer = (*Provider)(nil)
 var _ provider.DependencyChecker = (*Provider)(nil)
-
-// A listener who joins a song already playing gets the rest of it: yt-dlp is
-// asked for the section that begins where they are and runs to the end, which is
-// the tool's own way of starting part-way through a track.
-func TestAStreamFromAPositionAsksYtDlpForThatSection(t *testing.T) {
-	record := filepath.Join(t.TempDir(), "args")
-	script := `printf '%s\\n' "$@" >> ` + record
-	script += `
-exit 1`
-	p := testProvider(t, stubYtdlp(t, script))
-
-	// The stub reports no container, so the stream fails; the command is what
-	// this test is about.
-	_, _, _ = p.Stream(context.Background(), "abc", 45_000)
-
-	got, err := os.ReadFile(record)
-	if err != nil {
-		t.Fatalf("yt-dlp was not run: %v", err)
-	}
-	args := string(got)
-	for _, want := range []string{"--download-sections", "*0:00:45-inf"} {
-		if !strings.Contains(args, want) {
-			t.Errorf("yt-dlp was not given %q:\n%s", want, args)
-		}
-	}
-}
-
-// The whole track needs no section: the flag costs a second tool (ffmpeg cuts
-// it), so a listener starting at the beginning is not made to pay for one.
-func TestAStreamFromTheStartAsksForTheWholeTrack(t *testing.T) {
-	record := filepath.Join(t.TempDir(), "args")
-	script := `printf '%s\\n' "$@" >> ` + record
-	script += `
-exit 1`
-	p := testProvider(t, stubYtdlp(t, script))
-
-	_, _, _ = p.Stream(context.Background(), "abc", 0)
-
-	got, _ := os.ReadFile(record)
-	if args := string(got); strings.Contains(args, "--download-sections") {
-		t.Errorf("a stream from the start was sectioned:\n%s", args)
-	}
-}

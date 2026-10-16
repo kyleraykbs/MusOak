@@ -284,7 +284,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		// for ever: a client that opens a request and dribbles its body holds
 		// the goroutine reading it. The bound is generous enough for the
 		// largest upload - the body is JSON and runs to ninety-six megabytes -
-		// and still finite. WriteTimeout is deliberately unset: an audio stream
+		// and still finite. WriteTimeout is deliberately unset: an audio transfer
 		// is one long write, and a deadline on it would cut the song short.
 		ReadTimeout: 5 * time.Minute,
 	}

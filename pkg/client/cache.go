@@ -262,21 +262,15 @@ func (c *Cache) fetch(ctx context.Context, api *Client, variantID string) (Cache
 }
 
 // download streams a variant into file and verifies the sha256 the server
-// advertised, so a truncated or corrupted transfer is never cached.
+// advertised, so a truncated or corrupted transfer is never cached. Only a
+// finished, stored rendition is ever answered by the media GET, and it always
+// names its own sha256, so a response without one is refused.
 func (c *Cache) download(ctx context.Context, api *Client, variantID string, file *os.File) (string, int64, error) {
 	resp, err := api.mediaResponse(ctx, variantID)
 	if err != nil {
 		return "", 0, err
 	}
 	defer resp.Body.Close()
-
-	// Only the finished, stored rendition may be cached. A variant that is
-	// still downloading is served as a progressive stream (X-Musoak-Stream),
-	// and nothing on that path names its own sha256, so a stream must never be
-	// renamed into place as if it were the whole file.
-	if resp.Header.Get("X-Musoak-Stream") != "" {
-		return "", 0, fmt.Errorf("musoak: variant %s came back as a stream, not the stored rendition", variantID)
-	}
 
 	hash := sha256.New()
 	size, err := io.Copy(io.MultiWriter(file, hash), resp.Body)

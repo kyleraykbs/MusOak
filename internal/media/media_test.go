@@ -191,8 +191,8 @@ func newTestManagerWithArtwork(t *testing.T, p provider.Provider, artwork Artwor
 	// Not t.TempDir(): a fetch the manager still has in flight when a test ends
 	// can touch this path a moment later, and t.TempDir's cleanup fails the run
 	// with "directory not empty" for that - a flake that says nothing about what
-	// the test asserted. A stream starts its download on a goroutine by design,
-	// so tests that stream cannot make that race go away; this can.
+	// the test asserted. A fetch the manager still has in flight runs on a
+	// goroutine by design, so a test cannot make that race go away; this can.
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	m := New(dir, 0, db, newTestRegistry(t, providers...), artwork, discardLogger())
 	return m, db

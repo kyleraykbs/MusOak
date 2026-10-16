@@ -242,13 +242,13 @@ func TestFormatBytes(t *testing.T) {
 	}
 }
 
-// TestPlayerAsksAboutThePlayingDownload checks that the player asks the server
-// about the entry still coming down, says its stage, and stops saying anything
-// once the copy has landed.
-func TestPlayerAsksAboutThePlayingDownload(t *testing.T) {
+// TestPlayerAsksAboutThePendingDownload checks that the player asks the server
+// about the rendition it is fetching for the next track, says its stage, and
+// stops saying anything once that fetch is over.
+func TestPlayerAsksAboutThePendingDownload(t *testing.T) {
 	dir := t.TempDir()
-	streamed := tone(t, dir, "streamed.opus", 3.0)
-	p, cancel := newTestPlayer(t, streamed)
+	file := tone(t, dir, "next.opus", 3.0)
+	p, cancel := newTestPlayer(t, file)
 	defer cancel()
 	ctx := context.Background()
 
@@ -261,11 +261,7 @@ func TestPlayerAsksAboutThePlayingDownload(t *testing.T) {
 		return &client.MediaStatus{Stage: client.MediaStageDownload, Progress: -1, Bytes: 3_250_000}, nil
 	}
 
-	ready := make(chan client.CacheEntry, 1)
-	if err := p.startTrack(ctx, playbackItem{variantID: "v1", source: streamed, ready: ready}); err != nil {
-		t.Fatalf("startTrack: %v", err)
-	}
-
+	p.setPending("v1")
 	waitForCondition(t, ctx, "the download to be asked about", func() bool {
 		p.refresh(ctx)
 		return download(p) != ""
@@ -280,12 +276,12 @@ func TestPlayerAsksAboutThePlayingDownload(t *testing.T) {
 		t.Error("the player never asked about variant v1")
 	}
 
-	// The copy lands, so there is nothing left to report.
-	ready <- client.CacheEntry{VariantID: "v1", TrackID: "t1", Path: streamed}
-	waitForCondition(t, ctx, "the download to be over", func() bool {
-		p.refresh(ctx)
-		return download(p) == ""
-	})
+	// The fetch is over, so there is nothing left to report.
+	p.setPending("")
+	p.refresh(ctx)
+	if got := download(p); got != "" {
+		t.Errorf("download = %q, want nothing once the fetch is over", got)
+	}
 }
 
 // download reads the status line's download label.

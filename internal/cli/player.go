@@ -35,15 +35,10 @@ type player struct {
 	queue []queueItem
 
 	// mediaStatus reads one variant's download state, which is what the status
-	// line says while the playing track is still coming down. It is nil for a
-	// player with no server to ask, which then says nothing about downloads.
+	// line says while the rendition about to play is still being fetched. It is
+	// nil for a player with no server to ask, which then says nothing about
+	// downloads.
 	mediaStatus func(ctx context.Context, variantID string) (*client.MediaStatus, error)
-
-	// streamInfo reads what a variant's stream says about itself, the length
-	// above all: a stream carries none of its own, and the status line needs
-	// one for the song that is arriving. It is nil for a player with no server
-	// to ask.
-	streamInfo func(ctx context.Context, variantID string, startMs int64) (client.StreamInfo, error)
 
 	interactive bool
 	keys        *keyReader
@@ -53,11 +48,6 @@ type player struct {
 
 	// drawn serialises whole status lines.
 	drawn sync.Mutex
-
-	// items are the queue entries handed to mpv, in playlist order. position
-	// indexes into them, which is how a landed copy is matched to the track
-	// currently playing.
-	items []playbackItem
 
 	mu          sync.Mutex
 	loaded      int
@@ -70,9 +60,12 @@ type player struct {
 	volume      int
 	paused      bool
 	message     string
-	// download is what the playing entry's download is doing, rendered for the
-	// status line and empty when nothing is being fetched.
+	// download is what the rendition being fetched for the next track is doing,
+	// rendered for the status line and empty when nothing is being fetched.
 	download string
+	// pending is the variant being fetched for the track about to play, whose
+	// download the status line reports; empty when nothing is being fetched.
+	pending string
 }
 
 // newPlayer returns a player for the queue.
@@ -256,163 +249,28 @@ func (p *player) skip(ctx context.Context, direction int) {
 	p.draw()
 }
 
-// startTrack loads the first entry. When its local copy is not on disk yet it
-// is streamed from its URL, and the copy is swapped in when it lands.
+// startTrack loads the first entry from its file.
 func (p *player) startTrack(ctx context.Context, item playbackItem) error {
-	if err := p.sink.StartFile(ctx, item.source, item.seekMs()); err != nil {
+	if err := p.sink.StartFile(ctx, item.source, item.positionMs); err != nil {
 		return err
 	}
-	index := p.addItem(item)
+	p.mu.Lock()
 	p.loaded++
-	p.watchDuration(ctx, index, item)
-	p.watchLocal(ctx, index, item.ready)
+	p.mu.Unlock()
 	p.applyPendingSkip(ctx)
 	return nil
 }
 
-// appendTrack queues the next entry behind whatever is playing. A copy that
-// landed before its turn is already the local path; otherwise mpv streams the
-// URL and the copy is swapped in once that entry is the one playing.
+// appendTrack queues the next entry behind whatever is playing.
 func (p *player) appendTrack(ctx context.Context, item playbackItem) error {
 	if err := p.sink.AppendFile(ctx, item.source); err != nil {
 		return err
 	}
-	index := p.addItem(item)
+	p.mu.Lock()
 	p.loaded++
-	p.watchDuration(ctx, index, item)
-	p.watchLocal(ctx, index, item.ready)
+	p.mu.Unlock()
 	p.applyPendingSkip(ctx)
 	return nil
-}
-
-// seekMs is where mpv should start the source. A stream already begins where
-// the listener asked - the server starts the source there - so mpv plays it
-// from zero; a local file is seeked to the position.
-func (i playbackItem) seekMs() int64 {
-	if i.ready != nil {
-		return 0
-	}
-	return i.positionMs
-}
-
-// streamed reports whether the entry is still the stream, not yet the file on
-// disk. mpv's playhead is then relative to where the stream began, and the
-// entry's position is that beginning.
-func (i playbackItem) streamed() bool {
-	return i.ready != nil && i.source != i.localPath
-}
-
-// watchDuration learns a streamed entry's length from the stream's own header
-// and records it, so the status line can draw a timeline for a song whose bytes
-// have no length of their own. It only runs for a streaming entry: a local file
-// reports its length through mpv, and a length already known needs no probe.
-func (p *player) watchDuration(ctx context.Context, index int, item playbackItem) {
-	if item.ready == nil || item.durationMs > 0 || p.streamInfo == nil {
-		return
-	}
-	go func() {
-		info, err := p.streamInfo(ctx, item.variantID, item.positionMs)
-		if err != nil || info.DurationMs <= 0 {
-			return
-		}
-		p.mu.Lock()
-		if index < len(p.items) {
-			p.items[index].durationMs = info.DurationMs
-		}
-		p.mu.Unlock()
-		p.draw()
-	}()
-}
-
-// addItem records an entry in playlist order and returns its index.
-func (p *player) addItem(item playbackItem) int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.items = append(p.items, item)
-	return len(p.items) - 1
-}
-
-// watchLocal hands mpv the local copy of a track once its download lands,
-// resuming from the position the streaming one reached and keeping the pause
-// state. It only swaps when that entry is the one actually playing; a copy
-// that arrives for a queued entry is left for its own turn (refresh picks it
-// up the moment it starts playing).
-func (p *player) watchLocal(ctx context.Context, index int, ready <-chan client.CacheEntry) {
-	if ready == nil {
-		return
-	}
-	go func() {
-		entry, ok := <-ready
-		if !ok {
-			return
-		}
-
-		p.mu.Lock()
-		if index < len(p.items) {
-			p.items[index].localPath = entry.Path
-		}
-		p.mu.Unlock()
-
-		// Only the entry that is playing may be swapped, and it is matched by
-		// variant id: a copy for a different item must never replace the track
-		// the listener is hearing.
-		position, err := p.sink.process.playlistPosition(ctx)
-		if err != nil || position < 0 {
-			return
-		}
-		p.mu.Lock()
-		var playingVariant string
-		if position < len(p.items) {
-			playingVariant = p.items[position].variantID
-		}
-		p.mu.Unlock()
-		if playingVariant == "" || playingVariant != entry.VariantID {
-			return
-		}
-		p.swapToLocal(ctx, position)
-	}()
-}
-
-// swapToLocal replaces whatever mpv is playing with the entry's local copy at
-// the position it had reached, keeping the pause state. The caller has checked
-// that the entry is the one playing.
-func (p *player) swapToLocal(ctx context.Context, index int) {
-	p.mu.Lock()
-	var path string
-	var offset int64
-	if index < len(p.items) {
-		item := p.items[index]
-		path = item.localPath
-		// A stream asked to begin at a position carries the rest of the song,
-		// and mpv's playhead is relative to where that stream started. The
-		// local copy is the whole song, so the playhead is shifted by the
-		// offset the stream began at before it is seeked.
-		if item.streamed() {
-			offset = item.positionMs
-		}
-	}
-	p.mu.Unlock()
-	if path == "" {
-		return
-	}
-
-	paused, err := p.sink.process.pauseState(ctx)
-	if err != nil {
-		return
-	}
-	where, _ := p.sink.process.positionMs(ctx)
-	if err := p.sink.process.loadReplace(ctx, path, where+offset); err != nil {
-		return
-	}
-	if paused {
-		_ = p.sink.process.setPause(ctx, true)
-	}
-
-	p.mu.Lock()
-	if index < len(p.items) {
-		p.items[index].source = path
-	}
-	p.mu.Unlock()
 }
 
 // applyPendingSkip honours an earlier "next track is still downloading".
@@ -454,47 +312,30 @@ func (p *player) refresh(ctx context.Context) {
 	}
 	p.positionMs = where
 	p.durationMs = duration
-	if position >= 0 && position < len(p.items) {
-		item := p.items[position]
-		if item.streamed() {
-			// The stream began at the offset; its playhead is relative to it.
-			p.positionMs = where + item.positionMs
-		}
-		if duration <= 0 {
-			// A stream has no length for mpv to report; the header's figure is
-			// what the timeline is drawn from until the local copy lands.
-			p.durationMs = item.durationMs
-		}
-	}
 	p.paused = paused
 	if position >= 0 && position < len(p.queue) {
 		p.title = p.queue[position].Title
 	}
-	// A local copy that landed while its entry was still queued behind another
-	// track is handed over now, the moment that entry is the one playing.
-	swap := positionErr == nil && position >= 0 && position < len(p.items) &&
-		p.items[position].localPath != "" && p.items[position].source != p.items[position].localPath
-
-	// The playing entry that has not landed locally is the only download the
-	// status line can say anything about; anything else has nothing to report.
-	waiting := ""
-	if positionErr == nil && position >= 0 && position < len(p.items) {
-		if item := p.items[position]; item.ready != nil && item.localPath == "" {
-			waiting = item.variantID
-		}
-	}
-	if waiting == "" {
+	pending := p.pending
+	if pending == "" {
 		p.download = ""
 	}
 	p.mu.Unlock()
 
-	if waiting != "" {
-		p.readDownload(readCtx, waiting)
+	if pending != "" {
+		p.readDownload(readCtx, pending)
 	}
+}
 
-	if swap {
-		p.swapToLocal(ctx, position)
+// setPending names the rendition being fetched for the track about to play, so
+// the status line reports that fetch while it runs; an empty id clears it.
+func (p *player) setPending(variantID string) {
+	p.mu.Lock()
+	p.pending = variantID
+	if variantID == "" {
+		p.download = ""
 	}
+	p.mu.Unlock()
 }
 
 // readDownload records what a variant's download is doing, so the status line
@@ -509,7 +350,9 @@ func (p *player) readDownload(ctx context.Context, variantID string) {
 		label = downloadLabel(status)
 	}
 	p.mu.Lock()
-	p.download = label
+	if p.pending == variantID {
+		p.download = label
+	}
 	p.mu.Unlock()
 }
 

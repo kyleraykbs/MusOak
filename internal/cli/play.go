@@ -11,10 +11,11 @@ import (
 	"github.com/kyleraykbs/MusOak/pkg/client"
 )
 
-// cmdPlay plays the local queue through mpv: the next tracks are prepared
-// while the current one plays, and a track that is not on disk yet is streamed
-// from the server over HTTP. As soon as its download lands, the playing track
-// is swapped to the local file without losing its position.
+// cmdPlay plays the local queue through mpv: the next tracks are downloaded
+// while the current one plays, and a track that is not on disk yet is fetched
+// first and then played from its file. Nothing is streamed from the server - a
+// rendition it has not stored is refused - so this waits for the download, and
+// the status line says what that fetch is doing meanwhile.
 func (a *App) cmdPlay(ctx context.Context, args []string) error {
 	set := flag.NewFlagSet("play", flag.ContinueOnError)
 	set.SetOutput(a.out)
@@ -39,7 +40,6 @@ func (a *App) cmdPlay(ctx context.Context, args []string) error {
 
 	ui := newPlayer(a.out, sink, queue)
 	ui.mediaStatus = a.client.MediaStatus
-	ui.streamInfo = a.client.MediaStreamInfo
 	ui.start(ctx)
 	defer ui.stop()
 
@@ -92,7 +92,16 @@ func (a *App) cmdPlay(ctx context.Context, args []string) error {
 		if queued == 0 {
 			itemStart = *start
 		}
-		item := a.slotItem(current, itemStart)
+
+		// Nothing is streamed: the track is fetched first, and the status line
+		// reports that fetch while it runs.
+		ui.setPending(current.variantID)
+		entry, ok := <-current.local
+		ui.setPending("")
+		if !ok {
+			return fmt.Errorf("musoak: %s: could not download the rendition", current.item.Title)
+		}
+		item := playbackItem{source: entry.Path, positionMs: itemStart}
 		if queued == 0 {
 			if err := ui.startTrack(ctx, item); err != nil {
 				return err
@@ -106,11 +115,10 @@ func (a *App) cmdPlay(ctx context.Context, args []string) error {
 	return ui.wait(ctx)
 }
 
-// slot prepares one queue entry. Resolution, delivery and completion are
-// deliberately separate: the resolved variant id — which the stream URL
-// depends on — is published through resolved as soon as it is known, while the
-// finished file arrives on local later. The player can therefore start a track
-// from its URL long before the download finishes.
+// slot prepares one queue entry. Resolution and delivery are deliberately
+// separate: the resolved variant id is published through resolved as soon as it
+// is known - the status line names that rendition while its file is fetched -
+// and the finished file arrives on local later.
 type slot struct {
 	item queueItem
 
@@ -124,26 +132,13 @@ type slot struct {
 	local chan client.CacheEntry
 }
 
-// playbackItem is what the player hands mpv for one queue entry: where to play
-// it from now, and where the local copy will land.
+// playbackItem is what the player hands mpv for one queue entry: the file to
+// play and where in it to begin. It is always a file on this machine - the
+// server refuses a rendition it has not stored, so a track is downloaded before
+// it is played.
 type playbackItem struct {
-	variantID string
-	// source is what mpv loads now: a local path, or a stream URL for a
-	// rendition the server is still preparing.
-	source string
-	// localPath is the on-disk copy; it is set once the file is there.
-	localPath string
-	// ready yields the local copy when the download lands. It is nil when the
-	// copy was already on disk (source is then the local path).
-	ready <-chan client.CacheEntry
-	// positionMs is where in the track playback should begin. For a local file
-	// it is a seek; for a stream it is folded into the URL as ?start=, because
-	// a stream that has not finished has no length to seek within.
+	source     string
 	positionMs int64
-	// durationMs is the track's length when it is known before the file
-	// exists - the figure a stream carries in a header rather than in its own
-	// bytes - so the status line can draw a timeline while the song arrives.
-	durationMs int64
 }
 
 // startSlot resolves one queue entry and makes sure a local copy exists. The
@@ -196,31 +191,6 @@ func (a *App) startSlot(ctx context.Context, item queueItem, order func(context.
 		s.local <- entry
 	}()
 	return s
-}
-
-// slotItem turns a resolved slot into what the player should play. It never
-// waits: a rendition that is not on disk yet is delivered as its stream URL
-// and the local copy is handed over later through ready.
-//
-// startMs is where in the track playback should begin. A not-downloaded
-// rendition is streamed from there - the URL carries the offset, so the server
-// hands over the rest of the song and no seeking is needed - while a local copy
-// is handed to mpv with the position to seek to.
-func (a *App) slotItem(s *slot, startMs int64) playbackItem {
-	if entry, ok := a.cache.Lookup(s.variantID); ok {
-		return playbackItem{
-			variantID:  s.variantID,
-			source:     entry.Path,
-			localPath:  entry.Path,
-			positionMs: startMs,
-		}
-	}
-	return playbackItem{
-		variantID:  s.variantID,
-		source:     a.client.MediaURL(s.variantID, startMs),
-		ready:      s.local,
-		positionMs: startMs,
-	}
 }
 
 // resolveVariant picks the rendition to play for a track: the earliest-ranked

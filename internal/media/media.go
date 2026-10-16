@@ -195,8 +195,6 @@ type Manager struct {
 	// serving counts the requests reading a variant's finished file, so a sweep
 	// does not delete the bytes a listener is in the middle of.
 	serving map[uuid.UUID]int
-	// streams counts a variant's source fetches: see maxStreamsPerVariant.
-	streams map[uuid.UUID]int
 	// downloadTimeout is how long one attempt may take; see downloadTimeout.
 	downloadTimeout  time.Duration
 	background       map[uuid.UUID]backgroundFetch
@@ -322,9 +320,9 @@ func (m *Manager) ensure(ctx context.Context, variantID uuid.UUID, primary bool)
 
 // Resolve looks up the two rows a media request needs: the variant, and its
 // finished file when there is one. The request resolves them once and hands the
-// result to Stream and ServeFile, so neither looks the same rows up again on the
-// way to the first byte. A variant that cannot be read is left nil rather than
-// failing the lookup: the name and the serve are decided from what is there.
+// result to ServeFile, so it does not look the same rows up again on the way to
+// the first byte. A variant that cannot be read is left nil rather than failing
+// the lookup: the name and the serve are decided from what is there.
 func (m *Manager) Resolve(ctx context.Context, variantID uuid.UUID) Resolved {
 	variant, _ := m.db.Variant(ctx, variantID)
 	file, fileErr := m.db.MediaFile(ctx, variantID)
@@ -764,39 +762,6 @@ func (m *Manager) isServing(variantID uuid.UUID) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.serving[variantID] > 0
-}
-
-// maxStreamsPerVariant caps how many source fetches one variant has in flight at
-// once. Every stream is its own yt-dlp process, so without a cap N listeners on
-// one song run N of them for the same bytes; past the cap the next listener is
-// told to come back rather than starting another, and by then the download
-// behind them has the file.
-const maxStreamsPerVariant = 2
-
-// beginStream takes one of a variant's stream slots, or reports false when they
-// are all taken.
-func (m *Manager) beginStream(variantID uuid.UUID) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.streams[variantID] >= maxStreamsPerVariant {
-		return false
-	}
-	if m.streams == nil {
-		m.streams = make(map[uuid.UUID]int)
-	}
-	m.streams[variantID]++
-	return true
-}
-
-// endStream gives a stream slot back.
-func (m *Manager) endStream(variantID uuid.UUID) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if n := m.streams[variantID]; n <= 1 {
-		delete(m.streams, variantID)
-	} else {
-		m.streams[variantID] = n - 1
-	}
 }
 
 // ready reports a completed file if one exists on disk.

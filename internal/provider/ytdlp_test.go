@@ -150,24 +150,3 @@ func TestYtdlpProgressReporterWithoutACallback(t *testing.T) {
 	reporter := NewYtdlpProgressReporter(nil)
 	reporter.Line("[download] 100% of    1.00MiB in 00:00:01 at   1.00MiB/s")
 }
-
-// A position inside a track, said the way yt-dlp's --download-sections wants it.
-func TestSectionTimestamp(t *testing.T) {
-	tests := []struct {
-		ms   int64
-		want string
-	}{
-		{0, "0:00:00"},
-		{1000, "0:00:01"},
-		{90_500, "0:01:30.500"},
-		{214_000, "0:03:34"},
-		{3_600_000, "1:00:00"},
-		{3_661_234, "1:01:01.234"},
-		{-5, "0:00:00"},
-	}
-	for _, test := range tests {
-		if got := SectionTimestamp(test.ms); got != test.want {
-			t.Errorf("SectionTimestamp(%d) = %q, want %q", test.ms, got, test.want)
-		}
-	}
-}

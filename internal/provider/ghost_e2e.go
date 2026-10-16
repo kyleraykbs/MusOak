@@ -27,8 +27,15 @@ const GhostProviderName = "e2e-ghost"
 // dialogue something playable to offer for it.
 const GhostTitle = "E2E Ghost Tone"
 
-// GhostTrackID is the one provider track id this fake answers with.
+// GhostTitleTwo gives the second browser scenario its own canonical track;
+// the e2e backend is shared by the suite, so the first scenario's association
+// must not make the second one playable before its dialogue appears.
+const GhostTitleTwo = "E2E Unplayable Tone Two"
+
+// GhostTrackID is the first fake's provider track id.
 const GhostTrackID = "e2e-ghost-1"
+
+const ghostTrackIDTwo = "e2e-ghost-2"
 
 // GhostDurationMs is deliberately nowhere near the slow fake's 30 s: matching
 // refuses two renditions whose lengths differ by more than five seconds, so a
@@ -49,12 +56,19 @@ func (ghostProvider) Search(ctx context.Context, q string, opts SearchOpts) ([]T
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if !strings.Contains(strings.ToLower(q), "ghost") {
+	lower := strings.ToLower(q)
+	if !strings.Contains(lower, "ghost") {
 		return nil, nil
 	}
+	title := GhostTitle
+	id := GhostTrackID
+	if strings.Contains(lower, "unplayable") || strings.Contains(lower, "two") {
+		title = GhostTitleTwo
+		id = ghostTrackIDTwo
+	}
 	return []Track{{
-		ProviderTrackID: GhostTrackID,
-		Title:           GhostTitle,
+		ProviderTrackID: id,
+		Title:           title,
 		Artists:         []string{E2EArtist},
 		DurationMs:      GhostDurationMs,
 	}}, nil

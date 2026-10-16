@@ -9,9 +9,10 @@ info:
 
     Two conventions matter:
 
-    * `GET /api/v1/media/{variantId}` serves bytes and supports Range requests;
-      it never starts a download. Ask for one with
-      `POST /api/v1/media/{variantId}/download` first.
+    * `GET /api/v1/media/{variantId}` serves bytes this server holds, with
+      Range support and `?start=<ms>`. It never starts a download: a rendition
+      that is not on disk is refused with a 409, and
+      `POST /api/v1/media/{variantId}/download` makes it ready first.
     * Room commands are REST calls; room state changes arrive on
       `GET /api/v1/ws` as events. The server holds the room's song and time:
       it advances the queue and republishes the anchored position about once a
@@ -211,72 +212,6 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
 
-  /api/v1/tracks/{trackId}/stream:
-    get:
-      tags: [media]
-      summary: Play a track without naming its rendition
-      description: |
-        The server picks the rendition it would play for this caller - the first
-        downloadable one in their effective provider order, the same choice the
-        variant picker makes - so a client that knows only the track id can
-        start the bytes in one request instead of listing the variants and
-        choosing. The answer is exactly `GET /api/v1/media/{variantId}`'s: a
-        finished file with Range support and an ETag, or the source streamed
-        while it downloads, marked `X-Musoak-Stream: 1`.
-
-        The chosen rendition is named in `X-Musoak-Variant`, so a client can
-        hand this URL to its player and swap to that rendition's media URL
-        later. A track with no downloadable rendition at all is a 404.
-      operationId: streamTrack
-      parameters:
-        - { $ref: "#/components/parameters/TrackID" }
-        - name: start
-          in: query
-          required: false
-          description: |
-            Where in the track a stream should begin, in milliseconds, exactly
-            as `GET /api/v1/media/{variantId}` reads it. A finished file is
-            ranged as usual.
-          schema: { type: integer, format: int64, minimum: 0 }
-      responses:
-        "200":
-          description: The whole file, or a stream of it while it downloads.
-          headers:
-            ETag: { $ref: "#/components/headers/ETag" }
-            X-Musoak-Variant:
-              description: The rendition the server chose for this caller.
-              schema: { type: string, format: uuid }
-            X-Musoak-Stream:
-              description: Present, and `1`, when this is a stream of a variant that has not finished downloading.
-              schema: { type: string }
-            X-Musoak-Duration:
-              description: |
-                The track's length in milliseconds, when the server knows it.
-              schema: { type: integer, format: int64 }
-            X-Musoak-Provider-Ms:
-              description: |
-                How long the request waited for the provider's own process to
-                start producing, in milliseconds. The rest of the wait is the
-                provider's network-bound work and is logged, not guessed.
-              schema: { type: integer, format: int64 }
-          content:
-            audio/ogg:
-              schema: { type: string, format: binary }
-            audio/mp4:
-              schema: { type: string, format: binary }
-            audio/webm:
-              schema: { type: string, format: binary }
-        "206":
-          description: The requested byte range.
-          content:
-            audio/ogg:
-              schema: { type: string, format: binary }
-        "404":
-          description: No such track, or the track has no downloadable rendition.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
-
   /api/v1/tracks/{trackId}/resolve:
     post:
       tags: [library]
@@ -307,27 +242,23 @@ paths:
   /api/v1/media/{variantId}:
     get:
       tags: [media]
-      summary: Play a rendition, finished or still arriving
+      summary: Play a rendition this server holds
       description: |
-        A finished rendition is the stored Ogg/Opus file, with Range support and
-        an ETag of its sha256.
+        The answer is the stored Ogg/Opus file for the rendition, with Range
+        support and an ETag of its sha256. There is no streaming: the bytes are
+        either on disk or they are not.
 
-        One that is still downloading is played from its source instead: the
-        bytes exist upstream, and waiting for the whole song to land is a silence
-        nobody asked for. Those bytes come from the provider's own fetch, handed
-        on as they arrive, so this answer has no `Content-Length`, cannot be
-        ranged, and must never be stored as the rendition - it is a copy of the
-        source, not the file this URL names. It is marked `X-Musoak-Stream: 1`
-        and carries no ETag. The container is the source's own (`audio/mp4`,
-        `audio/webm`, `audio/ogg`), not the stored Ogg/Opus. The download carries
-        on in the background, so a later request is answered from disk.
+        `start` begins the file part way in, where a listener already is - a
+        room whose song is a minute gone, a session picked up where it was left
+        - and what arrives is the rest of the track. It is read in milliseconds
+        and mapped to a byte offset; a `Range` header is more precise and takes
+        precedence over it. Zero, absent or unparseable means the whole file from
+        the beginning.
 
-        `start` begins a stream where a listener already is - a room whose song
-        is a minute gone, a session picked up where it was left - and what
-        arrives is the rest of the track, running to its end. A client that
-        wants to move inside a stream asks again with a new `start`; a stream
-        itself cannot be ranged, because it is a fetch in progress rather than a
-        file.
+        A rendition that is not on disk is refused, not streamed: a 409 saying
+        `variant is not downloadable` when its source is metadata only, or a 409
+        saying it is `not downloaded yet` when it merely has to be fetched with
+        `POST /api/v1/media/{variantId}/download` first.
       operationId: getMedia
       parameters:
         - { $ref: "#/components/parameters/VariantID" }
@@ -335,43 +266,31 @@ paths:
           in: query
           required: false
           description: |
-            Where in the track a stream should begin, in milliseconds. Only
-            consulted when the answer is a stream; a finished file is ranged as
-            usual. Zero, absent or unparseable means the whole track from the
-            beginning.
+            Where in the track to begin, in milliseconds, mapped to the byte
+            offset of that position. A `Range` header takes precedence. Zero,
+            absent or unparseable means the whole file from the beginning.
           schema: { type: integer, format: int64, minimum: 0 }
       responses:
         "200":
-          description: The whole file, or a stream of it while it downloads.
+          description: The whole stored file.
           headers:
             ETag: { $ref: "#/components/headers/ETag" }
-            X-Musoak-Stream:
-              description: Present, and `1`, when this is a stream of a variant that has not finished downloading.
-              schema: { type: string }
-            X-Musoak-Duration:
-              description: |
-                The track's length in milliseconds, when the server knows it.
-                A stream has no length of its own - it is a fetch in progress -
-                so this is what a client draws a timeline from.
-              schema: { type: integer, format: int64 }
-            X-Musoak-Provider-Ms:
-              description: |
-                How long the request waited for the provider's own process to
-                start producing, in milliseconds.
-              schema: { type: integer, format: int64 }
           content:
             audio/ogg:
               schema: { type: string, format: binary }
-            audio/mp4:
-              schema: { type: string, format: binary }
-            audio/webm:
-              schema: { type: string, format: binary }
         "206":
-          description: The requested byte range.
+          description: The requested byte range, or the file from the `start` position.
           content:
             audio/ogg:
               schema: { type: string, format: binary }
         "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: |
+            The rendition is not on disk: either it is not downloadable and must
+            be resolved to a playable variant, or it has to be downloaded first.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /api/v1/media/{variantId}/status:
     get:
@@ -2664,18 +2583,12 @@ components:
 
     Capabilities:
       type: object
-      required: [search, download, stream]
+      required: [search, download]
       properties:
         search: { type: boolean }
         download:
           type: boolean
           description: False for metadata-only providers such as Spotify.
-        stream:
-          type: boolean
-          description: |
-            True when the provider can resolve a directly playable URL without
-            downloading the whole track first; the media endpoint streams from
-            it while a rendition is still arriving.
 
     Track:
       type: object

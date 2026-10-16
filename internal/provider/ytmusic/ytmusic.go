@@ -8,7 +8,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -81,7 +80,6 @@ func (p *Provider) Capabilities() provider.Caps {
 	return provider.Caps{
 		Search:        true,
 		Download:      true,
-		Stream:        true,
 		SearchAlbums:  true,
 		SearchArtists: true,
 		Radio:         true,
@@ -487,172 +485,9 @@ func convertProgress(progress provider.ProgressFunc) ffmpeg.ProgressFunc {
 	}
 }
 
-// streamExtWait bounds how long Stream waits for yt-dlp to report the container
-// it chose. The report is written before any audio, so it either arrives during
-// startup or the fetch never got that far.
-const streamExtWait = 30 * time.Second
-
-// streamExtPoll is how often Stream re-checks for that report.
-const streamExtPoll = 25 * time.Millisecond
-
-// Stream implements provider.Streamer: it runs yt-dlp exactly as Download does,
-// but sends the audio to a pipe and hands that to the caller instead of writing
-// a file. The bytes arrive as they are fetched, never the whole track buffered.
-//
-// ctx is the listener's; cancelling it kills the fetch, which belongs to that
-// one listener and must not disturb the download running alongside it.
-func (p *Provider) Stream(ctx context.Context, providerTrackID string, startMs int64) (io.ReadCloser, string, error) {
-	url := "https://music.youtube.com/watch?v=" + providerTrackID
-
-	body, mimeType, err := p.stream(ctx, url, startMs)
-	if err != nil {
-		p.logger.Warn("ytmusic stream failed with yt-dlp defaults, retrying with the web_embedded client",
-			"provider_track_id", providerTrackID, "error", err)
-		if body, mimeType, err = p.stream(ctx, url, startMs, "--extractor-args", playerClient); err != nil {
-			return nil, "", err
-		}
-	}
-	return body, mimeType, nil
-}
-
-// stream starts one yt-dlp fetch with the flags a download uses, but -o - sends
-// the audio to stdout and --print-to-file records the container yt-dlp chose.
-// That report arrives before any audio, so waiting for it both learns the MIME
-// type and proves the fetch really started; until then a failure is still an
-// ordinary error rather than a truncated stream.
-func (p *Provider) stream(ctx context.Context, url string, startMs int64, extra ...string) (io.ReadCloser, string, error) {
-	extFile, err := os.CreateTemp("", "musoak-ytmusic-ext-*")
-	if err != nil {
-		return nil, "", fmt.Errorf("ytmusic stream %s: ext file: %w", url, err)
-	}
-	extPath := extFile.Name()
-	extFile.Close()
-	defer os.Remove(extPath)
-
-	args := p.ytdlpArgs(extra...)
-	if startMs > 0 {
-		// Fetch from `startMs` to the end, and let yt-dlp's own cutter do it:
-		// it knows the container and the timestamps, and asking for a section
-		// is the tool's own way of starting part-way through. Without it a
-		// listener joining a song already playing would be handed bytes from
-		// the beginning and have to buffer a minute of music to reach the
-		// second they are on.
-		//
-		// The cost is a second tool: a section is cut with ffmpeg, which seeks
-		// the source (a range request where the host allows one). So a start
-		// part-way in waits for that seek, where starting at zero does not -
-		// which is why a whole track is asked for without this flag at all.
-		args = append(args, "--download-sections", "*"+provider.SectionTimestamp(startMs)+"-inf")
-	}
-	args = append(args, "-o", "-", "--print-to-file", "%(ext)s", extPath, url)
-
-	cmd := exec.CommandContext(ctx, p.ytdlp, args...)
-	// An explicit pipe, rather than StdoutPipe, keeps the audio out of cmd's
-	// bookkeeping: Wait can run as soon as the fetch starts without racing the
-	// reader for the tail of the stream.
-	audioReader, audioWriter, err := os.Pipe()
-	if err != nil {
-		return nil, "", fmt.Errorf("ytmusic stream %s: pipe: %w", url, err)
-	}
-	cmd.Stdout = audioWriter
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
-		audioReader.Close()
-		audioWriter.Close()
-		return nil, "", fmt.Errorf("yt-dlp %s: %w", url, err)
-	}
-	// The child holds its own copy of the write end; closing ours is what turns
-	// its exit into EOF for the reader.
-	audioWriter.Close()
-
-	proc := &streamProcess{audio: audioReader, cmd: cmd, done: make(chan struct{})}
-	go func() {
-		cmd.Wait()
-		close(proc.done)
-	}()
-
-	mimeType, err := waitForContainer(proc, extPath)
-	if err != nil {
-		proc.Close()
-		return nil, "", fmt.Errorf("ytmusic stream %s: %w: %s", url, err, strings.TrimSpace(stderr.String()))
-	}
-	return proc, mimeType, nil
-}
-
-// waitForContainer reads the container yt-dlp reported, polling until the file
-// is complete or the fetch ends. yt-dlp writes it before any audio, so it
-// appears almost immediately; if it never does, the fetch is reported rather
-// than handed on as an empty stream.
-func waitForContainer(proc *streamProcess, path string) (string, error) {
-	deadline := time.Now().Add(streamExtWait)
-	for {
-		if mimeType, done, err := readContainer(path); done {
-			return mimeType, err
-		}
-		select {
-		case <-proc.done:
-			// A quick fetch can land its report and exit between polls, so look
-			// once more before giving up.
-			if mimeType, done, err := readContainer(path); done {
-				return mimeType, err
-			}
-			return "", fmt.Errorf("yt-dlp exited before reporting the audio container")
-		case <-time.After(streamExtPoll):
-		}
-		if time.Now().After(deadline) {
-			return "", fmt.Errorf("timed out after %s waiting for yt-dlp to report the audio container", streamExtWait)
-		}
-	}
-}
-
-// readContainer reads yt-dlp's container report once it is complete: the value
-// is written with a trailing newline, which is what tells a finished report from
-// a partially written file. A complete but unsupported container is reported as
-// an error, never mapped to a guess.
-func readContainer(path string) (string, bool, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil || len(raw) == 0 || raw[len(raw)-1] != '\n' {
-		return "", false, nil
-	}
-	mimeType, err := provider.MIMEForExt(strings.TrimSpace(string(raw)))
-	if err != nil {
-		return "", true, err
-	}
-	return mimeType, true, nil
-}
-
-// streamProcess owns one yt-dlp fetch whose audio arrives on audio. Reading
-// hands the audio on as it comes and reaches io.EOF when it ends; Close ends
-// the fetch, killing the process if it is still running and waiting for it to
-// be reaped.
-type streamProcess struct {
-	audio *os.File
-	cmd   *exec.Cmd
-	done  chan struct{}
-}
-
-// Read hands on the audio as it arrives.
-func (s *streamProcess) Read(p []byte) (int, error) { return s.audio.Read(p) }
-
-// Close ends the fetch. It is safe to call more than once, and after the audio
-// has already reached io.EOF.
-func (s *streamProcess) Close() error {
-	s.audio.Close()
-	if s.cmd.Process != nil {
-		// Closing the pipe alone only ends yt-dlp at its next write; killing it
-		// ends a stalled fetch now.
-		_ = s.cmd.Process.Kill()
-	}
-	// Wait until the process is reaped; it already is when the audio reached EOF.
-	<-s.done
-	return nil
-}
-
 // ytdlpArgs is the argument prefix every yt-dlp invocation shares: one video at
-// a time, quiet, the same audio format selection, and the cookie flags that
-// answer YouTube's bot check. Download and Stream both build on it, so the
-// audio a stream carries is the format a download would have produced.
+// a time, quiet, and the same audio format selection, plus the cookie flags that
+// answer YouTube's bot check.
 func (p *Provider) ytdlpArgs(extra ...string) []string {
 	args := []string{
 		"--no-playlist",
@@ -676,9 +511,9 @@ func (p *Provider) ytdlpArgs(extra ...string) []string {
 // bytes it takes as it takes them.
 //
 // --newline --progress makes yt-dlp write a progress line per chunk to stdout.
-// The flags go on here rather than in the shared list because the streaming path
-// writes the audio itself to stdout, and the shared "--no-progress" is what
-// keeps the two apart: a later --progress wins.
+// The flags go on here rather than in the shared list because the shared
+// "--no-progress" would otherwise win: a later --progress is what turns the
+// readings back on.
 func (p *Provider) fetch(ctx context.Context, url, dir string, progress provider.ProgressFunc, extra ...string) (string, error) {
 	args := p.ytdlpArgs(extra...)
 	args = append(args, "--newline", "--progress", "-o", filepath.Join(dir, "%(id)s.%(ext)s"), url)

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"mime"
 	"net/http"
 	"strings"
@@ -9,7 +10,6 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kyleraykbs/MusOak/internal/media"
-	"github.com/kyleraykbs/MusOak/internal/ranking"
 	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
@@ -31,12 +31,11 @@ func variantIDFromPath(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool)
 	return id, true
 }
 
-// handleMediaFile serves a rendition, finished or still arriving. A finished
-// file is served from disk with Range support and an ETag. One that is still
-// downloading is played from its source - the bytes exist upstream, and waiting
-// for the whole song to land is a silence nobody asked for - while the download
-// carries on in the background, so the next request is answered from disk. Use
-// the status endpoint to watch for readiness.
+// handleMediaFile serves a rendition this server holds. There is no streaming:
+// a file that is on disk is served with Range support, an ETag and `?start=`,
+// and one that is not is refused with a 409 telling the caller to download it
+// first. Use the status endpoint to watch for readiness and the download
+// endpoint to fetch it.
 func (s *Server) handleMediaFile(w http.ResponseWriter, r *http.Request) {
 	id, ok := variantIDFromPath(w, r)
 	if !ok {
@@ -45,96 +44,41 @@ func (s *Server) handleMediaFile(w http.ResponseWriter, r *http.Request) {
 	s.serveMedia(w, r, id)
 }
 
-// handleTrackStream plays a track a caller knows only by id, without the extra
-// round trip of listing its variants and choosing one: the server picks the
-// rendition it would play for this caller - the first downloadable one in their
-// effective provider order, the same choice the picker and the room path make -
-// and answers exactly as /api/v1/media/{variantId} does, streaming while the
-// file is still downloading and serving it with Range once it is on disk.
-//
-// The chosen rendition is named in X-Musoak-Variant, so a client can hand this
-// URL to its player and later swap to that rendition's media URL if it wants
-// them to be the same request from then on. A track with no downloadable
-// rendition at all is a 404 saying so, not an empty stream.
-func (s *Server) handleTrackStream(w http.ResponseWriter, r *http.Request) {
-	id, ok := trackIDFromPath(w, r)
-	if !ok {
-		return
-	}
-	if _, err := s.store.Track(r.Context(), id); err != nil {
-		writeStoreError(w, err, "track not found")
-		return
-	}
-	variant, found, err := s.preferredVariant(r.Context(), id, s.currentUser(r))
-	if err != nil {
-		writeStoreError(w, err, "variants unavailable")
-		return
-	}
-	if !found {
-		writeError(w, http.StatusNotFound,
-			"track has no downloadable rendition; resolve it first (POST /api/v1/tracks/{trackId}/resolve)")
-		return
-	}
-	w.Header().Set("X-Musoak-Variant", variant.ID.String())
-	s.serveMedia(w, r, variant.ID)
-}
-
-// preferredVariant is the rendition this server would play for a caller who
-// named only a track: the first downloadable one in their effective provider
-// order, which is the order the picker lists and the room path picks from. A
-// guest has no ranking of their own, so the aggregate order decides, exactly as
-// it does for an anonymous room member. The order is shared with the variants
-// endpoint, so a client that does resolve them and pick the first answers the
-// same variant this does.
-func (s *Server) preferredVariant(ctx context.Context, trackID uuid.UUID, user *store.User) (store.Variant, bool, error) {
-	variants, err := s.store.VariantsForTrack(ctx, trackID)
-	if err != nil {
-		return store.Variant{}, false, err
-	}
-	counts, err := s.store.VariantVoteCounts(ctx, trackID)
-	if err != nil {
-		return store.Variant{}, false, err
-	}
-	uploaders, err := s.store.VariantUploaders(ctx, trackID)
-	if err != nil {
-		return store.Variant{}, false, err
-	}
-	order, err := s.effectiveOrder(ctx, user)
-	if err != nil {
-		return store.Variant{}, false, err
-	}
-	var caller uuid.UUID
-	if user != nil {
-		caller = user.ID
-	}
-	for _, variant := range ranking.OrderVariants(order, variants, uploaders, counts, caller) {
-		if variant.Downloadable {
-			return variant, true, nil
-		}
-	}
-	return store.Variant{}, false, nil
-}
-
-// serveMedia answers one rendition's URL: the name it downloads under, the
-// source's own bytes while the file is still arriving, and the finished file
-// once it is on disk. Every path that plays a rendition goes through it, so the
-// track-level stream and the media URL cannot answer differently.
+// serveMedia answers one rendition's URL: the finished file when it is on disk,
+// or a refusal when it is not. A variant whose source is metadata only is
+// refused differently from one that merely has not been fetched yet, mirroring
+// the download endpoint, so a caller learns which of the two it has to resolve.
 func (s *Server) serveMedia(w http.ResponseWriter, r *http.Request, id uuid.UUID) {
-	// Resolved once, and handed down: the variant tells the answer its name and
-	// where its bytes come from, and the file is the answer when the rendition is
-	// already on disk. The serve paths used to fetch both again on the way to the
-	// first byte, once per query and once per stat.
+	// Resolved once, and handed down: the variant tells the refusal which case
+	// it is, and the file is the answer when the rendition is already on disk.
 	res := s.media.Resolve(r.Context(), id)
 
-	// The bytes are Opus in an Ogg container, served as audio/ogg - and a
-	// browser left to itself names a download of that ".ogg". Say the name the
-	// file actually has: the extension the library stores it under, and the song
-	// it belongs to. "inline" so the same response still plays in an audio
-	// element.
-	w.Header().Set("Content-Disposition", mime.FormatMediaType("inline", map[string]string{
-		"filename": mediaFileName(res, id),
-	}))
-	if s.media.Stream(w, r, id, res) {
+	if res.File != nil {
+		// The bytes are Opus in an Ogg container, served as audio/ogg - and a
+		// browser left to itself names a download of that ".ogg". Say the name
+		// the file actually has: the extension the library stores it under, and
+		// the song it belongs to. "inline" so the same response still plays in
+		// an audio element.
+		w.Header().Set("Content-Disposition", mime.FormatMediaType("inline", map[string]string{
+			"filename": mediaFileName(res, id),
+		}))
+		s.media.ServeFile(w, r, id, res)
+		return
+	}
+
+	// No file on disk. A variant row that could not be read, or a file lookup
+	// that failed for any reason other than "absent", is the store's own error
+	// to report - ServeFile answers it. Only a rendition that really is absent
+	// gets the refusal, so a lookup failure is never mistaken for a missing
+	// download.
+	if res.Variant != nil && (res.FileErr == nil || errors.Is(res.FileErr, store.ErrNotFound)) {
+		if !res.Variant.Downloadable {
+			writeError(w, http.StatusConflict,
+				"variant is not downloadable; resolve its track first (POST /api/v1/tracks/{trackId}/resolve)")
+			return
+		}
+		writeError(w, http.StatusConflict,
+			"the rendition is not downloaded yet; start its download (POST /api/v1/media/"+id.String()+"/download) and play it when it is ready")
 		return
 	}
 	s.media.ServeFile(w, r, id, res)

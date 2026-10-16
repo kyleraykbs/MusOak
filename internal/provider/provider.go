@@ -9,9 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 )
@@ -31,9 +29,6 @@ type Caps struct {
 	// their tracks. A playlist belongs to one provider: two services offering
 	// the same name are different lists, so they are never merged.
 	Playlists bool
-	// Stream reports that the provider can hand out a track's audio as it
-	// arrives, without waiting for the whole file.
-	Stream bool
 }
 
 // Track is a provider's search hit, before cross-provider matching.
@@ -128,42 +123,6 @@ type RadioProvider interface {
 	Radio(ctx context.Context, seed Track, limit int) ([]Track, error)
 }
 
-// Streamer is a provider that can hand out a track's audio as it arrives,
-// without waiting for the whole file.
-type Streamer interface {
-	// Stream starts fetching a track and returns its audio: the bytes, and the
-	// MIME type of the container yt-dlp chose. Closing the reader ends the fetch.
-	//
-	// startMs is where inside the track the audio should begin: zero is the
-	// whole thing, and anything else starts there and runs to the end. It exists
-	// because a listener who joins a song already playing - a room whose song is
-	// a minute gone, a session picked up where it was left - must hear the rest
-	// of it, not the start of it. A provider that cannot start part-way in may
-	// ignore it and begin at zero; the caller's answer says which it got.
-	Stream(ctx context.Context, providerTrackID string, startMs int64) (io.ReadCloser, string, error)
-}
-
-// audioMIMEByExt maps the container extensions the streaming path understands
-// to the MIME type the listener is told it is receiving.
-var audioMIMEByExt = map[string]string{
-	"m4a":  "audio/mp4",
-	"webm": "audio/webm",
-	"opus": "audio/ogg",
-	"ogg":  "audio/ogg",
-}
-
-// MIMEForExt maps the audio container extension yt-dlp reported to a MIME type.
-// An extension that is not one of the containers this server knows is an error
-// rather than a guess: telling a client the wrong type of the bytes it is about
-// to receive is worse than refusing them.
-func MIMEForExt(ext string) (string, error) {
-	mimeType, ok := audioMIMEByExt[strings.ToLower(strings.TrimPrefix(strings.TrimSpace(ext), "."))]
-	if !ok {
-		return "", fmt.Errorf("unsupported audio container %q", ext)
-	}
-	return mimeType, nil
-}
-
 // Provider is one music source.
 type Provider interface {
 	Name() string
@@ -218,8 +177,6 @@ type DependencyChecker interface {
 var (
 	// ErrDownloadUnsupported means the provider cannot be downloaded from.
 	ErrDownloadUnsupported = errors.New("provider does not support downloads")
-	// ErrStreamUnsupported means the provider cannot hand out its audio.
-	ErrStreamUnsupported = errors.New("provider does not support streaming")
 	// ErrRadioUnsupported means the provider cannot build a radio.
 	ErrRadioUnsupported = errors.New("provider does not support radio")
 	// ErrNotEnabled means no such provider is registered.
@@ -450,20 +407,6 @@ func (r *Registry) Download(ctx context.Context, name, providerTrackID, destPath
 		return fmt.Errorf("%w: %s", ErrDownloadUnsupported, name)
 	}
 	return p.Download(ctx, providerTrackID, destPath, progress)
-}
-
-// Stream routes a stream to a provider, refusing providers without the
-// capability (Spotify) and unknown names.
-func (r *Registry) Stream(ctx context.Context, name, providerTrackID string, startMs int64) (io.ReadCloser, string, error) {
-	p, ok := r.Get(name)
-	if !ok {
-		return nil, "", fmt.Errorf("%w: %s", ErrNotEnabled, name)
-	}
-	streamer, ok := p.(Streamer)
-	if !ok || !p.Capabilities().Stream {
-		return nil, "", fmt.Errorf("%w: %s", ErrStreamUnsupported, name)
-	}
-	return streamer.Stream(ctx, providerTrackID, startMs)
 }
 
 // MissingDeps maps provider name to the binaries it needs but cannot find.

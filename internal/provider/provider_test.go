@@ -3,23 +3,19 @@ package provider
 import (
 	"context"
 	"errors"
-	"io"
 	"log/slog"
-	"strings"
 	"testing"
 	"time"
 )
 
 type fakeProvider struct {
-	name       string
-	caps       Caps
-	tracks     []Track
-	streamBody io.ReadCloser
-	streamMIME string
-	err        error
-	delay      time.Duration
-	deps       []string
-	calls      int
+	name   string
+	caps   Caps
+	tracks []Track
+	err    error
+	delay  time.Duration
+	deps   []string
+	calls  int
 }
 
 func (f *fakeProvider) Name() string          { return f.name }
@@ -28,11 +24,6 @@ func (f *fakeProvider) MissingDeps() []string { return f.deps }
 func (f *fakeProvider) Download(ctx context.Context, id, dest string, _ ProgressFunc) error {
 	f.calls++
 	return f.err
-}
-
-func (f *fakeProvider) Stream(ctx context.Context, id string, _ int64) (io.ReadCloser, string, error) {
-	f.calls++
-	return f.streamBody, f.streamMIME, f.err
 }
 
 func (f *fakeProvider) Search(ctx context.Context, q string, opts SearchOpts) ([]Track, error) {
@@ -202,99 +193,6 @@ func TestDownloadRouting(t *testing.T) {
 		t.Errorf("unknown provider: err = %v, want ErrNotEnabled", err)
 	}
 }
-
-// bareProvider implements Provider but not Streamer, to prove the registry
-// looks at the interface as well as the capability flag.
-type bareProvider struct{ name string }
-
-func (b *bareProvider) Name() string       { return b.name }
-func (b *bareProvider) Capabilities() Caps { return Caps{Search: true} }
-func (b *bareProvider) Search(context.Context, string, SearchOpts) ([]Track, error) {
-	return nil, nil
-}
-func (b *bareProvider) Download(context.Context, string, string, ProgressFunc) error {
-	return ErrDownloadUnsupported
-}
-
-func TestStreamRouting(t *testing.T) {
-	reg := newTestRegistry(t, time.Second)
-	stream := &fakeProvider{
-		name:       "ytmusic",
-		caps:       Caps{Search: true, Stream: true},
-		streamBody: io.NopCloser(strings.NewReader("audio bytes")),
-		streamMIME: "audio/webm",
-	}
-	// A metadata-only provider carries the interface but not the capability.
-	meta := &fakeProvider{name: "spotify", caps: Caps{Search: true}}
-	noIface := &bareProvider{name: "plain"}
-	reg.Register(stream)
-	reg.Register(meta)
-	reg.Register(noIface)
-
-	body, mimeType, err := reg.Stream(context.Background(), "ytmusic", "id", 0)
-	if err != nil {
-		t.Fatalf("Stream: %v", err)
-	}
-	if mimeType != "audio/webm" {
-		t.Errorf("mimeType = %q", mimeType)
-	}
-	got, err := io.ReadAll(body)
-	if err != nil {
-		t.Fatalf("read stream: %v", err)
-	}
-	body.Close()
-	if string(got) != "audio bytes" {
-		t.Errorf("audio = %q", got)
-	}
-	if stream.calls != 1 {
-		t.Errorf("stream calls = %d, want 1", stream.calls)
-	}
-
-	// A provider without the capability is refused even though it carries the
-	// interface, and is never asked.
-	if _, _, err := reg.Stream(context.Background(), "spotify", "id", 0); !errors.Is(err, ErrStreamUnsupported) {
-		t.Errorf("spotify stream: err = %v, want ErrStreamUnsupported", err)
-	}
-	if meta.calls != 0 {
-		t.Error("a metadata-only provider must never be asked to stream")
-	}
-
-	// A provider that does not implement Streamer at all is refused the same way.
-	if _, _, err := reg.Stream(context.Background(), "plain", "id", 0); !errors.Is(err, ErrStreamUnsupported) {
-		t.Errorf("plain stream: err = %v, want ErrStreamUnsupported", err)
-	}
-
-	if _, _, err := reg.Stream(context.Background(), "deezer", "id", 0); !errors.Is(err, ErrNotEnabled) {
-		t.Errorf("unknown provider: err = %v, want ErrNotEnabled", err)
-	}
-}
-
-func TestMIMEForExt(t *testing.T) {
-	for _, tc := range []struct{ ext, want string }{
-		{"m4a", "audio/mp4"},
-		{"webm", "audio/webm"},
-		{"opus", "audio/ogg"},
-		{"ogg", "audio/ogg"},
-		{"M4A", "audio/mp4"},
-		{".webm", "audio/webm"},
-	} {
-		got, err := MIMEForExt(tc.ext)
-		if err != nil {
-			t.Errorf("MIMEForExt(%q): %v", tc.ext, err)
-			continue
-		}
-		if got != tc.want {
-			t.Errorf("MIMEForExt(%q) = %q, want %q", tc.ext, got, tc.want)
-		}
-	}
-
-	// An unknown container is refused rather than guessed.
-	if got, err := MIMEForExt("flv"); err == nil {
-		t.Errorf("MIMEForExt(flv) = %q, want an error", got)
-	}
-}
-
-var _ Streamer = (*fakeProvider)(nil)
 
 func TestMissingDepsAggregation(t *testing.T) {
 	reg := newTestRegistry(t, time.Second)

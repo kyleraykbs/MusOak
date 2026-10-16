@@ -68,16 +68,15 @@ func New(baseURL string, opts ...Option) *Client {
 // BaseURL is the server this client talks to.
 func (c *Client) BaseURL() string { return c.baseURL }
 
-// MediaURL is the URL a variant's bytes are served from, the same URL the
+// MediaURL is the URL a variant's stored file is served from, the same URL the
 // media GET uses. A player that speaks HTTP (mpv does) can be handed it
-// directly, so playback of a rendition the server is still preparing can begin
-// before the download has finished.
+// directly. The server answers only for a rendition it has finished storing:
+// for one it has not, the request is refused and the caller must download it
+// first (Cache.Fetch does that).
 //
-// startMs, when positive, asks a stream of a not-yet-downloaded variant to
-// begin that far into the track and run to the end: a listener joining a song
-// already under way hears the rest of it rather than its head. Zero is the
-// whole track from the beginning, which is also what a file that is already on
-// disk answers - there the offset is a seek, not a query.
+// startMs, when positive, asks the file to be served from that far into the
+// track: a listener joining a song already under way hears the rest of it
+// rather than its head. Zero is the whole file from the beginning.
 func (c *Client) MediaURL(variantID string, startMs int64) string {
 	media := c.baseURL + "/api/v1/media/" + variantID
 	if startMs <= 0 {
@@ -86,27 +85,6 @@ func (c *Client) MediaURL(variantID string, startMs int64) string {
 	query := url.Values{}
 	query.Set("start", strconv.FormatInt(startMs, 10))
 	return media + "?" + query.Encode()
-}
-
-// TrackStreamURL is the URL a track's server-chosen rendition is streamed from,
-// for a client that knows only the track: the server picks the rendition by the
-// caller's own provider ranking - the same choice the variant picker makes - so
-// playback starts without the extra round trip of listing the variants and
-// choosing one. The answer is exactly the media URL's, and names the rendition
-// it chose in X-Musoak-Variant, so a client can hand this to a player now and
-// swap to that rendition's MediaURL later if it wants the two to be the same
-// request from then on.
-//
-// startMs is where inside the track the stream should begin, exactly as it is
-// for MediaURL.
-func (c *Client) TrackStreamURL(trackID string, startMs int64) string {
-	stream := c.baseURL + "/api/v1/tracks/" + trackID + "/stream"
-	if startMs <= 0 {
-		return stream
-	}
-	query := url.Values{}
-	query.Set("start", strconv.FormatInt(startMs, 10))
-	return stream + "?" + query.Encode()
 }
 
 // Token returns the current bearer token, empty for a guest.

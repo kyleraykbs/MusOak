@@ -31,7 +31,9 @@ Go module `github.com/kyleraykbs/MusOak`.
 - `internal/library` — browses and syncs albums and artists: provider
   tracklists in, canonical tracks and album membership out.
 - `internal/media` — download pipeline (singleflight, retries, quota + LRU
-  eviction), Range+ETag serving, local import/scan.
+  eviction), Range+ETag serving of stored files, `?start=` to begin a stored
+  file part way in, local import/scan. Nothing is streamed from a provider: a
+  rendition that is not on disk is refused, not fetched through.
 - `internal/auth` — argon2id PHC hashes, hashed bearer sessions, registration
   policy.
 - `internal/ranking` — per-user provider order, cached mean-position aggregate,

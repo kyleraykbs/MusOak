@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -16,22 +14,16 @@ import (
 )
 
 // roomPlayer is the one line a room member has while it follows a room: the song
-// the room is on, where this member is in it, and what the rendition in hand is
-// doing - the server's own stream of it arriving while its download runs behind
-// it, or the file once it has landed.
+// the room is on, and where this member is in it. The participant hands it a file
+// only once the rendition is on disk, so the line never has a download to report
+// mid-song; it says where the song has reached instead.
 //
-// It is what makes a member's wait visible instead of silence: a song being heard
-// from the provider while the file is still coming, the download's own stage and
-// numbers, and the moment the file takes over. On a terminal the line is redrawn
-// in place, where a position moving and a label changing are worth watching;
-// anywhere else one line is printed per change, so piping the command gives a
-// readable log rather than a carriage return per status read.
+// On a terminal the line is redrawn in place, where a position moving is worth
+// watching; anywhere else one line is printed per change, so piping the command
+// gives a readable log rather than a carriage return per status read.
 type roomPlayer struct {
 	out  io.Writer
 	part *client.Participant
-	// media reads one variant's download state, and is nil for a member with no
-	// server to ask, which then says nothing about downloads.
-	media func(ctx context.Context, variantID string) (*client.MediaStatus, error)
 
 	// interactive is whether the line may be redrawn in place, which is what a
 	// terminal is for.
@@ -41,13 +33,6 @@ type roomPlayer struct {
 	slot client.SinkTrack
 	// position is where this member's own player is in the song.
 	position int64
-	// download is what the playing rendition's download is doing, already
-	// rendered, and empty when there is nothing being fetched.
-	download string
-	// reading is whether a download status read is in flight, so the tick does
-	// not pile them up, and lastRead is when the last one was asked for.
-	reading  bool
-	lastRead time.Time
 	// printedKey and printedAt are what the last line said and where in the song
 	// it was said, which is how a repeated line is left out of a log.
 	printedKey string
@@ -68,12 +53,12 @@ type roomPlayer struct {
 }
 
 // newRoomPlayer returns a player for one member's playback.
-func newRoomPlayer(out io.Writer, part *client.Participant, media func(ctx context.Context, variantID string) (*client.MediaStatus, error)) *roomPlayer {
-	return &roomPlayer{out: out, part: part, media: media, stopped: make(chan struct{})}
+func newRoomPlayer(out io.Writer, part *client.Participant) *roomPlayer {
+	return &roomPlayer{out: out, part: part, stopped: make(chan struct{})}
 }
 
 // start begins the line, and the tick that keeps it true: the position moves
-// while a song plays, and a download's numbers move while it is fetched.
+// while a song plays.
 func (r *roomPlayer) start(ctx context.Context) {
 	r.interactive = term.IsTerminal(int(os.Stdout.Fd()))
 	go r.run(ctx)
@@ -121,19 +106,12 @@ func (r *roomPlayer) run(ctx context.Context) {
 	}
 }
 
-// track is what the participant hands its sink, as it hands it: a new song, the
-// stream of the one already playing asked for again, or the file taking over
-// from it. It must not wait for anything - the participant calls it from its own
-// loop and from the goroutines that resolve and fetch - so it records the answer
-// and draws it, and nothing else.
+// track is what the participant hands its sink, as it hands it: a new song, from
+// the file it fetched. It must not wait for anything - the participant calls it
+// from its own loop - so it records the answer and draws it, and nothing else.
 func (r *roomPlayer) track(slot client.SinkTrack) {
 	r.mu.Lock()
 	r.slot = slot
-	if !slot.Streaming {
-		// The file is what is playing now, so there is no download left to
-		// report; a label from the stream it took over from is stale.
-		r.download = ""
-	}
 	r.mu.Unlock()
 
 	if r.interactive {
@@ -143,8 +121,7 @@ func (r *roomPlayer) track(slot client.SinkTrack) {
 	r.print(slot)
 }
 
-// refresh reads where this member is, and asks what its download is doing while
-// its rendition is still arriving.
+// refresh reads where this member is in the song.
 func (r *roomPlayer) refresh(ctx context.Context) {
 	// The position is a read of the player, which is bounded so a player that
 	// has stopped answering cannot hold the line still: the room's clock is
@@ -158,53 +135,11 @@ func (r *roomPlayer) refresh(ctx context.Context) {
 	}
 	r.mu.Lock()
 	r.position = position
-	slot := r.slot
-	// Only a stream is asked about. It is the one case where the server still
-	// has something to prepare, and so the only one with a stage and numbers to
-	// report; a rendition the server already holds has nothing left to say, and
-	// a file on disk has nothing coming at all.
-	due := slot.Streaming && slot.VariantID != "" && r.media != nil &&
-		!r.reading && time.Since(r.lastRead) >= time.Second
-	if due {
-		r.reading = true
-	}
 	r.mu.Unlock()
-
-	if due {
-		// The read is a round trip, so it is not made on the drawing loop: a
-		// server that is slow must not stall the line.
-		go r.readDownload(ctx, slot.VariantID)
-	}
 }
 
-// readDownload records what a variant's download is doing, so the line says the
-// stage and its numbers rather than leaving the listener guessing.
-func (r *roomPlayer) readDownload(ctx context.Context, variantID string) {
-	defer func() {
-		r.mu.Lock()
-		r.reading = false
-		r.lastRead = time.Now()
-		r.mu.Unlock()
-	}()
-
-	readCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	label := ""
-	if status, err := r.media(readCtx, variantID); err == nil {
-		label = downloadLabel(status)
-	}
-
-	r.mu.Lock()
-	if r.slot.VariantID == variantID {
-		r.download = label
-	}
-	r.mu.Unlock()
-	r.draw()
-}
-
-// print says one line, when there is something new in it: a different song, the
-// file taking over from a stream, or the same song started again. A stream asked
-// for once more mid-song is not news, and neither is the same line twice.
+// print says one line, when there is something new in it: a different song, or
+// the same song started again. The same line twice is not news.
 func (r *roomPlayer) print(slot client.SinkTrack) {
 	// The participant hands a slot over from more than one goroutine - the loop
 	// that reconciles, and the goroutine a download finishes under - so a line
@@ -231,12 +166,11 @@ func (r *roomPlayer) print(slot client.SinkTrack) {
 	r.mu.Unlock()
 }
 
-// roomKey is what makes two slots the same telling: the song, the rendition, and
-// whether it is the server's stream or a file. The position is not part of it -
-// a stream asked for again further into the song is the same song - so a
-// restart is caught by the position going backwards instead.
+// roomKey is what makes two slots the same telling: the song and the rendition.
+// The position is not part of it, so a restart is caught by the position going
+// backwards instead.
 func roomKey(slot client.SinkTrack) string {
-	return slot.TrackID + "\x00" + slot.VariantID + "\x00" + strconv.FormatBool(slot.Streaming)
+	return slot.TrackID + "\x00" + slot.VariantID
 }
 
 // draw writes the line in place, which is only ever done on a terminal.
@@ -265,8 +199,6 @@ func (r *roomPlayer) line() string {
 		title:      r.slot.Title,
 		positionMs: r.position,
 		durationMs: r.slot.DurationMs,
-		streaming:  r.slot.Streaming,
-		download:   r.download,
 	})
 }
 
@@ -275,18 +207,11 @@ type roomStatus struct {
 	title      string
 	positionMs int64
 	durationMs int64
-	// streaming is true while what is playing is the server's own stream of a
-	// rendition that is not here yet: the song is being heard while its file is
-	// fetched behind it.
-	streaming bool
-	// download is the rendition's own download, already rendered, and empty when
-	// nothing is being fetched.
-	download string
 }
 
-// roomLine renders the whole of a member's line: the song, where the member is
-// in it, and what the rendition in hand is doing. The room's answer to the queue
-// player's status line, and what the tests pin.
+// roomLine renders the whole of a member's line: the song and where the member
+// is in it. The room's answer to the queue player's status line, and what the
+// tests pin.
 func roomLine(s roomStatus) string {
 	title := s.title
 	if title == "" {
@@ -302,15 +227,5 @@ func roomLine(s roomStatus) string {
 		length = formatDuration(s.durationMs)
 	}
 
-	var b strings.Builder
-	fmt.Fprintf(&b, "%-44s %s/%s", truncate(title, 44), where, length)
-	if s.streaming {
-		// The listener is not waiting for anything: the song is being heard from
-		// the provider's own stream while the file arrives.
-		b.WriteString("  streaming while the file arrives")
-	}
-	if s.download != "" {
-		fmt.Fprintf(&b, "  %s", s.download)
-	}
-	return b.String()
+	return fmt.Sprintf("%-44s %s/%s", truncate(title, 44), where, length)
 }

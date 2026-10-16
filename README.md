@@ -228,8 +228,10 @@ specification and the routes cannot drift apart.
 * `GET /api/v1/tracks/{id}`, `/variants`, `POST /tracks/{id}/resolve` — resolve
   attaches a downloadable rendition when a track only has metadata-only ones.
 * `POST /api/v1/media/{variantId}/download` — start or join a download
-  (idempotent); `GET /api/v1/media/{variantId}` streams the file with Range and
-  a sha256 ETag, and never starts work.
+  (idempotent); `GET /api/v1/media/{variantId}` serves the file the server holds
+  with Range, a sha256 ETag and `?start=<ms>` to begin part way in, and refuses a
+  variant that is not on disk yet (`409`, naming the download to start) — it
+  never starts work itself.
 * `POST /api/v1/library/import` — local files become first-class variants.
 * `GET/POST /api/v1/me/playlists...` — playlists, including positional edits.
 * `POST /api/v1/radio` — a station from a seed, mixed from the providers you name.
@@ -317,8 +319,8 @@ the real service is reachable.
 
 ## Writing a Sink (Discord bot)
 
-A **Sink** is playback: the CLI's sink drives mpv, a bot's sink streams the
-rendition into a voice channel. Everything else — what to play, when to start,
+A **Sink** is playback: the CLI's sink drives mpv, a bot's sink pushes the
+file into a voice channel. Everything else — what to play, when to start,
 how to stay in sync — is `client.Participant`.
 
 ```go

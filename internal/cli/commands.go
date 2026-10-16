@@ -594,10 +594,10 @@ func (a *App) roomJoin(ctx context.Context, roomID string) error {
 
 	a.printf("joined %s as %s; Ctrl-C to leave\n", roomID, room.MemberID)
 
-	// The member's own line: what the room is playing, where this client is in
-	// it, and what the rendition in hand is doing - the server's stream arriving
-	// while its download runs behind it, or the file once it has landed.
-	ui := newRoomPlayer(a.out, participant, a.client.MediaStatus)
+	// The member's own line: what the room is playing and where this client is
+	// in it. The rendition it plays is a file this member holds, fetched before
+	// it is played, so there is nothing arriving to report.
+	ui := newRoomPlayer(a.out, participant)
 	participant.OnTrack = ui.track
 	ui.start(ctx)
 	defer ui.stop()

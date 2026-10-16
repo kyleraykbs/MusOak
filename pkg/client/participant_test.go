@@ -543,8 +543,8 @@ func TestAuthFlowOverSDK(t *testing.T) {
 }
 
 // playedSongs is the tracks a sink was handed, in order, with a song's repeats
-// collapsed: a stream handing over to the file that just landed is one song
-// being played, not the order moving on.
+// collapsed: the same song reloaded is one song being played, not the order
+// moving on.
 func playedSongs(played []client.SinkTrack) []string {
 	var songs []string
 	for _, slot := range played {

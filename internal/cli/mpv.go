@@ -313,10 +313,10 @@ func (m *mpvProcess) stop(ctx context.Context) error {
 
 // waitForEnd blocks until the current file reaches its end. Only an end-file
 // that says the file ran out counts as one: loading a replacement emits end-file
-// with reason "stop", and that is the file being taken over by another one - a
-// stream handing over to the file that just landed - not the song being over.
-// Reading it as the end would skip the song the listener is hearing, because the
-// next end-file that arrives would look like the one that was waited for.
+// with reason "stop", and that is the file being taken over by another one, not
+// the song being over. Reading it as the end would skip the song the listener is
+// hearing, because the next end-file that arrives would look like the one that
+// was waited for.
 func (m *mpvProcess) waitForEnd(ctx context.Context) error {
 	for {
 		select {
@@ -335,9 +335,9 @@ func (m *mpvProcess) waitForEnd(ctx context.Context) error {
 				// now will end-file for itself.
 				continue
 			case "error":
-				// A file that would not load at all: a 404, a stream the server
-				// refused with 503, a container mpv cannot read. It is reported
-				// rather than passed off as the song finishing.
+				// A file that would not load at all: a 404, a URL the server
+				// refused, a container mpv cannot read. It is reported rather
+				// than passed off as the song finishing.
 				if event.FileError != "" {
 					return fmt.Errorf("musoak: mpv could not play it: %s", event.FileError)
 				}
@@ -398,18 +398,10 @@ var _ client.Seeker = (*MpvSink)(nil)
 var _ client.Positioner = (*MpvSink)(nil)
 
 // Play starts one slot and returns when what it was handed runs out or ctx ends.
-// What it is handed is a file on disk, the server's stream of a rendition that is
-// not here yet, or the file the server holds served over HTTP - mpv plays all
-// three, and only the first has a length to seek within.
+// What it is handed is always a file on disk: the server refuses a rendition it
+// has not stored, so a track is fetched before it is played.
 func (s *MpvSink) Play(ctx context.Context, track client.SinkTrack) error {
-	position := track.PositionMs
-	if track.Streaming {
-		// A stream already begins where the listener is: its request names the
-		// position, and it has no length and no ranges to seek within, so
-		// seeking it would ask for bytes the URL does not name.
-		position = 0
-	}
-	if err := s.process.loadReplace(ctx, track.Path, position); err != nil {
+	if err := s.process.loadReplace(ctx, track.Path, track.PositionMs); err != nil {
 		return err
 	}
 	return s.process.waitForEnd(ctx)

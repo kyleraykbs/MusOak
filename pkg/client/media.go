@@ -6,8 +6,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 )
@@ -71,105 +69,13 @@ func (b *idleBody) Close() error {
 	return b.body.Close()
 }
 
-// StreamInfo is what a streamed answer says about itself: whether the server is
-// streaming a variant it has not finished downloading, the track's length when
-// the server knows it, and, for a track-level stream, the rendition the server
-// chose. A stream carries no length of its own - no Content-Length, no ETag, no
-// ranges - so this is where a client draws a timeline for audio whose own length
-// is still unknown.
-type StreamInfo struct {
-	// VariantID is the rendition the server chose for a track-level stream,
-	// from X-Musoak-Variant. It is empty when the request named the rendition
-	// itself, or when the answer did not carry the header.
-	VariantID string
-	// Streaming is true when the answer is a source stream rather than the
-	// stored rendition; a request for a finished file is not streamed.
-	Streaming bool
-	// DurationMs is the track's length in milliseconds, zero when the server
-	// does not know it.
-	DurationMs int64
-}
-
-// streamResponse performs a media GET whose first byte may be slow - a stream
-// starts a provider fetch - and returns the raw response so the caller reads
-// what its headers say. The short request timeout is dropped: the header
-// arrives with the source's first bytes, and a slow provider is not a slow
-// request.
-func (c *Client) streamResponse(ctx context.Context, url string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	c.decorate(req)
-
-	hc := *c.http
-	hc.Timeout = 0
-	resp, err := hc.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		defer resp.Body.Close()
-		return nil, decodeError(resp)
-	}
-	return resp, nil
-}
-
-// streamInfoFrom reads what a media or track-stream answer says about itself
-// from its headers, so both questions are answered by one reading.
-func streamInfoFrom(resp *http.Response) StreamInfo {
-	info := StreamInfo{
-		VariantID: strings.TrimSpace(resp.Header.Get("X-Musoak-Variant")),
-		Streaming: resp.Header.Get("X-Musoak-Stream") != "",
-	}
-	if raw := strings.TrimSpace(resp.Header.Get("X-Musoak-Duration")); raw != "" {
-		if ms, err := strconv.ParseInt(raw, 10, 64); err == nil && ms > 0 {
-			info.DurationMs = ms
-		}
-	}
-	return info
-}
-
-// MediaStreamInfo asks what a variant's URL would answer and reads only the
-// headers: whether it is streaming, and how long the track is. The audio is not
-// read and the response is closed at once, so this is a probe for the numbers a
-// stream cannot carry, not a transfer. startMs should be the position the
-// stream will actually be played from, so the length describes the song it is
-// playing.
-func (c *Client) MediaStreamInfo(ctx context.Context, variantID string, startMs int64) (StreamInfo, error) {
-	resp, err := c.streamResponse(ctx, c.MediaURL(variantID, startMs))
-	if err != nil {
-		return StreamInfo{}, err
-	}
-	defer resp.Body.Close()
-	return streamInfoFrom(resp), nil
-}
-
-// TrackStreamInfo asks the server to pick and stream a rendition of a track the
-// caller knows only by id, and reads only the headers: which rendition the
-// server chose, whether it is streaming, and how long the track is. The audio is
-// not read and the response is closed at once. This is where a client learns
-// X-Musoak-Variant - the rendition it could not name itself - so it can hand the
-// player TrackStreamURL now and swap to that rendition's MediaURL later.
-func (c *Client) TrackStreamInfo(ctx context.Context, trackID string, startMs int64) (StreamInfo, error) {
-	resp, err := c.streamResponse(ctx, c.TrackStreamURL(trackID, startMs))
-	if err != nil {
-		return StreamInfo{}, err
-	}
-	defer resp.Body.Close()
-	return streamInfoFrom(resp), nil
-}
-
-// Sink plays a rendition. The CLI's sink drives a local player; a Discord
-// bot's sink streams the file into a voice channel. Nothing in this package
-// cares which.
+// Sink plays a file. The CLI's sink drives a local player; a Discord bot's sink
+// pushes the file into a voice channel. Nothing in this package cares which.
 type Sink interface {
-	// Play starts what the track names and returns when it finishes or ctx ends:
-	// a file this client holds, or the server's own answer for a rendition it
-	// does not - a stream, which begins at the position in the track rather than
-	// being seeked to it, or a stored file served over HTTP, which is seeked.
-	// The participant advances to the next song itself when it returns, and a
-	// stream-taking-over handover arrives as one more Play of the same track.
+	// Play starts the file the track names and returns when it finishes or ctx
+	// ends. What is handed over is always a file on this machine: a rendition
+	// the server has not stored is fetched first, never played from the provider.
+	// The participant advances to the next song itself when Play returns.
 	Play(ctx context.Context, track SinkTrack) error
 	Stop(ctx context.Context) error
 }
@@ -191,29 +97,19 @@ type Positioner interface {
 	PositionMs(ctx context.Context) (int64, error)
 }
 
-// SinkTrack is one rendition handed to a Sink: a file this client holds, or,
-// when it does not hold it yet, the server's own answer for it.
+// SinkTrack is one rendition handed to a Sink: a file this client holds.
 type SinkTrack struct {
 	TrackID   string
 	VariantID string
 	// Title is the song's name, for a sink that says what it is playing.
 	Title string
-	// Path is what to play: the file on disk, or a URL of the server's.
+	// Path is the file on disk to play.
 	Path string
 	// DurationMs is the song's length: the file's own once it is here, and the
-	// length the room reports while the rendition is still arriving.
+	// length the room reports when the file's own is still unknown.
 	DurationMs int64
-	// PositionMs is where in the song playback should begin. A file is played
-	// from there; a stream already begins there - the URL says so - because a
-	// stream has no length to seek within.
+	// PositionMs is where in the song playback should begin; a sink seeks there.
 	PositionMs int64
-	// Streaming is true when Path is the server's stream of a rendition it has
-	// not finished preparing: a copy of the source arriving now, marked
-	// X-Musoak-Stream, with no length of its own and no ranges. A sink must not
-	// seek one - PositionMs is where in the song it begins, not where to jump
-	// to - and must not read its end as the song ending, because the file
-	// behind it takes over the moment it lands.
-	Streaming bool
 }
 
 // Participant options.
@@ -241,23 +137,15 @@ const (
 	// resyncEvery forever.
 	maxResyncBackoff = 2 * time.Minute
 
-	// streamGap is the least time between two requests for one song's stream. A
-	// stream request buys the provider's own start-up, so a stream is not
-	// re-requested on every beat even when the drift rule would like one.
-	streamGap = 2 * time.Second
-	// streamRetryStep and streamRetryMax bound the wait before a stream that
-	// would not play is asked for again. The download behind it is usually the
-	// answer, and the waits double, so a provider that is refusing is not asked
-	// once a beat while its file is still coming.
-	streamRetryStep = 500 * time.Millisecond
-	streamRetryMax  = 10 * time.Second
+	// fetchRetryStep and fetchRetryMax bound the wait before a song whose fetch
+	// failed is tried again. The waits double, so a provider that is refusing is
+	// not asked once a beat while the room stays on the same song.
+	fetchRetryStep = 500 * time.Millisecond
+	fetchRetryMax  = 10 * time.Second
 	// startWatchLimit is how long a load is watched for the sink to start
-	// playing before its cost is left unmeasured, and startWatchStream is the
-	// same for a stream: nothing that has not started by then is going to. A
-	// stream is given longer because its start is somebody else's provider
-	// beginning to send, not this machine opening a file.
-	startWatchLimit  = 5 * time.Second
-	startWatchStream = 10 * time.Second
+	// playing before its cost is left unmeasured: nothing that has not started
+	// by then is going to.
+	startWatchLimit = 5 * time.Second
 )
 
 // Participant follows a room on behalf of one member. The server is the room's
@@ -298,16 +186,9 @@ type Participant struct {
 	// to the sink being ready; it is added to the room's position when starting
 	// a load so the audible start lands where the room will be, not where it was.
 	loadLatencyMs int64
-	// streamLatencyMs is the same estimate for a stream, and a separate one on
-	// purpose: a file is this device reading one, while a stream is the
-	// provider starting to send it, and a file load scheduled a stream's two
-	// seconds ahead would start the song two seconds past the room.
-	streamLatencyMs int64
-	// variants is the rendition this member chose per track - and whether the
-	// server is still preparing it - so a stream re-requested on a seek costs
-	// no round trip, and a track whose file never lands is not resolved again
-	// on every beat.
-	variants map[string]rendition
+	// variants is the rendition this member chose per track, so the choice is
+	// not resolved again on every beat while its file is still being fetched.
+	variants map[string]string
 	// absurdSaid is whether the too-large-to-correct warning has been said for
 	// the song playing.
 	absurdSaid bool
@@ -335,7 +216,7 @@ type localPlayback struct {
 	trackID string
 	// entry is the rendition in hand. Its VariantID is the one being played and
 	// fetched; its Path is the file once that file is here, and is empty while
-	// the sink holds the server's own answer instead.
+	// the file is still being fetched.
 	entry      CacheEntry
 	paused     bool
 	playing    bool
@@ -343,31 +224,17 @@ type localPlayback struct {
 	cancel     context.CancelFunc
 	generation int
 
-	// durationMs is how long the song runs. A rendition with no file here
-	// cannot say, so this is the figure the room reports, and it is what a
-	// streamed timeline and the follower rule are drawn from until the file
+	// durationMs is how long the song runs. A rendition whose file is not here
+	// yet cannot say, so this is the figure the room reports until the file
 	// lands and its own length can be read.
 	durationMs int64
-	// streaming is true while the sink holds the server's stream of a rendition
-	// that is not here yet. A stream is not a file: it has no length to seek
-	// within, so moving it means asking for it at another position again, and
-	// its end is the provider's bytes stopping rather than the song being over.
-	streaming bool
-	// streamStartMs is where in the song the stream's bytes begin - the
-	// ?start= its URL carries. A sink reports a stream's playhead relative to
-	// that beginning, so this is what turns it into a position in the song.
-	streamStartMs int64
-	// streamNextAt is the earliest another stream of this song may be asked
-	// for, and streamTries counts the attempts that would not play: each
-	// request costs the provider's start-up, so they are spaced, and a run of
-	// failures backs off.
-	streamNextAt time.Time
-	streamTries  int
-	// resolving is whether the rendition is being chosen right now, and
-	// fetching whether its file is being downloaded: both are goroutines this
-	// participant owns, never work the reconcile loop waits for.
-	resolving bool
-	fetching  bool
+	// fetching is whether this song's file is being fetched right now, in a
+	// goroutine this participant owns; fetchNextAt is the earliest a fetch that
+	// failed may be tried again, and fetchTries counts the failures so the wait
+	// backs off. The reconcile loop never waits for any of it.
+	fetching    bool
+	fetchNextAt time.Time
+	fetchTries  int
 }
 
 // length is how long the song runs: the file's own length once it is here, and
@@ -377,17 +244,6 @@ func (l *localPlayback) length() int64 {
 		return l.entry.DurationMs
 	}
 	return l.durationMs
-}
-
-// rendition is what this member will play and fetch for one track: the variant
-// it chose, and whether the server is still preparing it.
-type rendition struct {
-	variantID string
-	// streaming is whether the server is still preparing this variant. One it
-	// already holds is answered with the stored file - a file over HTTP, which
-	// a player seeks to a position - where one it is still preparing is a
-	// stream, beginning at the position its request names.
-	streaming bool
 }
 
 // NewParticipant returns a participant for a room.
@@ -405,7 +261,7 @@ func NewParticipant(room *RoomClient, cache *Cache, sink Sink, logger *slog.Logg
 		driftTolerance: defaultDriftToleranceMs,
 		played:         map[string]bool{},
 		warming:        map[string]bool{},
-		variants:       map[string]rendition{},
+		variants:       map[string]string{},
 		warmSlots:      make(chan struct{}, warmConcurrency),
 	}
 }
@@ -672,7 +528,7 @@ func (p *Participant) reconcile(ctx context.Context) {
 			// caught up yet: its state is a beat behind, not a correction.
 			return
 		}
-		p.load(ctx, current, p.startAt(current, p.willStream(item.TrackID)))
+		p.load(ctx, current, p.startAt(current))
 		return
 	}
 	if localEnded {
@@ -680,7 +536,7 @@ func (p *Participant) reconcile(ctx context.Context) {
 		return
 	}
 	if !localPlaying {
-		p.load(ctx, current, p.startAt(current, p.willStream(item.TrackID)))
+		p.load(ctx, current, p.startAt(current))
 		return
 	}
 	if localPaused {
@@ -690,54 +546,27 @@ func (p *Participant) reconcile(ctx context.Context) {
 	p.correctDrift(ctx, local, current)
 }
 
-// willStream reports whether this member's next load of the track will be the
-// server's stream of it rather than a file. It is what picks the start
-// estimate, so it answers from the rendition this member already chose when
-// there is one, and otherwise from whether anything is on disk.
-func (p *Participant) willStream(trackID string) bool {
-	if _, ok := p.cache.LookupTrack(trackID); ok {
-		return false
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if chosen, ok := p.variants[trackID]; ok {
-		return chosen.streaming
-	}
-	// Nothing here and nothing chosen yet: what the server answers with is a
-	// stream unless it turns out to hold the file already.
-	return true
-}
-
 // startAt is where a load should start so it lands on the room's position: the
-// place the room will be once the load has taken its smoothed time. A stream
-// and a file do not take the same time to start, so each is drawn from its own
-// estimate.
-func (p *Participant) startAt(current *RoomPlayback, stream bool) int64 {
+// place the room will be once the load has taken its smoothed time.
+func (p *Participant) startAt(current *RoomPlayback) int64 {
 	p.mu.Lock()
 	latency := p.loadLatencyMs
-	if stream {
-		latency = p.streamLatencyMs
-	}
 	p.mu.Unlock()
 	return current.PositionAt(p.serverNow() + latency)
 }
 
 // load puts the room's song on the sink at the given position. A rendition this
-// member already holds is played from its file; one it does not is handed to
-// the sink as the server's own answer for it - its stream, beginning where the
-// room is - so the song is heard in the time the provider takes to start
-// sending instead of after the whole download, with the file fetched behind it
-// and taken over the moment it lands (see playFromServer).
+// member already holds is played from its file; one it does not is fetched
+// first and played when the file lands, because the server serves only the
+// renditions it has already stored - it refuses a play of anything else. The
+// fetch runs in a goroutine this participant owns: nothing on the event and
+// drift loop ever waits for a byte, because a download on this loop is what
+// froze it - seconds to minutes in which no event, no drift correction and no
+// command is read, and the socket back-fills until the server drops the member.
 //
-// Nothing here fetches, resolves or waits: it runs on the event and drift loop,
-// and both the server's own fetch and this client's download belong to
-// goroutines this participant owns. A download on this loop is what froze it -
-// seconds to minutes in which no event, no drift correction and no command is
-// read, and the socket back-fills until the server drops the member.
-//
-// If a fresh file, the load is timed from issue through to the sink actually
-// playing and the estimate is smoothed, so the next load can be started in time
-// to land on the room's beat.
+// A load from a file this client holds is timed from issue through to the sink
+// actually playing, and the estimate is smoothed, so the next load can be
+// started in time to land on the room's beat.
 func (p *Participant) load(ctx context.Context, current *RoomPlayback, expected int64) {
 	item := current.Item
 	p.mu.Lock()
@@ -746,9 +575,9 @@ func (p *Participant) load(ctx context.Context, current *RoomPlayback, expected 
 
 	if local != nil && local.itemID == item.ID {
 		if local.entry.Path == "" {
-			// The same song, still not here: it is asked for again rather than
-			// loaded, because a stream is what the sink will play.
-			p.playFromServer(ctx, local, current, expected)
+			// The same song, still not here: the fetch that is bringing it
+			// plays it the moment it lands.
+			p.fetchForPlay(ctx, local)
 			return
 		}
 		p.play(ctx, local, item, expected, time.Time{})
@@ -765,12 +594,11 @@ func (p *Participant) load(ctx context.Context, current *RoomPlayback, expected 
 		return
 	}
 
-	// Not here yet: the sink hears the server's stream of it while the file
-	// arrives, which is the whole point of not waiting for the download.
+	// Not here yet: fetch it, and play the file when it lands.
 	p.setLocal(&localPlayback{
 		itemID: item.ID, trackID: item.TrackID, durationMs: roomLength(current),
 	})
-	p.playFromServer(ctx, p.local(), current, expected)
+	p.fetchForPlay(ctx, p.local())
 }
 
 // roomLength is how long the room's current song runs, as the room reports it:
@@ -785,137 +613,79 @@ func roomLength(current *RoomPlayback) int64 {
 	return current.Item.DurationMs
 }
 
-// playFromServer puts the room's song on the sink from the server's own answer
-// for it - its stream of a rendition that is not downloaded yet, or the file it
-// holds - and has the file fetched behind it so the sink can take it over when
-// it lands. The song is heard now rather than when the download finishes.
+// fetchForPlay fetches the rendition of the room's song that this member does
+// not hold, so it can be played as a file. It never waits: the round trip that
+// chooses the rendition and the transfer that fetches it both run in a
+// goroutine this participant owns, and when the file lands the song is loaded
+// at the position the room will be at by then.
 //
-// It never waits for anything: asking the sink to play a URL is one message to
-// it, and both the round trip that chooses the rendition and the transfer that
-// fetches it run in goroutines this participant owns. The reconcile loop only
-// arranges them.
-//
-// expected is where in the song this member should begin. A stream starts at
-// the position its request names rather than seeking to it, so that is where
-// the room will be when the audio actually starts.
-func (p *Participant) playFromServer(ctx context.Context, local *localPlayback, current *RoomPlayback, expected int64) {
-	if local == nil {
+// A fetch that fails is retried from the loop with a doubling wait, so a
+// provider that is refusing is not asked once a beat while the room stays on
+// the same song.
+func (p *Participant) fetchForPlay(ctx context.Context, local *localPlayback) {
+	if local == nil || local.trackID == "" {
 		return
 	}
-	item := current.Item
-	// Nothing to hear past the end of the song: the room is about to move on,
-	// and a fetch that begins at the last second of a track plays nothing.
-	if length := local.length(); length > 0 && expected >= length {
-		return
-	}
-
+	trackID := local.trackID
 	p.mu.Lock()
-	switch {
-	case p.playing != local, local.entry.Path != "":
-		// The song moved on under this, or the file landed while it was being
-		// arranged.
-		p.mu.Unlock()
-		return
-	case time.Now().Before(local.streamNextAt):
-		// A stream was asked for too recently to ask again: each request buys
-		// the provider's own start-up, so they are spaced rather than made
-		// every beat.
+	if p.playing != local || local.entry.Path != "" || local.fetching ||
+		time.Now().Before(local.fetchNextAt) {
 		p.mu.Unlock()
 		return
 	}
-	if local.entry.VariantID != "" {
-		// The rendition is already this member's: this is the same song asked
-		// for again, at the position the caller wants.
-		local.arrange(expected)
-		variantID := local.entry.VariantID
-		p.mu.Unlock()
-		// Timed from the ask: what is measured is how long this rendition takes
-		// to start being heard, which is the provider beginning to send it.
-		p.play(ctx, local, item, expected, time.Now())
-		p.fetchBehind(ctx, local, item, variantID)
-		return
-	}
-	if local.resolving {
-		p.mu.Unlock()
-		return
-	}
-	local.resolving = true
+	local.fetching = true
 	p.mu.Unlock()
 
-	// Which rendition this member plays and fetches is one round trip away, and
-	// the loop is not the place to spend it.
 	go func() {
-		chosen, err := p.chooseRendition(ctx, item.TrackID)
-		// The room has moved while the rendition was being chosen: begin where
-		// it will be once the sink has it, not where it was when the loop asked.
-		// Drawn before the lock, because the estimate is read under it.
-		start := int64(0)
+		// The transfer outlives the loop's own context: a skip or a room change
+		// must not strand a half-written file, exactly as the server detaches
+		// its own transfer from the request that started it.
+		fetchCtx := context.WithoutCancel(ctx)
+		variantID, err := p.chooseRendition(fetchCtx, trackID)
+		var entry CacheEntry
 		if err == nil {
-			start = p.startAt(current, chosen.streaming)
+			entry, err = p.fetch(fetchCtx, variantID, trackID)
 		}
 
 		p.mu.Lock()
-		local.resolving = false
+		local.fetching = false
 		if err != nil {
-			// Nothing to hand the sink: the room's next beat tries again, and
-			// the wait doubles while it keeps failing.
-			local.streamTries++
-			local.streamNextAt = time.Now().Add(retryWait(local.streamTries))
+			local.fetchTries++
+			local.fetchNextAt = time.Now().Add(retryWait(local.fetchTries))
 			p.mu.Unlock()
-			p.logger.Warn("participant: no rendition to play the room's song from",
-				"track", item.TrackID, "error", err)
+			p.logger.Warn("participant: could not fetch the room's song", "track", trackID, "error", err)
 			return
 		}
-		if p.playing != local || local.entry.Path != "" {
+		if p.playing != local {
 			p.mu.Unlock()
 			return
 		}
-		local.entry.VariantID = chosen.variantID
-		local.streaming = chosen.streaming
-		local.arrange(start)
+		local.entry = entry
+		local.fetchTries = 0
+		local.fetchNextAt = time.Time{}
+		current := p.current
 		p.mu.Unlock()
 
-		// Timed from the ask, so the next stream of this member can be asked
-		// for at the position the room will be at when it starts: what is
-		// measured is the provider's own start-up, not the round trip that
-		// chose the rendition.
-		p.play(ctx, local, item, start, time.Now())
-		p.fetchBehind(ctx, local, item, chosen.variantID)
+		if current != nil && !current.Paused {
+			p.load(ctx, current, p.startAt(current))
+		}
 	}()
 }
 
-// arrange records how the sink will be asked to play this song on the next
-// play: a stream begins at the position its URL names, a file the server holds
-// is seeked to the position like any other, and either way the next request for
-// this song is spaced - a stream request buys the provider's own start-up.
-//
-// The caller holds p.mu.
-func (local *localPlayback) arrange(expected int64) {
-	local.streamNextAt = time.Now().Add(streamGap)
-	if local.streaming {
-		local.streamStartMs = expected
-		return
-	}
-	local.streamStartMs = 0
-}
-
-// retryWait is how long the nth attempt at something that would not play waits:
-// half a second, doubling to ten, which is about the time a download behind a
-// stream needs to land.
+// retryWait is how long the nth retry of a fetch that failed waits: half a
+// second, doubling to ten.
 func retryWait(tries int) time.Duration {
-	wait := streamRetryStep
-	for i := 1; i < tries && wait < streamRetryMax; i++ {
+	wait := fetchRetryStep
+	for i := 1; i < tries && wait < fetchRetryMax; i++ {
 		wait *= 2
 	}
-	return min(wait, streamRetryMax)
+	return min(wait, fetchRetryMax)
 }
 
 // watchStart times a load through to the sink actually playing: from the moment
 // the load was issued to the first position the sink reports at or past the
 // start. The sink's own start latency is what the room's boundary has to absorb,
-// and it is not observable any other way through the Sink interface. A stream
-// and a file are timed into their own estimates, because they are not the same
-// quantity.
+// and it is not observable any other way through the Sink interface.
 func (p *Participant) watchStart(ctx context.Context, issuedAt time.Time, expected int64, local *localPlayback, generation int) {
 	positioner, ok := p.sink.(Positioner)
 	if !ok {
@@ -925,32 +695,18 @@ func (p *Participant) watchStart(ctx context.Context, issuedAt time.Time, expect
 	if target < 50 {
 		target = 50
 	}
-	p.mu.Lock()
-	limit := startWatchLimit
-	if local.streaming {
-		limit = startWatchStream
-	}
-	p.mu.Unlock()
-	// Nothing that has not started in that long is going to: the estimate keeps
-	// its old value rather than waiting longer.
-	deadline := time.Now().Add(limit)
+	// Nothing that has not started in startWatchLimit is going to: the estimate
+	// keeps its old value rather than waiting longer.
+	deadline := time.Now().Add(startWatchLimit)
 	for time.Now().Before(deadline) {
 		p.mu.Lock()
 		same := p.playing == local && p.playing.generation == generation
-		var stream bool
-		var startOffset int64
-		if same {
-			stream, startOffset = local.streaming, local.streamStartMs
-		}
 		p.mu.Unlock()
 		if !same {
 			return
 		}
-		// A stream's playhead is relative to the bytes the URL began at, so the
-		// offset it started at is added back: what is timed is the sink reaching
-		// the position in the song it was asked for.
-		if position, err := positioner.PositionMs(ctx); err == nil && position+startOffset >= target {
-			p.measureLoad(time.Since(issuedAt), stream)
+		if position, err := positioner.PositionMs(ctx); err == nil && position >= target {
+			p.measureLoad(time.Since(issuedAt))
 			return
 		}
 		select {
@@ -963,11 +719,8 @@ func (p *Participant) watchStart(ctx context.Context, issuedAt time.Time, expect
 
 // measureLoad folds one load's duration into the smoothed estimate for what it
 // timed. A load from cache costs only the sink's own start, so the estimate
-// settles on what starting a song from this device actually takes; a stream
-// costs the provider starting to send it, which is a different and much larger
-// figure - a file load scheduled a stream's two seconds ahead would start the
-// song two seconds past the room.
-func (p *Participant) measureLoad(took time.Duration, stream bool) {
+// settles on what starting a song from this device actually takes.
+func (p *Participant) measureLoad(took time.Duration) {
 	sample := took.Milliseconds()
 	if sample < 0 || sample > 10_000 {
 		// A wild sample is a stalled fetch, not a load time: leave the estimate
@@ -975,42 +728,28 @@ func (p *Participant) measureLoad(took time.Duration, stream bool) {
 		return
 	}
 	p.mu.Lock()
-	estimate := &p.loadLatencyMs
-	if stream {
-		estimate = &p.streamLatencyMs
-	}
-	if *estimate == 0 {
-		*estimate = sample
+	if p.loadLatencyMs == 0 {
+		p.loadLatencyMs = sample
 	} else {
-		*estimate = (*estimate*3 + sample) / 4
+		p.loadLatencyMs = (p.loadLatencyMs*3 + sample) / 4
 	}
 	p.mu.Unlock()
 }
 
 // play hands the sink the song at the given position and runs it as an ordinary
-// queue entry: a file this member holds, or the server's own answer for the
-// rendition - a stream of a source the server is still fetching, or the file it
-// holds, which is a file over HTTP. A fresh load (issuedAt non-zero) is watched
-// through to the sink playing so its cost is measured; an already-loaded file
-// has nothing to measure.
+// queue entry: a file this client holds. A fresh load (issuedAt non-zero) is
+// watched through to the sink playing so its cost is measured; an already-loaded
+// file has nothing to measure.
 func (p *Participant) play(ctx context.Context, local *localPlayback, item QueueItem, expected int64, issuedAt time.Time) {
-	if local == nil {
+	if local == nil || local.entry.Path == "" {
 		return
 	}
 	if expected < 0 {
 		expected = 0
 	}
-	source, streaming := local.entry.Path, false
-	if source == "" {
-		if local.entry.VariantID == "" {
-			// No rendition chosen yet: there is nothing to hand a sink.
-			return
-		}
-		source, streaming = p.room.client.MediaURL(local.entry.VariantID, local.streamStartMs), local.streaming
-	}
 	slot := SinkTrack{
 		TrackID: local.trackID, VariantID: local.entry.VariantID, Title: item.Title,
-		Path: source, DurationMs: local.length(), PositionMs: expected, Streaming: streaming,
+		Path: local.entry.Path, DurationMs: local.length(), PositionMs: expected,
 	}
 	if p.OnTrack != nil {
 		p.OnTrack(slot)
@@ -1034,27 +773,17 @@ func (p *Participant) play(ctx context.Context, local *localPlayback, item Queue
 		finished := playCtx.Err() == nil
 		p.mu.Lock()
 		same := p.playing == local && p.playing.generation == generation
-		stream := false
 		if same {
-			stream = local.streaming
 			local.playing = false
 			// A file that ran out is the song over, and this client moves on by
 			// itself - the room's next beat corrects it if the room disagrees.
-			// A stream that ran out is the provider's bytes stopping: the room
-			// is the only one that says when the song is over, so a stream is
-			// asked for again rather than run past, and one that would not play
-			// at all is waited for rather than skipped.
-			local.ended = finished && !stream
-			if stream {
-				local.streamTries++
-				local.streamNextAt = time.Now().Add(retryWait(local.streamTries))
-			}
+			local.ended = finished
 		}
 		p.mu.Unlock()
 		if err != nil && finished {
 			p.logger.Warn("participant: playback failed", "variant", slot.VariantID, "error", err)
 		}
-		if finished && same && !stream {
+		if finished && same {
 			p.advanceLocal(ctx, item.ID)
 		}
 	}()
@@ -1064,72 +793,8 @@ func (p *Participant) play(ctx context.Context, local *localPlayback, item Queue
 			go p.watchStart(playCtx, issuedAt, expected, local, generation)
 		} else {
 			// No playhead to watch: the load's own cost is all there is to time.
-			p.measureLoad(time.Since(issuedAt), streaming)
+			p.measureLoad(time.Since(issuedAt))
 		}
-	}
-}
-
-// fetchBehind gets the rendition a stream is playing onto disk, so the sink can
-// be handed the file the moment it lands. The transfer is detached from the
-// caller's context - a skip, a room change or quitting must not strand a
-// half-written file, exactly as the server detaches its own transfer from the
-// request that started it - and it is the download the stream already started on
-// the server's side that this joins.
-func (p *Participant) fetchBehind(ctx context.Context, local *localPlayback, item QueueItem, variantID string) {
-	p.mu.Lock()
-	if local.fetching || p.playing != local {
-		p.mu.Unlock()
-		return
-	}
-	local.fetching = true
-	p.mu.Unlock()
-
-	go func() {
-		defer func() {
-			p.mu.Lock()
-			local.fetching = false
-			p.mu.Unlock()
-		}()
-		entry, err := p.fetch(context.WithoutCancel(ctx), variantID, item.TrackID)
-		if err != nil {
-			if entry.Path == "" {
-				p.logger.Warn("participant: could not fetch the rendition being streamed",
-					"track", item.TrackID, "variant", variantID, "error", err)
-				return
-			}
-			// The file is here and playable; only indexing it failed.
-			p.logger.Warn("participant: index the fetched rendition", "track", item.TrackID, "error", err)
-		}
-		p.handOver(ctx, local, item, entry)
-	}()
-}
-
-// handOver moves the sink from what the server was sending onto the file that
-// just landed, at the position the music had reached. The file is the whole song
-// while a stream began part-way in, so the offset the stream began at is added
-// back to the sink's playhead before the file starts there: the handover is the
-// same moment of the song rather than a jump in it.
-func (p *Participant) handOver(ctx context.Context, local *localPlayback, item QueueItem, entry CacheEntry) {
-	// Read the playhead first: the sink has to be aiming at the file from where
-	// the stream is now, and the stream is still playing while this is read.
-	position := p.playhead(ctx, local)
-
-	p.mu.Lock()
-	if p.playing != local || local.entry.Path != "" {
-		// The member has moved on, or the file is already what is playing.
-		p.mu.Unlock()
-		return
-	}
-	wasPaused := local.paused
-	local.entry = entry
-	local.streaming = false
-	local.streamStartMs = 0
-	local.streamNextAt = time.Time{}
-	p.mu.Unlock()
-
-	p.play(ctx, local, item, position, time.Time{})
-	if wasPaused {
-		p.pause(ctx, local, true)
 	}
 }
 
@@ -1192,9 +857,7 @@ func (p *Participant) clearAdvancing(itemID string) {
 	p.mu.Unlock()
 }
 
-// correctDrift nudges the sink back onto the room's position. A file is seeked
-// there; a stream, which has no length and no ranges to seek within, is asked
-// for again at the room's position, which is the only move it has.
+// correctDrift nudges the sink back onto the room's position with a seek.
 func (p *Participant) correctDrift(ctx context.Context, local *localPlayback, current *RoomPlayback) {
 	positioner, ok := p.sink.(Positioner)
 	seeker, canSeek := p.sink.(Seeker)
@@ -1213,7 +876,7 @@ func (p *Participant) correctDrift(ctx context.Context, local *localPlayback, cu
 	p.mu.Lock()
 	previous, previousItem := p.lastExpected, p.lastItemID
 	p.lastExpected, p.lastItemID = expected, local.itemID
-	start, streaming, nextAt, tolerance := local.streamStartMs, local.streaming, local.streamNextAt, p.driftTolerance
+	tolerance := p.driftTolerance
 	p.mu.Unlock()
 	roomJumped := previousItem == local.itemID && absMs(expected-previous) > roomSeekJumpMs
 	if roomJumped {
@@ -1226,13 +889,10 @@ func (p *Participant) correctDrift(ctx context.Context, local *localPlayback, cu
 		// room to move, which is what "a song ends slightly early" means.
 		return
 	}
-	raw, err := positioner.PositionMs(ctx)
+	got, err := positioner.PositionMs(ctx)
 	if err != nil {
 		return
 	}
-	// A stream's playhead is relative to the bytes its URL began at: every
-	// position here is a position in the song.
-	got := raw + start
 	drift := absMs(got - expected)
 	if drift <= tolerance {
 		return
@@ -1244,23 +904,6 @@ func (p *Participant) correctDrift(ctx context.Context, local *localPlayback, cu
 	// for the room to move instead of tearing the song apart every second.
 	if drift > absurdDriftMs && !roomJumped {
 		p.sayAbsurdDrift(got, expected)
-		return
-	}
-	if streaming {
-		if raw <= 0 {
-			// The stream has not played a byte yet: what the first beats measure
-			// is the provider starting to send, not a drift, and asking for it
-			// again only starts the wait over.
-			return
-		}
-		if time.Now().Before(nextAt) {
-			// A request buys the provider's start-up, so a correction waits its
-			// turn instead of being made on every beat.
-			return
-		}
-		p.logger.Debug("participant: the stream is off the room; asking for it again",
-			"drift_ms", got-expected, "got_ms", got, "expected_ms", expected)
-		p.playFromServer(ctx, local, current, p.startAt(current, true))
 		return
 	}
 	if !canSeek {
@@ -1281,36 +924,18 @@ func absMs(ms int64) int64 {
 	return ms
 }
 
-// sinkPosition is where in the song this member's own player is: the sink's
-// playhead, with the offset a stream began at added back. A stream's playhead is
-// relative to the bytes it was handed, and every position this package compares
-// is a position in the song.
-func (p *Participant) sinkPosition(ctx context.Context, local *localPlayback) (int64, bool) {
+// sinkPosition is where in the song this member's own player is, when its sink
+// can say.
+func (p *Participant) sinkPosition(ctx context.Context) (int64, bool) {
 	positioner, ok := p.sink.(Positioner)
 	if !ok {
 		return 0, false
 	}
-	raw, err := positioner.PositionMs(ctx)
+	position, err := positioner.PositionMs(ctx)
 	if err != nil {
 		return 0, false
 	}
-	p.mu.Lock()
-	start := int64(0)
-	if local != nil {
-		start = local.streamStartMs
-	}
-	p.mu.Unlock()
-	return raw + start, true
-}
-
-// playhead is where in the song this member is, for the purpose of taking over
-// from what it is playing: its own player where the sink can say, and the room's
-// position - the clock this member is meant to sit on - where it cannot.
-func (p *Participant) playhead(ctx context.Context, local *localPlayback) int64 {
-	if position, ok := p.sinkPosition(ctx, local); ok {
-		return position
-	}
-	return p.Position()
+	return position, true
 }
 
 // absurdDriftMs is how far apart two positions have to be before correcting
@@ -1348,19 +973,16 @@ func (p *Participant) ensureTrack(ctx context.Context, trackID string) (CacheEnt
 	if err != nil {
 		return CacheEntry{}, err
 	}
-	return p.fetch(ctx, chosen.variantID, trackID)
+	return p.fetch(ctx, chosen, trackID)
 }
 
 // chooseRendition is the rendition this member will play and fetch for a track:
 // the copy in hand, else the first downloadable rendition the server offers,
-// which is this member's own choice of version. It reports whether the server is
-// still preparing that rendition, because a stream begins at the position its
-// request names where the stored file a server already holds is a file over
-// HTTP that a player seeks. The answer is remembered per track, so a stream
-// re-requested on a correction costs no round trip.
-func (p *Participant) chooseRendition(ctx context.Context, trackID string) (rendition, error) {
+// which is this member's own choice of version. The answer is remembered per
+// track, so it is not resolved again on every beat while its file is fetched.
+func (p *Participant) chooseRendition(ctx context.Context, trackID string) (string, error) {
 	if entry, ok := p.cache.LookupTrack(trackID); ok {
-		return rendition{variantID: entry.VariantID}, nil
+		return entry.VariantID, nil
 	}
 	p.mu.Lock()
 	chosen, ok := p.variants[trackID]
@@ -1371,11 +993,11 @@ func (p *Participant) chooseRendition(ctx context.Context, trackID string) (rend
 
 	variants, err := p.room.client.TrackVariants(ctx, trackID)
 	if err != nil {
-		return rendition{}, err
+		return "", err
 	}
 	chosen, ok = pickRendition(variants)
 	if !ok {
-		return rendition{}, errors.New("musoak: no downloadable rendition")
+		return "", errors.New("musoak: no downloadable rendition")
 	}
 	p.mu.Lock()
 	p.variants[trackID] = chosen
@@ -1383,20 +1005,18 @@ func (p *Participant) chooseRendition(ctx context.Context, trackID string) (rend
 	return chosen, nil
 }
 
-// pickRendition is the first downloadable rendition of a track, and whether the
-// server is still preparing it: one it already holds is answered with the stored
-// file, and one it is still fetching is a stream.
-func pickRendition(variants []Variant) (rendition, bool) {
+// pickRendition is the first downloadable rendition of a track.
+func pickRendition(variants []Variant) (string, bool) {
 	for _, variant := range variants {
 		if variant.Downloadable {
-			return rendition{variantID: variant.ID, streaming: variant.Media.State != MediaReady}, true
+			return variant.ID, true
 		}
 	}
-	return rendition{}, false
+	return "", false
 }
 
 // fetch downloads a variant and indexes it under its track, so the next play of
-// that track is a file rather than a stream. The entry comes back either way: a
+// that track is a file already on disk. The entry comes back either way: a
 // failure to index a file that landed still leaves a playable file behind, which
 // is why callers check the path and not only the error.
 func (p *Participant) fetch(ctx context.Context, variantID, trackID string) (CacheEntry, error) {
@@ -1490,11 +1110,9 @@ func (p *Participant) Position() int64 {
 }
 
 // LocalPosition reports where this client's own player is in the song, when its
-// sink can say so. A stream's playhead is relative to where that stream began,
-// so the offset is added back: the answer is a position in the song, which is
-// the only kind of position this package talks about.
+// sink can say so.
 func (p *Participant) LocalPosition(ctx context.Context) (int64, bool) {
-	return p.sinkPosition(ctx, p.local())
+	return p.sinkPosition(ctx)
 }
 
 // Vote scores the current track from 1 (bad) to 5 (great).
