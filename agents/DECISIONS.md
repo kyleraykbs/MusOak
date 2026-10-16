@@ -304,4 +304,8 @@
 ## [2026-10-15] Audio is served only from files this server holds
 - Decision: provider-backed streaming is removed. Playback resolves a rendition, starts its download, waits for the complete file, then serves the stored file; held files retain normal ranges and `?start=` offsets.
 - Why: provider audio has unknown length, cannot be seeked reliably, depends on that provider being reachable at that second, and competes with the download that would make the song durable. A stored file is seekable and is what room join-at-position needs.
-- Reversible: no (deliberate).
+
+## [2026-10-16] Favorites are decimal personal ratings, and room auto-vote is opt-in
+- Decision: favorite values are stored as integer tenths and exposed as JSON numbers from 0.1 through 5.0. A room member may automatically submit their saved rating for a newly started song, but automatic ratings only participate in auto-skip when the client explicitly sends `autoSkip: true`; manual votes keep the existing room rule.
+- Why: a binary star cannot express the listener's opinion, while decimal tenths preserve exact UI intent without floating-point storage ambiguity. Auto-rating should not silently make a room skip a song; that requires an explicit room control.
+- Reversible: yes.

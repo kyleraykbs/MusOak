@@ -49,6 +49,7 @@ type variantResponse struct {
 	Downloadable    bool                `json:"downloadable"`
 	ISRC            string              `json:"isrc,omitempty"`
 	Media           mediaStatusResponse `json:"media"`
+	Uploader        *sourceUploader     `json:"uploader"`
 }
 
 // buildTrack fills in the artists and albums of a track.
@@ -125,7 +126,6 @@ func (s *Server) buildVariant(ctx context.Context, variant store.Variant) varian
 	return variantResponseFrom(variant, mediaStatusResponseFrom(s.media.Status(ctx, variant.ID)))
 }
 
-// variantResponseFrom shapes one variant from a download state already known.
 func variantResponseFrom(variant store.Variant, status mediaStatusResponse) variantResponse {
 	out := variantResponse{
 		ID:              variant.ID.String(),

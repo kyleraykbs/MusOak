@@ -432,6 +432,10 @@ func TestSearchPinsUserUploadsFirst(t *testing.T) {
 	if len(search.Groups[0].Variants) != 1 || search.Groups[0].Variants[0].Provider != store.UploadProvider {
 		t.Errorf("first group variants = %+v", search.Groups[0].Variants)
 	}
+	uploader := search.Groups[0].Variants[0].Uploader
+	if uploader == nil || uploader.Username != "kyle" {
+		t.Fatalf("search uploader = %+v, want kyle", uploader)
+	}
 	if search.Groups[1].UserUpload || search.Groups[1].Track.Title != "Provider Song" {
 		t.Errorf("second group = %+v, want the provider hit", search.Groups[1])
 	}

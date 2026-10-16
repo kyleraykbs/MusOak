@@ -207,7 +207,9 @@ func (s *Server) userUploadGroups(ctx context.Context, query string, limit int) 
 			slot = len(groups) - 1
 			at[upload.Variant.TrackID] = slot
 		}
-		groups[slot].Variants = append(groups[slot].Variants, s.buildVariant(ctx, upload.Variant))
+		variant := s.buildVariant(ctx, upload.Variant)
+		variant.Uploader = &sourceUploader{UserID: upload.Uploader.UserID.String(), Username: upload.Uploader.Username, DisplayName: upload.Uploader.DisplayName}
+		groups[slot].Variants = append(groups[slot].Variants, variant)
 	}
 	return groups, nil
 }
