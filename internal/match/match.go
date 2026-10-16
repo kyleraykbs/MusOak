@@ -904,6 +904,13 @@ func (m *Matcher) Resolve(ctx context.Context, trackID uuid.UUID) ([]store.Varia
 
 	query := strings.TrimSpace(track.Title + " " + strings.Join(want.Artists, " "))
 
+	// Whether any provider offered a candidate worth attaching at all. Two very
+	// different outcomes end up in the same place below - a search that found
+	// nothing above the threshold, and an attach that landed on another track
+	// row - and reporting the second for both sent a reader looking for
+	// duplicate tracks that were never there.
+	found := false
+
 	for _, p := range m.providers.All() {
 		if !p.Capabilities().Download {
 			continue
@@ -916,6 +923,7 @@ func (m *Matcher) Resolve(ctx context.Context, trackID uuid.UUID) ([]store.Varia
 				"provider", p.Name(), "track", trackID, "score", bestScore)
 			continue
 		}
+		found = true
 
 		// The library scan is a read; it happens before the lock so another
 		// match is not queued behind it.
@@ -964,12 +972,22 @@ func (m *Matcher) Resolve(ctx context.Context, trackID uuid.UUID) ([]store.Varia
 		return nil, err
 	}
 	if !hasDownloadable(variants) {
-		// The rendition that matched is already a variant of another canonical
-		// track: this library holds the same recording twice, and this copy is
-		// the one still without a source. Joining the two is a merge, which is
-		// not this function's to do.
-		m.logger.Info("track still has no source after resolving",
-			"track", trackID, "hint", "the rendition is attached to another track with the same recording")
+		if found {
+			// The rendition that matched is already a variant of another
+			// canonical track: this library holds the same recording twice, and
+			// this copy is the one still without a source. Joining the two is a
+			// merge, which is not this function's to do.
+			m.logger.Info("track still has no source after resolving",
+				"track", trackID, "hint", "the rendition is attached to another track with the same recording")
+		} else {
+			// Nothing to attach: no provider had a hit this track could be
+			// scored against. Repeating the search for it every few minutes is
+			// the same question put to the same providers, and a song that
+			// cannot be sourced is worth saying out loud rather than retrying
+			// for ever.
+			m.logger.Info("track still has no source after resolving",
+				"track", trackID, "title", track.Title, "hint", "no provider had a candidate above the match threshold")
+		}
 		return variants, ErrNoPlayableVariant
 	}
 	return variants, nil
