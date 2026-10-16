@@ -40,6 +40,11 @@
 - Why: a page-side `import('/js/player.js')` re-instantiates the app's module graph under the service worker and boots a *second* app — empty `state`, its own rooms, its own audio element — so a test that reached into the modules measured an app the user was not using (and the harness's first version did exactly that for a day). `driver.refresh()` is a hard reload: the worker is not controlling the new document and every byte comes off the wire again (298 KB against a warm reload's 1.8 KB), so a cache test written on it reports a defect that does not exist. The audio element was the one thing neither a test nor a person with devtools could point at, which is why the app now says which element is which.
 - Also: console errors are collected twice, from BiDi and from Firefox's own console output in the driver log, because Selenium's typed BiDi parse raises on an event with no stack trace inside the socket thread where nothing sees it; a self-check test provokes both an error and an uncaught exception and fails if either collector is blind.
 - Reversible: yes
+- Superseded 2026-10-16 (musoak-web): there is one element again. The song being
+  played is downloaded once into memory and the element is handed that copy
+  (musoak-web's DECISIONS, "the queue's own download is what plays"), so the
+  spare element, the hand-over and `audio-spare` are gone; `data-e2e=audio` is
+  the only name, and `ui.player()` still lists every `audio` in the document.
 
 ## [2026-10-14] A cover request waits two seconds, and a source that just refused is remembered
 - Decision: `artwork.Fetch` no longer waits for the whole download. It waits `waitForImage` (2 s), then answers `ErrPending` (404 + `Cache-Control: no-store`) while the fetch carries on unattended on a context that outlives the request; the next render is served from disk. The provider transfers are queued through a 4-slot semaphore, and a source that failed is left alone for `failedTTL` (5 min, bounded map, dropped on the next success). Every way a cover can be absent — nothing known, still fetching, the CDN refusing — is now answered `no-store`.
