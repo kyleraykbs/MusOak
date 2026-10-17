@@ -412,7 +412,8 @@ INSERT OR IGNORE INTO playlist_order (playlist_id, user_id, sort_order)
 SELECT p.id, p.user_id,
        (SELECT COUNT(*) FROM playlists p2 WHERE p2.user_id = p.user_id
         AND (p2.created_at > p.created_at OR (p2.created_at = p.created_at AND p2.id < p.id)))
-FROM playlists p;
+FROM playlists p
+JOIN users u ON u.id = p.user_id;
 `
 
 // migrations are append-only; never edit an applied migration.

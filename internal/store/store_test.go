@@ -506,3 +506,42 @@ func TestMigrationsAreIdempotentOnReopen(t *testing.T) {
 		t.Errorf("data lost on reopen: %+v, %v", got, err)
 	}
 }
+
+// Migration 23 must ignore orphaned legacy playlists instead of failing the
+// entire database open on the new order table's foreign keys.
+func TestPlaylistOrderMigrationIgnoresOrphanedPlaylists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "musoak.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("initial Open: %v", err)
+	}
+	ctx := context.Background()
+	user := &User{Username: "legacy"}
+	if err := db.CreateUser(ctx, user); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `INSERT INTO playlists (id, user_id, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`, uuid.NewString(), uuid.NewString(), "orphan", 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version >= 23`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen with orphaned playlist: %v", err)
+	}
+	defer reopened.Close()
+	var count int
+	if err := reopened.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM playlist_order`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("playlist_order rows = %d, want no orphaned rows", count)
+	}
+}
