@@ -101,6 +101,7 @@ type PlaylistRepo interface {
 	SetPlaylistArtwork(ctx context.Context, id uuid.UUID, url string) error
 	// SetPlaylistVisibility makes a playlist public or private.
 	SetPlaylistVisibility(ctx context.Context, id uuid.UUID, public bool) error
+	ReorderPlaylists(ctx context.Context, userID uuid.UUID, ids []uuid.UUID) error
 	CreatePlaylist(ctx context.Context, p *Playlist) error
 	// Playlist returns a playlist; ErrNotFound covers both "missing" and
 	// "belongs to somebody else".
@@ -180,16 +181,17 @@ func (d *DB) PublicPlaylistsForUser(ctx context.Context, userID uuid.UUID) ([]Pl
 // caller.
 func (d *DB) playlistsForUser(ctx context.Context, userID uuid.UUID, publicOnly bool) ([]Playlist, error) {
 	query := `
-		SELECT p.id, p.user_id, p.name, p.artwork_url, p.public, p.created_at, p.updated_at,
-		       (SELECT COUNT(*) FROM playlist_items i WHERE i.playlist_id = p.id),
-		       (SELECT COALESCE(SUM(t.duration_ms), 0) FROM playlist_items i
-			JOIN tracks t ON t.id = i.track_id WHERE i.playlist_id = p.id)
-		FROM playlists p
-		WHERE p.user_id = ?`
+    SELECT p.id, p.user_id, p.name, p.artwork_url, p.public, p.created_at, p.updated_at,
+           (SELECT COUNT(*) FROM playlist_items i WHERE i.playlist_id = p.id),
+           (SELECT COALESCE(SUM(t.duration_ms), 0) FROM playlist_items i
+            JOIN tracks t ON t.id = i.track_id WHERE i.playlist_id = i.playlist_id)
+    FROM playlists p
+    LEFT JOIN playlist_order po ON po.playlist_id = p.id
+    WHERE p.user_id = ?`
 	if publicOnly {
 		query += ` AND p.public = 1`
 	}
-	query += ` ORDER BY p.created_at DESC`
+	query += ` ORDER BY COALESCE(po.sort_order, 2147483647), p.created_at DESC`
 
 	rows, err := d.db.QueryContext(ctx, query, userID.String())
 	if err != nil {
@@ -231,6 +233,45 @@ func (d *DB) RenamePlaylist(ctx context.Context, id uuid.UUID, name string) erro
 		return mapErr(err)
 	}
 	return rowsAffectedOrNotFound(res)
+}
+
+// ReorderPlaylists applies an owner's complete playlist order.
+func (d *DB) ReorderPlaylists(ctx context.Context, userID uuid.UUID, ids []uuid.UUID) error {
+	return d.withTx(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT id FROM playlists WHERE user_id = ?`, userID.String())
+		if err != nil {
+			return mapErr(err)
+		}
+		owned := make(map[string]bool)
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return mapErr(err)
+			}
+			owned[id] = true
+		}
+		if err := rows.Close(); err != nil {
+			return mapErr(err)
+		}
+		if len(ids) != len(owned) {
+			return fmt.Errorf("%w: order does not contain every playlist", ErrConflict)
+		}
+		seen := make(map[string]bool, len(ids))
+		for _, id := range ids {
+			key := id.String()
+			if !owned[key] || seen[key] {
+				return fmt.Errorf("%w: invalid playlist order", ErrConflict)
+			}
+			seen[key] = true
+		}
+		for position, id := range ids {
+			if _, err := tx.ExecContext(ctx, `UPDATE playlists SET sort_order = ?, updated_at = ? WHERE id = ? AND user_id = ?`, position, time.Now().UnixMilli(), id.String(), userID.String()); err != nil {
+				return mapErr(err)
+			}
+		}
+		return nil
+	})
 }
 
 // DeletePlaylist removes a playlist and its entries.

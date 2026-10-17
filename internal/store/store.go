@@ -400,6 +400,21 @@ type migration struct {
 	sql     string
 }
 
+// schemaV23 gives each owner an explicit playlist-list order. It is a table
+// rather than a column so replaying older migrations in tests remains safe.
+const schemaV23 = `
+CREATE TABLE IF NOT EXISTS playlist_order (
+    playlist_id TEXT PRIMARY KEY REFERENCES playlists(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    sort_order INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO playlist_order (playlist_id, user_id, sort_order)
+SELECT p.id, p.user_id,
+       (SELECT COUNT(*) FROM playlists p2 WHERE p2.user_id = p.user_id
+        AND (p2.created_at > p.created_at OR (p2.created_at = p.created_at AND p2.id < p.id)))
+FROM playlists p;
+`
+
 // migrations are append-only; never edit an applied migration.
 var migrations = []migration{
 	{version: 1, name: "initial schema", sql: schemaV1},
@@ -424,6 +439,7 @@ var migrations = []migration{
 	{version: 20, name: "media paths relative to the storage directory", sql: schemaV20},
 	{version: 21, name: "read indexes", sql: schemaV21},
 	{version: 22, name: "favorite ratings and decimal votes", sql: schemaV22},
+	{version: 23, name: "playlist order", sql: schemaV23},
 }
 
 // schemaV22 stores favorite ratings in integer tenths and gives room votes

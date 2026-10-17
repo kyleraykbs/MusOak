@@ -77,6 +77,7 @@ func (s *Server) routeTable() []route {
 		{"GET /api/v1/me/stats/top", s.handleTopTracks},
 
 		{"GET /api/v1/me/playlists", s.handlePlaylistList},
+		{"POST /api/v1/me/playlists/reorder", s.handlePlaylistListReorder},
 		{"POST /api/v1/me/playlists", s.handlePlaylistCreate},
 		{"POST /api/v1/me/playlists/import", s.handlePlaylistImportStart},
 		{"GET /api/v1/me/playlist-imports/{jobId}", s.handlePlaylistImportStatus},

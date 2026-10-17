@@ -63,6 +63,9 @@ type playlistItemsRequest struct {
 type playlistReorderRequest struct {
 	Order []int `json:"order"`
 }
+type playlistListReorderRequest struct {
+	IDs []string `json:"ids"`
+}
 
 // playlistIDFromPath parses the playlist a request names.
 func playlistIDFromPath(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
@@ -197,6 +200,35 @@ func (s *Server) handlePlaylistList(w http.ResponseWriter, r *http.Request) {
 		out = append(out, playlistSummary(&playlists[i], user.ID))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"playlists": out})
+}
+
+func (s *Server) handlePlaylistListReorder(w http.ResponseWriter, r *http.Request) {
+	user, ok := s.requireUser(w, r)
+	if !ok {
+		return
+	}
+	var req playlistListReorderRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	ids := make([]uuid.UUID, 0, len(req.IDs))
+	for _, raw := range req.IDs {
+		id, err := uuid.Parse(raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid playlist order")
+			return
+		}
+		ids = append(ids, id)
+	}
+	if err := s.store.ReorderPlaylists(r.Context(), user.ID, ids); err != nil {
+		if errors.Is(err, store.ErrConflict) || errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeStoreError(w, err, "could not reorder playlists")
+		return
+	}
+	s.handlePlaylistList(w, r)
 }
 
 // handlePlaylistCreate makes an empty playlist.
