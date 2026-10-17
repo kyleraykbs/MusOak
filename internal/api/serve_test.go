@@ -45,14 +45,16 @@ func TestServeAppliesMiddleware(t *testing.T) {
 	base := "http://" + listener.Addr().String()
 	client := &http.Client{Timeout: 5 * time.Second}
 
-	// Anonymous access is refused when requireLogin is set.
+	// Anonymous search is public discovery even when library mutations require a
+	// login. A guest needs to know whether this server has the song before being
+	// asked to create an account.
 	resp, err := client.Get(base + "/api/v1/search?q=x")
 	if err != nil {
 		t.Fatalf("anonymous request: %v", err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("anonymous search = %d, want 401 from the served handler", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("anonymous search = %d, want 200 from the served handler", resp.StatusCode)
 	}
 
 	// Registering over the same socket yields a token that authenticates.

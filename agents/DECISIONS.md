@@ -314,3 +314,13 @@
 - Decision: favorite values are stored as integer tenths and exposed as JSON numbers from 0.1 through 5.0. A room member may automatically submit their saved rating for a newly started song, but automatic ratings only participate in auto-skip when the client explicitly sends `autoSkip: true`; manual votes keep the existing room rule.
 - Why: a binary star cannot express the listener's opinion, while decimal tenths preserve exact UI intent without floating-point storage ambiguity. Auto-rating should not silently make a room skip a song; that requires an explicit room control.
 - Reversible: yes.
+
+## [2026-10-16] Provider discovery is public when library login is required
+- Decision: `/api/v1/providers` and the provider search endpoints for tracks,
+  albums, artists and playlists are public reads, even with `requireLogin` on.
+  Personal library reads, mutations and account data remain authenticated.
+- Why: a guest must be able to search before deciding whether this server has
+  anything worth creating an account for. The old middleware treated search as
+  library access and the web UI consequently opened a sign-in prompt for every
+  guest search.
+- Reversible: yes.

@@ -158,17 +158,23 @@ var publicPaths = map[string]bool{
 	"/api/v1/auth/register": true,
 	"/api/v1/auth/login":    true,
 	"/api/v1/openapi.yaml":  true,
+	// Search is read-only discovery. Guests need it to decide whether this
+	// server has what they want before an account is worth asking for.
+	"/api/v1/providers":        true,
+	"/api/v1/search":           true,
+	"/api/v1/albums/search":    true,
+	"/api/v1/artists/search":   true,
+	"/api/v1/playlists/search": true,
 	// The room channel: a guest follows the room they joined, and the socket is
 	// how they hear what it is doing.
 	"/api/v1/ws": true,
 }
 
-// publicPrefixes are the endpoints a guest may reach whatever follows them.
-//
 // A room is joined by anybody who has the link - that is what a room is for -
-// and hearing what a room is playing needs the audio, so the media path is open
-// with it. Neither one names the library: searching, browsing, playlists and
-// everything that is somebody's own still need an account.
+// and hearing what it is playing needs the audio, so the media path is open
+// with it. Search is also read-only discovery: guests may search before deciding
+// whether this server is worth signing in to. Personal library data and writes
+// still require an account.
 var publicPrefixes = []string{
 	"/api/v1/rooms",
 	"/api/v1/media/",

@@ -110,14 +110,19 @@ func (c *testClient) register(username, password string) string {
 	return out.Token
 }
 
-func TestRequireLoginRejectsAnonymous(t *testing.T) {
+func TestRequireLoginAllowsAnonymousDiscovery(t *testing.T) {
 	c := newHTTPTestServer(t, func(cfg *config.Config) { cfg.RequireLogin = true })
 
-	if rec := c.do(http.MethodGet, "/healthz", "", nil); rec.Code != http.StatusOK {
-		t.Fatalf("healthz = %d, want 200 even with requireLogin", rec.Code)
-	}
-	if rec := c.do(http.MethodGet, "/api/v1/search?q=x", "", nil); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("anonymous search = %d, want 401", rec.Code)
+	for _, path := range []string{
+		"/api/v1/providers",
+		"/api/v1/search?q=x",
+		"/api/v1/albums/search?q=x",
+		"/api/v1/artists/search?q=x",
+		"/api/v1/playlists/search?q=x",
+	} {
+		if rec := c.do(http.MethodGet, path, "", nil); rec.Code != http.StatusOK {
+			t.Fatalf("anonymous %s = %d, want 200 (%s)", path, rec.Code, rec.Body.String())
+		}
 	}
 
 	token := c.register("kyle", "hunter2hunter2")
@@ -149,10 +154,10 @@ func (c *testClient) doAs(method, path, memberID string, body any) *httptest.Res
 }
 
 // A room is joined by anybody who has the link, so requireLogin - which is
-// about the library - does not stand in front of one. A guest may join, follow
-// the room, and hear what it is playing; searching the library still needs an
-// account.
-func TestRequireLoginLeavesRoomsOpenToGuests(t *testing.T) {
+// about personal library data - does not stand in front of rooms or discovery.
+// A guest may search to decide whether signing in is worth doing, then join a
+// room and hear what it is playing.
+func TestRequireLoginLeavesRoomsAndSearchOpenToGuests(t *testing.T) {
 	c := newHTTPTestServer(t, func(cfg *config.Config) { cfg.RequireLogin = true })
 	host := c.register("kyle", "hunter2hunter2")
 
@@ -186,7 +191,7 @@ func TestRequireLoginLeavesRoomsOpenToGuests(t *testing.T) {
 		t.Errorf("members = %+v, want the guest among them", joined.Room.Members)
 	}
 
-	// Following the room, and hearing it, is the same door.
+	// Following the room, hearing it, and searching for a track are public reads.
 	for _, path := range []string{"/api/v1/rooms/" + roomID, "/api/v1/ws"} {
 		if rec := c.doAs(http.MethodGet, path, "guest-1", nil); rec.Code == http.StatusUnauthorized {
 			t.Errorf("%s = 401 for a guest, want it reachable", path)
@@ -195,10 +200,8 @@ func TestRequireLoginLeavesRoomsOpenToGuests(t *testing.T) {
 	if rec := c.doAs(http.MethodGet, "/api/v1/media/00000000-0000-0000-0000-000000000000", "guest-1", nil); rec.Code == http.StatusUnauthorized {
 		t.Error("media = 401 for a guest, want it reachable")
 	}
-
-	// The library is still not open: a guest cannot search it.
-	if rec := c.do(http.MethodGet, "/api/v1/search?q=x", "", nil); rec.Code != http.StatusUnauthorized {
-		t.Errorf("guest search = %d, want 401", rec.Code)
+	if rec := c.do(http.MethodGet, "/api/v1/search?q=x", "", nil); rec.Code != http.StatusOK {
+		t.Errorf("guest search = %d, want 200", rec.Code)
 	}
 }
 
