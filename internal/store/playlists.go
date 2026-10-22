@@ -184,7 +184,7 @@ func (d *DB) playlistsForUser(ctx context.Context, userID uuid.UUID, publicOnly 
     SELECT p.id, p.user_id, p.name, p.artwork_url, p.public, p.created_at, p.updated_at,
            (SELECT COUNT(*) FROM playlist_items i WHERE i.playlist_id = p.id),
            (SELECT COALESCE(SUM(t.duration_ms), 0) FROM playlist_items i
-            JOIN tracks t ON t.id = i.track_id WHERE i.playlist_id = i.playlist_id)
+            JOIN tracks t ON t.id = i.track_id WHERE i.playlist_id = p.id)
     FROM playlists p
     LEFT JOIN playlist_order po ON po.playlist_id = p.id
     WHERE p.user_id = ?`

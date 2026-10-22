@@ -123,6 +123,49 @@ func TestPlaylistFlow(t *testing.T) {
 	}
 }
 
+// Every playlist in a listing sums only its own items: a shared total would
+// show one playlist's length on all of them.
+func TestPlaylistListDurationsArePerPlaylist(t *testing.T) {
+	c := newHTTPTestServer(t, nil)
+	token := c.register("kyle", "hunter2hunter2")
+	tracks := seedTracks(t, c, "One", "Two", "Three")
+
+	makePlaylist := func(name string, items ...string) {
+		t.Helper()
+		rec := c.do(http.MethodPost, "/api/v1/me/playlists", token, map[string]string{"name": name})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("create %s = %d: %s", name, rec.Code, rec.Body.String())
+		}
+		var playlist playlistResponse
+		c.decode(rec, &playlist)
+		rec = c.do(http.MethodPost, "/api/v1/me/playlists/"+playlist.ID+"/items", token, map[string]any{"trackIds": items})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("add to %s = %d: %s", name, rec.Code, rec.Body.String())
+		}
+	}
+	makePlaylist("short", tracks[0].ID.String())
+	makePlaylist("long", tracks[1].ID.String(), tracks[2].ID.String())
+
+	rec := c.do(http.MethodGet, "/api/v1/me/playlists", token, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list = %d", rec.Code)
+	}
+	var listing struct {
+		Playlists []playlistResponse `json:"playlists"`
+	}
+	c.decode(rec, &listing)
+
+	want := map[string]int64{"short": 180_000, "long": 360_000}
+	if len(listing.Playlists) != len(want) {
+		t.Fatalf("playlists = %+v", listing.Playlists)
+	}
+	for _, playlist := range listing.Playlists {
+		if playlist.DurationMs != want[playlist.Name] {
+			t.Errorf("%s durationMs = %d, want %d", playlist.Name, playlist.DurationMs, want[playlist.Name])
+		}
+	}
+}
+
 func TestPlaylistOwnershipAndGuests(t *testing.T) {
 	c := newHTTPTestServer(t, nil)
 	owner := c.register("owner", "hunter2hunter2")
