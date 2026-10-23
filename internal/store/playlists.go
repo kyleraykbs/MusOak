@@ -266,7 +266,17 @@ func (d *DB) ReorderPlaylists(ctx context.Context, userID uuid.UUID, ids []uuid.
 			seen[key] = true
 		}
 		for position, id := range ids {
-			if _, err := tx.ExecContext(ctx, `UPDATE playlists SET sort_order = ?, updated_at = ? WHERE id = ? AND user_id = ?`, position, time.Now().UnixMilli(), id.String(), userID.String()); err != nil {
+			// The order lives in its own table: the listing reads
+			// playlist_order, and a playlist created after that migration has no
+			// row yet, so this is an upsert rather than an update. There is no
+			// sort_order column on playlists to write.
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO playlist_order (playlist_id, user_id, sort_order)
+				VALUES (?, ?, ?)
+				ON CONFLICT(playlist_id) DO UPDATE SET
+					user_id = excluded.user_id,
+					sort_order = excluded.sort_order`,
+				id.String(), userID.String(), position); err != nil {
 				return mapErr(err)
 			}
 		}

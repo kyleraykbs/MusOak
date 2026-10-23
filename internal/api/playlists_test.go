@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/kyleraykbs/MusOak/internal/store"
@@ -221,5 +222,56 @@ func TestPlaylistOwnershipAndGuests(t *testing.T) {
 	}
 	if rec := c.do(http.MethodGet, "/api/v1/me/playlists/not-a-uuid", owner, nil); rec.Code != http.StatusBadRequest {
 		t.Errorf("bad playlist id = %d, want 400", rec.Code)
+	}
+}
+
+// Reordering the playlist tab is an owner's complete order: the listing that
+// comes back is the one they dropped, and it survives the next read.
+func TestPlaylistListReorderPersists(t *testing.T) {
+	c := newHTTPTestServer(t, nil)
+	token := c.register("kyle", "hunter2hunter2")
+
+	ids := make(map[string]string)
+	for _, name := range []string{"one", "two", "three"} {
+		rec := c.do(http.MethodPost, "/api/v1/me/playlists", token, map[string]string{"name": name})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("create %s = %d: %s", name, rec.Code, rec.Body.String())
+		}
+		var playlist playlistResponse
+		c.decode(rec, &playlist)
+		ids[name] = playlist.ID
+	}
+
+	listed := func() string {
+		t.Helper()
+		rec := c.do(http.MethodGet, "/api/v1/me/playlists", token, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("list = %d: %s", rec.Code, rec.Body.String())
+		}
+		var listing struct {
+			Playlists []playlistResponse `json:"playlists"`
+		}
+		c.decode(rec, &listing)
+		names := make([]string, 0, len(listing.Playlists))
+		for _, playlist := range listing.Playlists {
+			names = append(names, playlist.Name)
+		}
+		return strings.Join(names, ",")
+	}
+
+	// The three may share a created_at to the millisecond, so their order
+	// before a drop is not something to pin; what follows is.
+	order := []string{ids["one"], ids["three"], ids["two"]}
+	rec := c.do(http.MethodPost, "/api/v1/me/playlists/reorder", token, map[string][]string{"ids": order})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("reorder = %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := listed(); got != "one,three,two" {
+		t.Errorf("order after reorder = %q, want the order that was dropped", got)
+	}
+
+	// A partial order and somebody else's playlist are both refused.
+	if rec := c.do(http.MethodPost, "/api/v1/me/playlists/reorder", token, map[string][]string{"ids": order[:2]}); rec.Code != http.StatusBadRequest {
+		t.Errorf("partial order = %d, want 400", rec.Code)
 	}
 }
