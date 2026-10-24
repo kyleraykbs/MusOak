@@ -198,6 +198,10 @@ type Manager struct {
 	// downloadTimeout is how long one attempt may take; see downloadTimeout.
 	downloadTimeout  time.Duration
 	background       map[uuid.UUID]backgroundFetch
+	// playing is the download somebody is waiting to hear, by variant. A play
+	// that starts after it - the listener skipped - stops it, so the song they
+	// are waiting for is not sharing the provider's pipe with the one they left.
+	playing map[uuid.UUID]*backgroundFetch
 	paused           []uuid.UUID
 	downloadAttempts int
 	downloadBackoff  time.Duration
@@ -280,11 +284,22 @@ func (m *Manager) ensure(ctx context.Context, variantID uuid.UUID, primary bool)
 	if path, ok := m.ready(ctx, variantID); ok {
 		return path, nil
 	}
+	// The download outlives whichever caller started it: a client hanging up
+	// must not abort a shared transfer for everybody else. It is still bounded -
+	// each attempt has its own deadline, and the probe and transcode that follow
+	// are bounded inside ffmpeg - which is what keeps a stalled provider or a
+	// wedged binary from pinning the variant for the rest of the session.
+	detached := context.WithoutCancel(ctx)
 	if primary {
-		// Marked before the fetch starts, so a background download that was
-		// about to begin waits instead of competing with it.
-		m.enterPrimary(variantID)
+		// The play's own fetch is cancellable, so the play that replaces it
+		// stops it. Marked before the fetch starts, so a background download
+		// that was about to begin waits instead of competing with it.
+		fetchCtx, cancel := context.WithCancel(detached)
+		record := m.enterPrimary(variantID, cancel)
 		defer m.leavePrimary()
+		defer m.forgetPlaying(variantID, record)
+		defer cancel()
+		detached = fetchCtx
 	} else {
 		// A person's play has the pipe. The wait is here, before the
 		// singleflight, and not inside the shared call: a play arriving for this
@@ -301,13 +316,6 @@ func (m *Manager) ensure(ctx context.Context, variantID uuid.UUID, primary bool)
 			return path, nil
 		}
 	}
-
-	// The download outlives whichever caller started it: a client hanging up
-	// must not abort a shared transfer for everybody else. It is still bounded -
-	// each attempt has its own deadline, and the probe and transcode that follow
-	// are bounded inside ffmpeg - which is what keeps a stalled provider or a
-	// wedged binary from pinning the variant for the rest of the session.
-	detached := context.WithoutCancel(ctx)
 
 	v, err, _ := m.sf.Do(variantID.String(), func() (any, error) {
 		return m.fetch(detached, variantID, primary)
@@ -397,6 +405,13 @@ func (m *Manager) fetch(ctx context.Context, variantID uuid.UUID, primary bool) 
 	close(watchDone)
 	if downloadErr != nil {
 		removeTmp()
+		if ctx.Err() != nil && primary {
+			// Stopped on purpose: a newer play took the pipe because the
+			// listener skipped this song. That is not the file failing - the
+			// next time it is wanted the fetch starts again.
+			m.setStatus(Status{VariantID: variantID, State: StateNone})
+			return "", downloadErr
+		}
 		m.fail(variantID, downloadErr)
 		return "", downloadErr
 	}
@@ -938,17 +953,36 @@ func (m *Manager) registerBackground(ctx context.Context, variantID uuid.UUID) (
 // background downloads that have just started are stopped so nothing shares the
 // provider's bandwidth with it, and what was stopped is remembered.
 //
-// It is a pause, not a killing: the fetch of the very variant the play is
-// waiting on is left running (it is the file this call wants, and it is shared),
-// a background download past the window is left to finish on its own, and
-// everything stopped here is put back when the play is over - see leavePrimary.
-// Cancelling the downloads that keep the room's next songs on disk is how a
-// room ends up with nothing warmed and every transition paying for a fetch.
-func (m *Manager) enterPrimary(variantID uuid.UUID) {
+// The play that was being waited on before this one is a different matter: the
+// listener skipped it, so it is stopped outright rather than paused, and it is
+// not put back. Its own fetch context is the cancel handed in here, and it is
+// recorded under the same lock so two plays arriving together still leave only
+// the newer one running.
+//
+// For background downloads it is a pause, not a killing: the fetch of the very
+// variant the play is waiting on is left running (it is the file this call
+// wants, and it is shared), a background download past the window is left to
+// finish on its own, and everything stopped here is put back when the play is
+// over - see leavePrimary. Cancelling the downloads that keep the room's next
+// songs on disk is how a room ends up with nothing warmed and every transition
+// paying for a fetch.
+func (m *Manager) enterPrimary(variantID uuid.UUID, cancel context.CancelFunc) *backgroundFetch {
 	m.primary.enter()
 	m.mu.Lock()
 	now := time.Now()
 	var stop []context.CancelFunc
+	for id, fetch := range m.playing {
+		if id == variantID {
+			continue
+		}
+		stop = append(stop, fetch.cancel)
+		delete(m.playing, id)
+	}
+	if m.playing == nil {
+		m.playing = make(map[uuid.UUID]*backgroundFetch)
+	}
+	record := &backgroundFetch{cancel: cancel, startedAt: now}
+	m.playing[variantID] = record
 	for id, fetch := range m.background {
 		if id == variantID || now.Sub(fetch.startedAt) >= resumeWindow {
 			continue
@@ -961,6 +995,18 @@ func (m *Manager) enterPrimary(variantID uuid.UUID) {
 	for _, cancel := range stop {
 		cancel()
 	}
+	return record
+}
+
+// forgetPlaying drops a finished play's fetch from the map, so a later play has
+// nothing stale to cancel. Only that play's own record is dropped: a second
+// play of the same variant may have taken its place while the first unwound.
+func (m *Manager) forgetPlaying(variantID uuid.UUID, record *backgroundFetch) {
+	m.mu.Lock()
+	if m.playing[variantID] == record {
+		delete(m.playing, variantID)
+	}
+	m.mu.Unlock()
 }
 
 // leavePrimary gives the pipe back, and puts back what the play paused: those

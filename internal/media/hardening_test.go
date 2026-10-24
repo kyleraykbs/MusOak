@@ -495,10 +495,50 @@ func TestEnsurePrimaryDoesNotJoinAGateBlockedBackground(t *testing.T) {
 		t.Fatal("EnsurePrimary hung joining a background fetch parked on the gate")
 	}
 
-	if err := <-otherDone; err != nil {
-		t.Fatalf("the first play failed: %v", err)
+	// The second play replaces the first, so the first is stopped - that is the
+	// skip rule now, not a failure of the gate.
+	if err := <-otherDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("the first play = %v, want it cancelled by the play that replaced it", err)
 	}
 	if err := <-queuedDone; err != nil {
 		t.Fatalf("the queued background fetch failed: %v", err)
+	}
+}
+
+// Skipping a song during its download stops that download. The listener is not
+// waiting on it any more, and leaving it running shares the provider's pipe
+// with the song they are waiting for.
+func TestANewPlayStopsTheDownloadItReplaced(t *testing.T) {
+	dir := t.TempDir()
+	fixture := tone(t, dir, "fixture.opus", 0.5)
+	fake := &fakeProvider{name: "ytmusic", fixture: fixture, delay: 300 * time.Millisecond}
+	m, db := newTestManager(t, fake)
+
+	skipped := seedVariant(t, db, true, "ytmusic")
+	playing := seedVariant(t, db, true, "ytmusic")
+
+	skippedDone := make(chan error, 1)
+	go func() {
+		_, err := m.EnsurePrimary(context.Background(), skipped.ID)
+		skippedDone <- err
+	}()
+	waitForCalls(t, fake, 1)
+
+	// The listener skips: the next song becomes the one being waited on.
+	if _, err := m.EnsurePrimary(context.Background(), playing.ID); err != nil {
+		t.Fatalf("the play that replaced it failed: %v", err)
+	}
+
+	if err := <-skippedDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("the skipped download = %v, want it stopped", err)
+	}
+	if state := m.Status(context.Background(), skipped.ID).State; state != StateNone {
+		t.Errorf("the skipped song's state = %s, want %s: a cancelled download is not a failed one", state, StateNone)
+	}
+	if state := m.Status(context.Background(), playing.ID).State; state != StateReady {
+		t.Errorf("the song that replaced it = %s, want %s", state, StateReady)
+	}
+	if _, statErr := os.Stat(m.pathFor(skipped.ID)); !os.IsNotExist(statErr) {
+		t.Errorf("the skipped song's partial file was left behind: %v", statErr)
 	}
 }
