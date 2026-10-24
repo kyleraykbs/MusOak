@@ -329,3 +329,20 @@ func TestProvidersCapsHaveNoStreamField(t *testing.T) {
 		t.Errorf("providers body still mentions stream: %s", rec.Body.String())
 	}
 }
+
+// Cancelling a download asks the manager to stop it, and says the same thing
+// whether or not one was running: the client lets go of a song at any point in
+// its fetch.
+func TestMediaCancelIsIdempotent(t *testing.T) {
+	c := newHTTPTestServer(t, nil)
+	id := uuid.NewString()
+	for attempt := range 2 {
+		rec := c.do(http.MethodDelete, "/api/v1/media/"+id+"/download", "", nil)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("cancel %d = %d: %s", attempt, rec.Code, rec.Body.String())
+		}
+	}
+	if rec := c.do(http.MethodDelete, "/api/v1/media/not-a-uuid/download", "", nil); rec.Code != http.StatusBadRequest {
+		t.Errorf("bad variant id = %d, want 400", rec.Code)
+	}
+}

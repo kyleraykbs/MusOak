@@ -542,3 +542,39 @@ func TestANewPlayStopsTheDownloadItReplaced(t *testing.T) {
 		t.Errorf("the skipped song's partial file was left behind: %v", statErr)
 	}
 }
+
+// A rendition nobody wants any more stops fetching: the song left the queue, or
+// the queue was replaced. The next ask starts it again from scratch.
+func TestCancelStopsABackgroundDownload(t *testing.T) {
+	dir := t.TempDir()
+	fixture := tone(t, dir, "fixture.opus", 0.5)
+	fake := &fakeProvider{name: "ytmusic", fixture: fixture, delay: 300 * time.Millisecond}
+	m, db := newTestManager(t, fake)
+	variant := seedVariant(t, db, true, "ytmusic")
+	ctx := context.Background()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.Ensure(ctx, variant.ID)
+		done <- err
+	}()
+	waitForCalls(t, fake, 1)
+
+	m.Cancel(variant.ID)
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("the cancelled download = %v, want it stopped", err)
+	}
+	if _, statErr := os.Stat(m.pathFor(variant.ID)); !os.IsNotExist(statErr) {
+		t.Errorf("a partial file was left behind: %v", statErr)
+	}
+
+	// Cancelling again is a no-op, and the song is still fetchable when it is
+	// wanted again.
+	m.Cancel(variant.ID)
+	if _, err := m.Ensure(ctx, variant.ID); err != nil {
+		t.Fatalf("the fetch after a cancel failed: %v", err)
+	}
+	if state := m.Status(ctx, variant.ID).State; state != StateReady {
+		t.Errorf("state after a fresh fetch = %s, want %s", state, StateReady)
+	}
+}

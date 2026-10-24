@@ -60,6 +60,7 @@ func (s *Server) routeTable() []route {
 		{"GET /api/v1/media/{variantId}", s.handleMediaFile},
 		{"GET /api/v1/media/{variantId}/status", s.handleMediaStatus},
 		{"POST /api/v1/media/{variantId}/download", s.handleMediaDownload},
+		{"DELETE /api/v1/media/{variantId}/download", s.handleMediaCancel},
 
 		{"POST /api/v1/auth/register", s.handleRegister},
 		{"POST /api/v1/auth/login", s.handleLogin},

@@ -197,6 +197,18 @@ func (s *Server) handleMediaDownload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, s.mediaStatus(r.Context(), id))
 }
 
+// handleMediaCancel stops a download nobody is waiting on any more: the song
+// left the queue, or the queue was replaced. It answers 204 whether or not one
+// was running, so a client may cancel a fetch that finished on its own.
+func (s *Server) handleMediaCancel(w http.ResponseWriter, r *http.Request) {
+	id, ok := variantIDFromPath(w, r)
+	if !ok {
+		return
+	}
+	s.media.Cancel(id)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // ensureMedia downloads a variant either as the song somebody is waiting to
 // hear - which takes the whole pipe: the downloads running for anything else
 // are cancelled and none starts until it has finished - or as background work,

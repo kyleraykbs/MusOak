@@ -342,6 +342,19 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      tags: [media]
+      summary: Stop a download nobody is waiting on any more
+      description: |
+        The song left the queue, or the queue was replaced. Idempotent: a
+        download that has already finished, or was never started, is the same
+        204. A play's own fetch is stopped too, and the next play of that song
+        starts it again.
+      operationId: cancelMediaDownload
+      parameters: [{ $ref: "#/components/parameters/VariantID" }]
+      responses:
+        "204":
+          description: The download is no longer wanted.
 
   /api/v1/library/import:
     post:

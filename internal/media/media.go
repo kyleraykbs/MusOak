@@ -998,6 +998,31 @@ func (m *Manager) enterPrimary(variantID uuid.UUID, cancel context.CancelFunc) *
 	return record
 }
 
+// Cancel stops a fetch nobody is waiting on any more: the song left the queue,
+// or the queue was replaced. It is a no-op when nothing is running, so a client
+// that cancels twice - or cancels a download that has just finished - is
+// answered the same way.
+//
+// A play is cancelled here too: clearing the queue while its song is downloading
+// is the same "nobody wants this file now". The next play of it starts a fresh
+// fetch; nothing is remembered about the cancellation except the status.
+func (m *Manager) Cancel(variantID uuid.UUID) {
+	m.mu.Lock()
+	var stop []context.CancelFunc
+	if fetch, ok := m.background[variantID]; ok {
+		stop = append(stop, fetch.cancel)
+		delete(m.background, variantID)
+	}
+	if fetch, ok := m.playing[variantID]; ok {
+		stop = append(stop, fetch.cancel)
+		delete(m.playing, variantID)
+	}
+	m.mu.Unlock()
+	for _, cancel := range stop {
+		cancel()
+	}
+}
+
 // forgetPlaying drops a finished play's fetch from the map, so a later play has
 // nothing stale to cancel. Only that play's own record is dropped: a second
 // play of the same variant may have taken its place while the first unwound.
