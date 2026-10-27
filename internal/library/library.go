@@ -15,8 +15,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -25,9 +27,17 @@ import (
 	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
-// maxProviderAlbums bounds how many albums one artist sync will pull, so a
-// prolific artist cannot turn a single request into hundreds.
+// maxProviderAlbums bounds how many releases of one kind an artist's catalogue
+// read takes, so a prolific artist cannot turn one page into thousands of
+// provider reads. The newest are the ones kept, which is the order a page shows
+// them in.
 const maxProviderAlbums = 50
+
+// releasePause is how long a catalogue read waits between two releases. YouTube
+// Music refuses a burst - asking for a whole artist at once leaves some releases
+// unreadable, and before this they stayed empty - so a catalogue read that takes
+// a few seconds is a far better trade than a page full of holes.
+const releasePause = 250 * time.Millisecond
 
 // Errors.
 var (
@@ -64,6 +74,11 @@ type Service struct {
 	providers *provider.Registry
 	matcher   *match.Matcher
 	logger    *slog.Logger
+
+	// catalogues are the artist catalogue reads, by artist: one at a time per
+	// artist, and the last one kept while it is still fresh.
+	catalogueMu sync.Mutex
+	catalogues  map[uuid.UUID]*catalogue
 }
 
 // New returns the service.
@@ -71,7 +86,10 @@ func New(db Store, providers *provider.Registry, matcher *match.Matcher, logger 
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Service{db: db, providers: providers, matcher: matcher, logger: logger}
+	return &Service{
+		db: db, providers: providers, matcher: matcher, logger: logger,
+		catalogues: map[uuid.UUID]*catalogue{},
+	}
 }
 
 // Album is an album with everything a caller needs to show it.
@@ -515,7 +533,7 @@ func (s *Service) SyncAlbum(ctx context.Context, albumID uuid.UUID, providers []
 		return nil, err
 	}
 	for _, variant := range selected {
-		detail, err := s.providers.Album(ctx, variant.Provider, variant.ProviderAlbumID)
+		detail, err := s.albumDetail(ctx, variant)
 		if err != nil {
 			result.Errors = append(result.Errors, ProviderError{Provider: variant.Provider, Error: err.Error()})
 			continue
@@ -530,7 +548,15 @@ func (s *Service) SyncAlbum(ctx context.Context, albumID uuid.UUID, providers []
 		for _, hit := range detail.Tracks {
 			track, _, err := s.matcher.Attach(ctx, variant.Provider, hit)
 			if err != nil {
-				return nil, fmt.Errorf("match %s/%s: %w", variant.Provider, hit.ProviderTrackID, err)
+				// One song that will not attach is not the rest of the album.
+				// It is said out loud and the tracklist carries on without it:
+				// stopping here left every song after it missing, which reads as
+				// an album the library only half knows.
+				result.Errors = append(result.Errors, ProviderError{
+					Provider: variant.Provider,
+					Error:    fmt.Sprintf("%s: %v", hit.Title, err),
+				})
+				continue
 			}
 			ids = append(ids, track.ID)
 		}
@@ -602,6 +628,15 @@ func (s *Service) SyncArtist(ctx context.Context, artistID uuid.UUID, providers 
 
 	result := &ArtistSyncResult{ArtistID: artistID, Providers: providerNames(selected, artistProvider)}
 
+	// What this artist released, split the way an artist's page shows it: the
+	// records, the singles, and the container the singles are collected into.
+	var (
+		albums      []matchedRelease
+		singles     []matchedRelease
+		matched     []matchedRelease
+		containerID uuid.UUID
+	)
+
 	// Each provider's albums are fetched in parallel; the database writes below
 	// stay on this goroutine.
 	type fetched struct {
@@ -626,39 +661,163 @@ func (s *Service) SyncArtist(ctx context.Context, artistID uuid.UUID, providers 
 			result.Errors = append(result.Errors, ProviderError{Provider: fetched.provider, Error: fetched.err.Error()})
 			continue
 		}
-		albums := fetched.albums
-		if len(albums) > maxProviderAlbums {
-			albums = albums[:maxProviderAlbums]
+		for _, hit := range fetched.albums {
+			release := matchedRelease{provider: fetched.provider, hit: hit}
+			if isSingleRelease(hit.Kind) {
+				singles = append(singles, release)
+			} else {
+				albums = append(albums, release)
+			}
 		}
-		for _, hit := range albums {
-			album, _, _, err := s.matcher.MatchAlbum(ctx, fetched.provider, hit)
+	}
+
+	// The newest releases are the ones a page shows first and the ones the cap
+	// keeps, so the order is settled before anything is stored.
+	albums = capReleases(newestFirst(albums))
+	singles = capReleases(newestFirst(singles))
+	for _, group := range []matchedReleaseGroup{{albums, false}, {singles, true}} {
+		for _, release := range group.releases {
+			album, _, _, err := s.matcher.MatchAlbum(ctx, release.provider, release.hit)
 			if err != nil {
-				return nil, fmt.Errorf("match %s/%s: %w", fetched.provider, hit.ProviderAlbumID, err)
+				return nil, fmt.Errorf("match %s/%s: %w", release.provider, release.hit.ProviderAlbumID, err)
 			}
 			if err := s.db.AttachAlbumArtist(ctx, album.ID, artistID); err != nil {
 				return nil, err
 			}
+			matched = append(matched, matchedRelease{album: *album, single: group.single})
 			result.Albums = append(result.Albums, *album)
 		}
 	}
 
+	// One row for everything the artist released as a single, so their page can
+	// list records and singles apart. It exists only when there are singles.
+	if len(singles) > 0 {
+		container, err := s.db.EnsureSinglesAlbum(ctx, artistID)
+		if err != nil {
+			return nil, err
+		}
+		containerID = container.ID
+		if !hasAlbum(result.Albums, container.ID) {
+			result.Albums = append(result.Albums, *container)
+		}
+	}
+
 	if syncAlbums {
-		for _, album := range result.Albums {
-			synced, err := s.SyncAlbum(ctx, album.ID, nil, resolve)
+		// Records first, then the singles: the songs panel fills with what a
+		// listener thinks of first. The pause between reads is what keeps the
+		// endpoint answering - asked for a whole catalogue at once it starts
+		// refusing, and an album refused is an album with no songs.
+		for index, entry := range matched {
+			if index > 0 {
+				sleepContext(ctx, releasePause)
+			}
+			synced, err := s.SyncAlbum(ctx, entry.album.ID, nil, resolve)
 			if err != nil {
-				result.Errors = append(result.Errors, ProviderError{Provider: album.Title, Error: err.Error()})
+				result.Errors = append(result.Errors, ProviderError{Provider: entry.album.Title, Error: err.Error()})
 				continue
 			}
 			result.Added += synced.Added
 			result.Errors = append(result.Errors, synced.Errors...)
+			if entry.single && containerID != uuid.Nil {
+				if _, err := s.db.AppendAlbumTracks(ctx, containerID, trackIDs(synced.Tracks)); err != nil {
+					result.Errors = append(result.Errors, ProviderError{Provider: entry.album.Title, Error: err.Error()})
+				}
+			}
 		}
 	}
 	return result, nil
 }
 
+// matchedRelease is one provider release of an artist's page, before matching.
+type matchedRelease struct {
+	provider string
+	hit      provider.Album
+	// album and single are set once the release is matched: the canonical album
+	// it belongs to, and whether it was a single rather than a record.
+	album  store.Album
+	single bool
+}
+
+// matchedReleaseGroup is one half of a discography: the records, or the singles.
+type matchedReleaseGroup struct {
+	releases []matchedRelease
+	single   bool
+}
+
+// isSingleRelease reports whether a release is a song's release rather than a
+// record: a single or an EP, which is a single with a few more songs on it.
+func isSingleRelease(kind string) bool {
+	return kind == store.ReleaseKindSingle || kind == store.ReleaseKindEP
+}
+
+// newestFirst orders releases by the year they came out, newest first, with the
+// ones nobody dated last: an undated release is not from year zero.
+func newestFirst(releases []matchedRelease) []matchedRelease {
+	out := append([]matchedRelease(nil), releases...)
+	sort.SliceStable(out, func(i, j int) bool {
+		left, leftOK := provider.YearValue(out[i].hit.Year)
+		right, rightOK := provider.YearValue(out[j].hit.Year)
+		if leftOK != rightOK {
+			return leftOK
+		}
+		if left != right {
+			return left > right
+		}
+		return out[i].hit.Title < out[j].hit.Title
+	})
+	return out
+}
+
+// capReleases bounds one half of a discography, keeping the newest.
+func capReleases(releases []matchedRelease) []matchedRelease {
+	if len(releases) > maxProviderAlbums {
+		return releases[:maxProviderAlbums]
+	}
+	return releases
+}
+
+func hasAlbum(albums []store.Album, id uuid.UUID) bool {
+	for i := range albums {
+		if albums[i].ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func trackIDs(tracks []store.Track) []uuid.UUID {
+	ids := make([]uuid.UUID, 0, len(tracks))
+	for i := range tracks {
+		ids = append(ids, tracks[i].ID)
+	}
+	return ids
+}
+
+// sleepContext waits, unless the caller has given up first.
+func sleepContext(ctx context.Context, d time.Duration) {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+}
+
+// albumDetail reads one release's tracklist, asking a second time when the first
+// read fails. The endpoint refuses bursts - a whole artist asked for at once
+// leaves some releases unreadable - and a refusal is over in a moment.
+func (s *Service) albumDetail(ctx context.Context, variant store.AlbumVariant) (*provider.AlbumDetail, error) {
+	detail, err := s.providers.Album(ctx, variant.Provider, variant.ProviderAlbumID)
+	if err == nil {
+		return detail, nil
+	}
+	sleepContext(ctx, releasePause)
+	return s.providers.Album(ctx, variant.Provider, variant.ProviderAlbumID)
+}
+
 // albumProvider and artistProvider read the provider name out of the two
 // release types, the only thing the shared helpers above cannot know.
-func albumProvider(v store.AlbumVariant) string  { return v.Provider }
+func albumProvider(v store.AlbumVariant) string   { return v.Provider }
 func artistProvider(v store.ArtistVariant) string { return v.Provider }
 
 // selectByProvider keeps the releases whose provider is named, or everything

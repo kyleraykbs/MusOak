@@ -211,6 +211,7 @@ func (p *Provider) SearchAlbums(ctx context.Context, q string, opts provider.Sea
 			Artists:         item.artistNames(),
 			Year:            yearOf(item.ReleaseDate),
 			TrackCount:      item.TotalTracks,
+			Kind:            item.kind(),
 			ArtworkURL:      bestImage(item.Images),
 		})
 	}
@@ -399,6 +400,7 @@ func (p *Provider) Album(ctx context.Context, providerAlbumID string) (*provider
 			Artists:         album.artistNames(),
 			Year:            yearOf(album.ReleaseDate),
 			TrackCount:      album.TotalTracks,
+			Kind:            album.kind(),
 			ArtworkURL:      bestImage(album.Images),
 		},
 		Tracks: make([]provider.Track, 0, len(tracks.Items)),
@@ -452,6 +454,7 @@ func (p *Provider) ArtistAlbums(ctx context.Context, providerArtistID string) ([
 			Artists:         artists,
 			Year:            yearOf(item.ReleaseDate),
 			TrackCount:      item.TotalTracks,
+			Kind:            item.kind(),
 			ArtworkURL:      bestImage(item.Images),
 		})
 	}
@@ -545,12 +548,22 @@ func bestImage(images []spotifyImage) string {
 type spotifyAlbum struct {
 	ID          string         `json:"id"`
 	Name        string         `json:"name"`
+	AlbumType   string         `json:"album_type"`
 	ReleaseDate string         `json:"release_date"`
 	TotalTracks int            `json:"total_tracks"`
 	Images      []spotifyImage `json:"images"`
 	Artists     []struct {
 		Name string `json:"name"`
 	} `json:"artists"`
+}
+
+// kind is what Spotify calls the release, in this server's words: a single is a
+// single, and a compilation is a record like any other.
+func (a spotifyAlbum) kind() string {
+	if strings.EqualFold(strings.TrimSpace(a.AlbumType), "single") {
+		return "single"
+	}
+	return "album"
 }
 
 func (a spotifyAlbum) artistNames() []string {

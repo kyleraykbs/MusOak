@@ -55,6 +55,8 @@ func (s *Server) routeTable() []route {
 		{"GET /api/v1/provider-playlists/{playlistId}", s.handleProviderPlaylist},
 		{"GET /api/v1/artists/search", s.handleArtistSearch},
 		{"GET /api/v1/artists/{artistId}", s.handleArtist},
+		{"GET /api/v1/artists/{artistId}/tracks", s.handleArtistTracks},
+		{"GET /api/v1/artists/{artistId}/catalogue", s.handleArtistCatalogue},
 		{"POST /api/v1/artists/{artistId}/sync", s.handleArtistSync},
 
 		{"GET /api/v1/media/{variantId}", s.handleMediaFile},

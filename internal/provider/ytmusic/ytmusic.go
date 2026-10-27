@@ -128,6 +128,7 @@ func (p *Provider) SearchAlbums(ctx context.Context, q string, opts provider.Sea
 			Artists:         hit.Artists,
 			Year:            hit.Year,
 			TrackCount:      hit.TrackCount,
+			Kind:            releaseKind(hit.Kind, "album"),
 			ArtworkURL:      hit.ArtworkURL,
 		})
 	}
@@ -242,6 +243,7 @@ func (p *Provider) Album(ctx context.Context, providerAlbumID string) (*provider
 			Artists:         hit.Artists,
 			Year:            hit.Year,
 			TrackCount:      hit.TrackCount,
+			Kind:            releaseKind(hit.Kind, "album"),
 			ArtworkURL:      hit.ArtworkURL,
 		},
 		Tracks: make([]provider.Track, 0, len(hit.Tracks)),
@@ -262,41 +264,51 @@ func (p *Provider) Album(ctx context.Context, providerAlbumID string) (*provider
 	return detail, nil
 }
 
-// ArtistAlbums implements provider.ArtistSearcher. YouTube Music has no plain
-// "artist albums" call, so the artist's song hit is used to reach the albums
-// the search endpoint exposes for that artist name.
+// ArtistAlbums implements provider.ArtistSearcher. YouTube Music's artist page
+// is the only place an artist's releases live, and the helper reads all of it:
+// the albums section and the singles section, each followed to its end, so this
+// is the discography rather than the ten releases the first page happens to
+// show.
+//
+// Singles come back marked as such rather than dropped: a library that cannot
+// see them cannot collect their songs, and what they are is the caller's to
+// decide.
 func (p *Provider) ArtistAlbums(ctx context.Context, providerArtistID string) ([]provider.Album, error) {
-	// The helper searches by name; the id is what the caller holds, so ask the
-	// provider for the artist's own page and fall back to a name search.
 	out, err := p.run(ctx, "artist", providerArtistID)
 	if err != nil {
 		return nil, err
 	}
 	var hit struct {
-		Name   string     `json:"name"`
-		Albums []albumHit `json:"albums"`
+		Name    string     `json:"name"`
+		Albums  []albumHit `json:"albums"`
+		Singles []albumHit `json:"singles"`
 	}
 	if err := json.Unmarshal(out, &hit); err != nil {
 		return nil, fmt.Errorf("ytmusic artist %s: parse helper output: %w", providerArtistID, err)
 	}
-	albums := make([]provider.Album, 0, len(hit.Albums))
-	for _, album := range hit.Albums {
-		if album.ID == "" {
-			continue
+	albums := make([]provider.Album, 0, len(hit.Albums)+len(hit.Singles))
+	appendHits := func(hits []albumHit, fallbackKind string) {
+		for _, album := range hits {
+			if album.ID == "" {
+				continue
+			}
+			artists := album.Artists
+			if len(artists) == 0 && hit.Name != "" {
+				artists = []string{hit.Name}
+			}
+			albums = append(albums, provider.Album{
+				ProviderAlbumID: album.ID,
+				Title:           album.Title,
+				Artists:         artists,
+				Year:            album.Year,
+				TrackCount:      album.TrackCount,
+				Kind:            releaseKind(album.Kind, fallbackKind),
+				ArtworkURL:      album.ArtworkURL,
+			})
 		}
-		artists := album.Artists
-		if len(artists) == 0 && hit.Name != "" {
-			artists = []string{hit.Name}
-		}
-		albums = append(albums, provider.Album{
-			ProviderAlbumID: album.ID,
-			Title:           album.Title,
-			Artists:         artists,
-			Year:            album.Year,
-			TrackCount:      album.TrackCount,
-			ArtworkURL:      album.ArtworkURL,
-		})
 	}
+	appendHits(hit.Albums, "album")
+	appendHits(hit.Singles, "single")
 	return albums, nil
 }
 
@@ -400,7 +412,20 @@ type albumHit struct {
 	Artists    []string `json:"artists"`
 	Year       string   `json:"year"`
 	TrackCount int      `json:"trackCount"`
-	ArtworkURL string   `json:"artworkUrl"`
+	// Kind is "album", "single" or "ep" as the helper read it.
+	Kind       string `json:"kind"`
+	ArtworkURL string `json:"artworkUrl"`
+}
+
+// releaseKind is what a helper field says a release is, or fallback when it says
+// nothing: a helper older than the field, or a fixture written before it.
+func releaseKind(value, fallback string) string {
+	switch kind := strings.ToLower(strings.TrimSpace(value)); kind {
+	case "album", "single", "ep":
+		return kind
+	default:
+		return fallback
+	}
 }
 
 type albumDetailHit struct {

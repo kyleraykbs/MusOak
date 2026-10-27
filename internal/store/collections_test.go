@@ -265,3 +265,184 @@ func TestAlbumMigrationKeepsExistingCredits(t *testing.T) {
 		t.Fatalf("albums after reopen = %+v, err = %v", albums, err)
 	}
 }
+
+// An artist's page reads their albums in the order a discography is read: the
+// singles container first, because it is not a release and has no date, then the
+// newest release, and anything undated last rather than at year zero.
+func TestAlbumsForArtistOrdersByRelease(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	artistID, err := db.EnsureArtist(ctx, "Pink Floyd")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	add := func(title, year, kind string) uuid.UUID {
+		id, err := db.EnsureAlbum(ctx, title, []string{"Pink Floyd"})
+		if err != nil {
+			t.Fatalf("EnsureAlbum(%q): %v", title, err)
+		}
+		if err := db.AttachAlbumArtist(ctx, id, artistID); err != nil {
+			t.Fatal(err)
+		}
+		if year != "" || kind != "" {
+			if _, _, err := db.AttachAlbumVariant(ctx, &AlbumVariant{
+				AlbumID: id, Provider: "ytmusic", ProviderAlbumID: "release-" + title,
+				Title: title, Artists: []string{"Pink Floyd"}, Year: year, TrackCount: 10, Kind: kind,
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return id
+	}
+	oldest := add("The Dark Side of the Moon", "1973", ReleaseKindAlbum)
+	newest := add("8-Tracks", "2026", ReleaseKindAlbum)
+	single := add("Time (edit)", "2023", ReleaseKindSingle)
+	undated := add("A Bootleg", "", "")
+
+	container, err := db.EnsureSinglesAlbum(ctx, artistID)
+	if err != nil {
+		t.Fatalf("EnsureSinglesAlbum: %v", err)
+	}
+	again, err := db.EnsureSinglesAlbum(ctx, artistID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.ID != container.ID {
+		t.Errorf("the container was not reused: %s then %s", container.ID, again.ID)
+	}
+	if container.Kind != AlbumKindSingles || container.Title != SinglesAlbumTitle {
+		t.Errorf("container = %+v", container)
+	}
+
+	albums, err := db.AlbumsForArtist(ctx, artistID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []struct {
+		id    uuid.UUID
+		title string
+	}{
+		{container.ID, SinglesAlbumTitle},
+		{newest, "8-Tracks"},
+		{single, "Time (edit)"},
+		{oldest, "The Dark Side of the Moon"},
+		{undated, "A Bootleg"},
+	}
+	if len(albums) != len(want) {
+		t.Fatalf("albums = %d, want %d", len(albums), len(want))
+	}
+	for i, expected := range want {
+		if albums[i].ID != expected.id || albums[i].Title != expected.title {
+			t.Errorf("album %d = %q (%s), want %q (%s)", i, albums[i].Title, albums[i].ID,
+				expected.title, expected.id)
+		}
+	}
+
+	// The container is not a record anybody released, so a provider release
+	// called "Singles" must never be matched onto it.
+	candidates, err := db.AlbumCandidates(ctx, "singles", "pink floyd", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range candidates {
+		if candidate.ID == container.ID {
+			t.Fatal("the singles container was offered as a match for a release")
+		}
+	}
+}
+
+// A library holds the spelling a release arrived with and the spelling somebody
+// searched for, and the same artist under two casings is one artist's songs. A
+// row can hold both, so the songs read has to see both.
+func TestArtistTracksFindsEverySpellingOfTheName(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	artistID, err := db.EnsureArtist(ctx, "Pink Floyd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An older library's twin: the same artist, upper-cased by the provider.
+	twinID := uuid.NewString()
+	if _, err := db.db.ExecContext(ctx, `INSERT INTO artists (id, name) VALUES (?, ?)`, twinID, "PINK FLOYD"); err != nil {
+		t.Fatal(err)
+	}
+	credit := func(title, artistName string) *Track {
+		track := mustTrack(t, db, title)
+		if err := db.SetTrackArtists(ctx, track.ID, []string{artistName}); err != nil {
+			t.Fatal(err)
+		}
+		return track
+	}
+	credit("Time", "Pink Floyd")
+	credit("Money", "PINK FLOYD")
+	credit("Breathe (In the Air)", "Pink Floyd")
+	credit("Wish You Were Here", "David Gilmour")
+
+	tracks, err := db.ArtistTracks(ctx, artistID, "", 10, 0)
+	if err != nil {
+		t.Fatalf("ArtistTracks: %v", err)
+	}
+	if len(tracks) != 3 {
+		t.Fatalf("tracks = %d, want 3 (both spellings, and nobody else)", len(tracks))
+	}
+	for i, want := range []string{"Breathe (In the Air)", "Money", "Time"} {
+		if tracks[i].Title != want {
+			t.Errorf("track %d = %q, want %q", i, tracks[i].Title, want)
+		}
+	}
+	total, err := db.CountArtistTracks(ctx, artistID, "")
+	if err != nil || total != 3 {
+		t.Errorf("CountArtistTracks = %d, %v, want 3", total, err)
+	}
+
+	narrowed, err := db.ArtistTracks(ctx, artistID, "tim", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(narrowed) != 1 || narrowed[0].Title != "Time" {
+		t.Errorf("searching \"tim\" = %+v, want Time", narrowed)
+	}
+	paged, err := db.ArtistTracks(ctx, artistID, "", 2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paged) != 2 || paged[0].Title != "Money" {
+		t.Errorf("page 2 = %+v", paged)
+	}
+}
+
+// Re-attaching a release fills in what the first read did not know - above all
+// what it is - without overwriting anything that was known.
+func TestAttachAlbumVariantFillsWhatIsUnknown(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	albumID, err := db.EnsureAlbum(ctx, "Time (edit)", []string{"Pink Floyd"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.AttachAlbumVariant(ctx, &AlbumVariant{
+		AlbumID: albumID, Provider: "ytmusic", ProviderAlbumID: "MPREb_time",
+		Title: "Time (edit)", TrackCount: 0,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	filled, created, err := db.AttachAlbumVariant(ctx, &AlbumVariant{
+		AlbumID: albumID, Provider: "ytmusic", ProviderAlbumID: "MPREb_time",
+		Title: "Time (edit)", Year: "2023", TrackCount: 1, Kind: ReleaseKindSingle,
+		Artists: []string{"Pink Floyd"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created {
+		t.Error("re-attaching created a second variant")
+	}
+	if filled.Kind != ReleaseKindSingle || filled.Year != "2023" || filled.TrackCount != 1 {
+		t.Errorf("the re-attach did not fill the release in: %+v", filled)
+	}
+	// What was already known stays.
+	if filled.Title != "Time (edit)" {
+		t.Errorf("title = %q", filled.Title)
+	}
+}

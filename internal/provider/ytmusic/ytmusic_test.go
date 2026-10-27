@@ -435,3 +435,69 @@ class YTMusic:
 		}
 	}
 }
+
+// An artist's page answers two sections, and every release says what it is. A
+// single is how a song came out rather than a record, so the caller needs to be
+// told which is which - and told the whole discography, not the first page of it,
+// which the helper follows itself.
+func TestArtistAlbumsKeepsSinglesApart(t *testing.T) {
+	fixture := filepath.Join(t.TempDir(), "artist.json")
+	const body = `{"name":"Pink Floyd",
+	  "albums":[{"id":"MPREb_dsotm","title":"The Dark Side of the Moon","year":"1973","kind":"album"},
+	            {"id":"","title":"no id"}],
+	  "singles":[{"id":"MPREb_time","title":"Time (edit - 2023 Master)","year":"2023","kind":"single"},
+	             {"id":"MPREb_ep","title":"Proper Education - EP","year":"2006","kind":"ep"}]}`
+	if err := os.WriteFile(fixture, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("YT_FIXTURE", fixture)
+
+	p := testProvider(t, stubPython(t, `cat "$YT_FIXTURE"`))
+	albums, err := p.ArtistAlbums(context.Background(), "UCpinkfloyd")
+	if err != nil {
+		t.Fatalf("ArtistAlbums: %v", err)
+	}
+	want := []struct {
+		id   string
+		kind string
+	}{
+		{"MPREb_dsotm", "album"},
+		{"MPREb_time", "single"},
+		{"MPREb_ep", "ep"},
+	}
+	if len(albums) != len(want) {
+		t.Fatalf("albums = %d, want %d", len(albums), len(want))
+	}
+	for i, expected := range want {
+		if albums[i].ProviderAlbumID != expected.id || albums[i].Kind != expected.kind {
+			t.Errorf("album %d = %s/%q, want %s/%q", i, albums[i].ProviderAlbumID,
+				albums[i].Kind, expected.id, expected.kind)
+		}
+		// The section's entries carry no credits of their own; the page's name is
+		// the artist on every release.
+		if len(albums[i].Artists) != 1 || albums[i].Artists[0] != "Pink Floyd" {
+			t.Errorf("album %d artists = %v", i, albums[i].Artists)
+		}
+	}
+}
+
+// A helper too old to send a kind still gets its sections read as what they are.
+func TestArtistAlbumsWithoutKindsFallsBackToTheSection(t *testing.T) {
+	fixture := filepath.Join(t.TempDir(), "artist.json")
+	const body = `{"name":"Pink Floyd",
+	  "albums":[{"id":"a","title":"A"}],
+	  "singles":[{"id":"b","title":"B"}]}`
+	if err := os.WriteFile(fixture, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("YT_FIXTURE", fixture)
+
+	p := testProvider(t, stubPython(t, `cat "$YT_FIXTURE"`))
+	albums, err := p.ArtistAlbums(context.Background(), "UCpinkfloyd")
+	if err != nil {
+		t.Fatalf("ArtistAlbums: %v", err)
+	}
+	if len(albums) != 2 || albums[0].Kind != "album" || albums[1].Kind != "single" {
+		t.Fatalf("albums = %+v", albums)
+	}
+}

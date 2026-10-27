@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/google/uuid"
 
 	"github.com/kyleraykbs/MusOak/internal/library"
+	"github.com/kyleraykbs/MusOak/internal/provider"
 	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
@@ -22,15 +24,21 @@ type albumVariantResponse struct {
 }
 
 type albumResponse struct {
-	ID         string                 `json:"id"`
-	Title      string                 `json:"title"`
-	Artists    []string               `json:"artists"`
-	Year       string                 `json:"year,omitempty"`
-	TrackCount int                    `json:"trackCount"`
+	ID         string   `json:"id"`
+	Title      string   `json:"title"`
+	Artists    []string `json:"artists"`
+	Year       string   `json:"year,omitempty"`
+	TrackCount int      `json:"trackCount"`
+	// Kind is "album", "single" or "ep" for a release, and "singles" for the
+	// container an artist's single releases are collected into.
+	Kind       string                 `json:"kind,omitempty"`
 	Providers  []string               `json:"providers"`
 	ArtworkURL string                 `json:"artworkUrl,omitempty"`
 	Variants   []albumVariantResponse `json:"variants,omitempty"`
 	Tracks     []trackResponse        `json:"tracks,omitempty"`
+	// Catalogue is set on the singles container: the artist's catalogue read is
+	// what fills it, so the page can say it is still arriving.
+	Catalogue *library.CatalogueState `json:"catalogue,omitempty"`
 }
 
 type artistVariantResponse struct {
@@ -47,6 +55,9 @@ type artistResponse struct {
 	ArtworkURL string                  `json:"artworkUrl,omitempty"`
 	Variants   []artistVariantResponse `json:"variants,omitempty"`
 	Albums     []albumResponse         `json:"albums,omitempty"`
+	// Catalogue is the artist's catalogue read: opening an artist starts one,
+	// and a page showing songs as they land polls it.
+	Catalogue *library.CatalogueState `json:"catalogue,omitempty"`
 }
 
 type syncRequest struct {
@@ -74,6 +85,7 @@ func (s *Server) buildAlbum(ctx context.Context, album *library.Album, withTrack
 		Title:      album.Album.Title,
 		Artists:    make([]string, 0, len(album.Artists)),
 		TrackCount: len(album.Tracks),
+		Kind:       albumKind(album),
 		Providers:  make([]string, 0, len(album.Variants)),
 		Variants:   make([]albumVariantResponse, 0, len(album.Variants)),
 	}
@@ -84,13 +96,17 @@ func (s *Server) buildAlbum(ctx context.Context, album *library.Album, withTrack
 		out.ArtworkURL = artworkPath(store.ArtworkAlbum, album.Album.ID)
 	}
 	seen := map[string]bool{}
+	earliest := 0
 	for _, variant := range album.Variants {
 		if !seen[variant.Provider] {
 			seen[variant.Provider] = true
 			out.Providers = append(out.Providers, variant.Provider)
 		}
-		if out.Year == "" && variant.Year != "" {
-			out.Year = variant.Year
+		// The record's own year is its earliest release - a remaster does not move
+		// it to the year it was remastered - and it is the year the artist's albums
+		// are ordered by, so the page and the order cannot disagree.
+		if year, ok := provider.YearValue(variant.Year); ok && (earliest == 0 || year < earliest) {
+			earliest, out.Year = year, variant.Year
 		}
 		out.Variants = append(out.Variants, albumVariantResponse{
 			ID:              variant.ID.String(),
@@ -145,10 +161,47 @@ func (s *Server) buildArtist(ctx context.Context, artist *library.Artist, withAl
 			if err != nil {
 				return artistResponse{}, err
 			}
+			// A single is not a record: this page lists the records and the one
+			// container the singles are collected into. The single's own album is
+			// still there to open from a search.
+			if isSingleReleaseKind(response.Kind) {
+				continue
+			}
 			out.Albums = append(out.Albums, response)
 		}
 	}
 	return out, nil
+}
+
+// albumKind is what an album is, in the response's words: the singles container
+// when it is one, and otherwise what its releases say - a record when any release
+// of it is a record, an EP when the most any release says is EP, and a single
+// when every release is one. An album nobody has classified is a record, which is
+// what everything was before the providers were asked.
+func albumKind(album *library.Album) string {
+	if album.Album.Kind == store.AlbumKindSingles {
+		return store.AlbumKindSingles
+	}
+	rank := map[string]int{
+		"":                      0,
+		store.ReleaseKindSingle: 1,
+		store.ReleaseKindEP:     2,
+		store.ReleaseKindAlbum:  3,
+	}
+	best := ""
+	for _, variant := range album.Variants {
+		if rank[variant.Kind] > rank[best] {
+			best = variant.Kind
+		}
+	}
+	if best == "" {
+		return store.ReleaseKindAlbum
+	}
+	return best
+}
+
+func isSingleReleaseKind(kind string) bool {
+	return kind == store.ReleaseKindSingle || kind == store.ReleaseKindEP
 }
 
 // handleAlbumSearch fans out to the album-capable providers and returns the
@@ -247,11 +300,18 @@ func problemsJSON(problems []library.ProviderError) []providerProblem {
 }
 
 // handleAlbum returns one album with its tracks.
+//
+// An album's page shows every song it has, so the read that gets it there happens
+// before the answer: a release nobody has read, or an album a single song left
+// behind, is filled in now rather than by a button. The page waits for it, which
+// is one provider call.
 func (s *Server) handleAlbum(w http.ResponseWriter, r *http.Request) {
 	albumID, ok := s.collectionID(w, r, "albumId")
 	if !ok {
 		return
 	}
+	s.library.EnsureAlbumTracks(r.Context(), albumID)
+
 	album, err := s.library.GetAlbum(r.Context(), albumID)
 	if err != nil {
 		writeLibraryError(w, err)
@@ -262,16 +322,26 @@ func (s *Server) handleAlbum(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err, "album unavailable")
 		return
 	}
+	// The singles container holds what the artist's catalogue read brings in, so
+	// opening it starts (or joins) that read and says how far it has got.
+	if album.Album.Kind == store.AlbumKindSingles && len(album.Artists) > 0 {
+		state := s.library.StartCatalogue(album.Artists[0].ID)
+		response.Catalogue = &state
+	}
 	s.withPlays(r.Context(), s.currentUser(r), trackRefs(response.Tracks))
 	writeJSON(w, http.StatusOK, response)
 }
 
-// handleArtist returns one artist with their albums.
+// handleArtist returns one artist with their albums, and starts reading their
+// catalogue: the records are there at once and their songs arrive as they are
+// found, which is what the page polls for.
 func (s *Server) handleArtist(w http.ResponseWriter, r *http.Request) {
 	artistID, ok := s.collectionID(w, r, "artistId")
 	if !ok {
 		return
 	}
+	state := s.library.StartCatalogue(artistID)
+
 	artist, err := s.library.GetArtist(r.Context(), artistID)
 	if err != nil {
 		writeLibraryError(w, err)
@@ -282,7 +352,80 @@ func (s *Server) handleArtist(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err, "artist unavailable")
 		return
 	}
+	response.Catalogue = &state
 	writeJSON(w, http.StatusOK, response)
+}
+
+// handleArtistCatalogue reports what an artist's catalogue read is doing. A page
+// that is showing songs as they arrive asks this until it is done.
+func (s *Server) handleArtistCatalogue(w http.ResponseWriter, r *http.Request) {
+	artistID, ok := s.collectionID(w, r, "artistId")
+	if !ok {
+		return
+	}
+	state, started := s.library.CatalogueStatus(artistID)
+	if !started {
+		// Nothing has been read for this artist yet, and somebody is asking: that
+		// is as good a reason to start as opening the page.
+		state = s.library.StartCatalogue(artistID)
+	}
+	writeJSON(w, http.StatusOK, state)
+}
+
+// handleArtistTracks lists an artist's songs, by title, with the query matched
+// anywhere in the title: the songs panel's search box and its scrolling.
+func (s *Server) handleArtistTracks(w http.ResponseWriter, r *http.Request) {
+	artistID, ok := s.collectionID(w, r, "artistId")
+	if !ok {
+		return
+	}
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	limit := clampArtistTracksLimit(intParam(r, "limit", artistTracksLimit))
+	offset := intParam(r, "offset", 0)
+	if offset < 0 {
+		offset = 0
+	}
+
+	ctx := r.Context()
+	tracks, err := s.store.ArtistTracks(ctx, artistID, query, limit, offset)
+	if err != nil {
+		writeStoreError(w, err, "artist songs unavailable")
+		return
+	}
+	total, err := s.store.CountArtistTracks(ctx, artistID, query)
+	if err != nil {
+		writeStoreError(w, err, "artist songs unavailable")
+		return
+	}
+	out := make([]trackResponse, 0, len(tracks))
+	for _, track := range tracks {
+		built, err := s.buildTrack(ctx, track)
+		if err != nil {
+			writeStoreError(w, err, "artist songs unavailable")
+			return
+		}
+		out = append(out, built)
+	}
+	s.withPlays(ctx, s.currentUser(r), trackRefs(out))
+	writeJSON(w, http.StatusOK, struct {
+		Tracks []trackResponse `json:"tracks"`
+		Total  int             `json:"total"`
+	}{Tracks: out, Total: total})
+}
+
+// artistTracksLimit is the default page size for an artist's songs. The songs
+// panel is a scrollable catalogue, not a search suggestion list, so its cap is
+// larger than the general search cap.
+const artistTracksLimit = 200
+
+func clampArtistTracksLimit(limit int) int {
+	if limit < 1 {
+		return 1
+	}
+	if limit > artistTracksLimit {
+		return artistTracksLimit
+	}
+	return limit
 }
 
 // handleAlbumSync pulls the album's provider tracklists into the library.

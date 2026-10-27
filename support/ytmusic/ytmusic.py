@@ -15,6 +15,7 @@
 # Every command prints one JSON document on stdout.
 import json
 import sys
+import time
 
 from ytmusicapi import YTMusic
 
@@ -147,8 +148,55 @@ def song(item):
     }
 
 
+def release_kind(item, section):
+    """Whether a release is an album, a single or an EP.
+
+    The endpoint says so in the entry's own `type` where it fills one in, and
+    where it does not - the first page of an artist's albums section omits it
+    while the continuation carries it - the section the entry came from says
+    it: a release in `singles` is a single, one in `albums` is an album. EPs
+    are singles with another name, which is why they live in that section.
+    """
+    kind = str(item.get("type", "") or "").strip().lower()
+    if kind in ("album", "single", "ep"):
+        return kind
+    return "single" if section == "singles" else "album"
+
+
+def release(item, section):
+    """One release of an artist page, in the shape the caller stores."""
+    return {
+        "id": item.get("browseId", "") or "",
+        "title": item.get("title", "") or "",
+        "artists": artists_of(item),
+        "year": str(item.get("year", "") or ""),
+        "trackCount": count_of(item.get("trackCount")),
+        "kind": release_kind(item, section),
+        "artworkUrl": artwork_of(item),
+    }
+
+
+def with_retry(run, attempts=3, pause=0.5):
+    """Run one call to YouTube Music, retrying a refused one.
+
+    The endpoint answers with an empty body when it is asked for a lot at once
+    - ytmusicapi surfaces that as a JSON decode error - and the refusal is over
+    in a moment. A whole artist is dozens of calls, so one refused request must
+    not lose an album: three tries with a growing pause turn a burst into a slow
+    read instead of a failed one, and a failure that survives them is real.
+    """
+    for attempt in range(attempts):
+        try:
+            return run()
+        except Exception:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(pause)
+            pause *= 2
+
+
 def search(yt, kind, query, limit):
-    raw = yt.search(query, filter=kind, limit=limit) or []
+    raw = with_retry(lambda: yt.search(query, filter=kind, limit=limit)) or []
     if kind == "songs":
         return [song(item) for item in raw if item.get("videoId")]
     if kind == "albums":
@@ -159,6 +207,7 @@ def search(yt, kind, query, limit):
                 "artists": artists_of(item),
                 "year": str(item.get("year", "") or ""),
                 "trackCount": count_of(item.get("trackCount")),
+                "kind": release_kind(item, "albums"),
                 "artworkUrl": artwork_of(item),
             }
             for item in raw
@@ -178,41 +227,70 @@ def search(yt, kind, query, limit):
 
 
 def album(yt, browse_id):
-    raw = yt.get_album(browse_id) or {}
+    raw = with_retry(lambda: yt.get_album(browse_id)) or {}
     return {
         "id": browse_id,
         "title": raw.get("title", "") or "",
         "artists": artists_of(raw),
         "year": str(raw.get("year", "") or ""),
         "trackCount": count_of(raw.get("trackCount")),
+        "kind": release_kind(raw, "albums"),
         "artworkUrl": artwork_of(raw),
+        # One call, the whole tracklist: get_album has no page size and no
+        # continuation, so an album read is complete by construction.
         "tracks": [song(track) for track in (raw.get("tracks") or []) if track.get("videoId")],
     }
 
 
+def section_releases(yt, block, section, artist_id):
+    """One section of an artist page: its first page and everything after it.
+
+    `get_artist` answers with the top of each section - ten releases - plus a
+    `params` for the rest, and ytmusicapi's own continuation call is what turns
+    those ten into the artist's whole discography. Pink Floyd's page is ten
+    releases without it and thirty-seven with, and The Dark Side of the Moon is
+    one of the twenty-seven the first page never had: the endpoint chooses the
+    ten, and this is the only way to learn the rest.
+
+    A continuation that fails is retried before it is given up on: the endpoint
+    refuses requests in bursts when it is asked for a lot at once, and a burst
+    is over in a moment. A continuation that still fails raises, because a
+    silently short discography is the bug this whole read exists to fix - the
+    caller records the failure and asks again later.
+    """
+    out = [release(item, section) for item in (block.get("results") or []) if item.get("browseId")]
+    params = block.get("params") or ""
+    browse = block.get("browseId") or artist_id
+    if params and browse:
+        more = with_retry(lambda: yt.get_artist_albums(browse, params, limit=None)) or []
+        out.extend(release(item, section) for item in more if item.get("browseId"))
+    # The continuation repeats the first page before continuing it, so the two
+    # are the same list read twice at the seam.
+    seen = set()
+    unique = []
+    for entry in out:
+        if entry["id"] in seen:
+            continue
+        seen.add(entry["id"])
+        unique.append(entry)
+    return unique
+
+
 def artist(yt, browse_id):
-    raw = yt.get_artist(browse_id) or {}
-    albums = []
-    for section in ("albums", "singles", "ep"):
-        block = raw.get(section) or {}
-        for item in block.get("results") or []:
-            if not item.get("browseId"):
-                continue
-            albums.append(
-                {
-                    "id": item.get("browseId", ""),
-                    "title": item.get("title", "") or "",
-                    "artists": artists_of(item),
-                    "year": str(item.get("year", "") or ""),
-                    "trackCount": count_of(item.get("trackCount")),
-                    "artworkUrl": artwork_of(item),
-                }
-            )
-    return {"name": raw.get("name", "") or "", "artworkUrl": artwork_of(raw), "albums": albums}
+    raw = with_retry(lambda: yt.get_artist(browse_id)) or {}
+    # Albums and singles come back apart because they are apart: a single is how
+    # a song was released, not a record, and it is the caller's to place. Either
+    # way every entry carries its own kind.
+    return {
+        "name": raw.get("name", "") or "",
+        "artworkUrl": artwork_of(raw),
+        "albums": section_releases(yt, raw.get("albums") or {}, "albums", browse_id),
+        "singles": section_releases(yt, raw.get("singles") or {}, "singles", browse_id),
+    }
 
 
 def radio(yt, video_id, limit):
-    raw = yt.get_watch_playlist(videoId=video_id, limit=limit) or {}
+    raw = with_retry(lambda: yt.get_watch_playlist(videoId=video_id, limit=limit)) or {}
     tracks = [song(item) for item in (raw.get("tracks") or [])]
     # The first entry is usually the seed itself; the caller already has it.
     return [track for track in tracks if track["id"] and track["id"] != video_id]
@@ -220,7 +298,7 @@ def radio(yt, video_id, limit):
 
 def playlists(yt, query, limit):
     # Search answers in whole pages (20, 40, ...), so trim to the asked-for size.
-    raw = (yt.search(query, filter="playlists", limit=limit) or [])[:limit]
+    raw = (with_retry(lambda: yt.search(query, filter="playlists", limit=limit)) or [])[:limit]
     return [
         {
             "id": item.get("browseId", "") or "",
@@ -237,7 +315,7 @@ def playlists(yt, query, limit):
 
 def playlist(yt, browse_id):
     # limit=None fetches the whole tracklist; the default stops at 100.
-    raw = yt.get_playlist(browse_id, limit=None) or {}
+    raw = with_retry(lambda: yt.get_playlist(browse_id, limit=None)) or {}
     tracks = [song(track) for track in (raw.get("tracks") or []) if track.get("videoId")]
     return {
         "id": browse_id,

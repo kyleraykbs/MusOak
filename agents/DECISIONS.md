@@ -324,3 +324,7 @@
   library access and the web UI consequently opened a sign-in prompt for every
   guest search.
 - Reversible: yes.
+## [2026-10-27] Artist catalogues are paged, classified, and read in the background
+- Decision: follow YT Music artist-section continuations instead of accepting its first ten releases; carry album/single/EP kind; show albums newest-first by earliest release year; collect an artist's singles into one synthetic `Singles` album; start a paced, resumable catalogue read when an artist opens; and make an album GET wait for a complete tracklist, including adopting a provider release for a track-born album.
+- Why: Pink Floyd's first page omitted 27 albums including The Dark Side of the Moon, singles polluted the album list, and a track-born Dark Side of the Moon held only the song that created it. YT Music has no bulk all-songs call: `get_album` is complete per release, so the artist-wide read must be background work.
+- Reversible: yes

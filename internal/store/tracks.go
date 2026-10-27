@@ -254,13 +254,27 @@ func (d *DB) EnsureArtist(ctx context.Context, name string) (uuid.UUID, error) {
 	return ensureArtist(ctx, d.db, name)
 }
 
+// ensureArtist returns the canonical artist of a name, creating it when it is
+// new. Names are matched once normalised - lowercased, whitespace collapsed -
+// because providers disagree about casing and spacing for the same artist, and a
+// library holding both "Pink Floyd" and "PINK FLOYD" holds two artists who each
+// have half the songs. The stored row keeps the spelling it was created with.
 func ensureArtist(ctx context.Context, q execer, name string) (uuid.UUID, error) {
-	if _, err := q.ExecContext(ctx,
-		`INSERT OR IGNORE INTO artists (id, name) VALUES (?, ?)`, uuid.NewString(), name); err != nil {
+	normalized := strings.ToLower(strings.Join(strings.Fields(name), " "))
+	var id string
+	err := q.QueryRowContext(ctx,
+		`SELECT id FROM artists WHERE lower(trim(name)) = ? LIMIT 1`, normalized).Scan(&id)
+	if err == nil {
+		return parseUUID(id)
+	}
+	if !isNotFound(err) {
 		return uuid.Nil, mapErr(err)
 	}
-	var id string
-	if err := q.QueryRowContext(ctx, `SELECT id FROM artists WHERE name = ?`, name).Scan(&id); err != nil {
+	if _, err := q.ExecContext(ctx,
+		`INSERT OR IGNORE INTO artists (id, name) VALUES (?, ?)`, uuid.NewString(), strings.TrimSpace(name)); err != nil {
+		return uuid.Nil, mapErr(err)
+	}
+	if err := q.QueryRowContext(ctx, `SELECT id FROM artists WHERE name = ?`, strings.TrimSpace(name)).Scan(&id); err != nil {
 		return uuid.Nil, mapErr(err)
 	}
 	return parseUUID(id)

@@ -137,6 +137,7 @@ func (m *Matcher) matchAlbumLocked(ctx context.Context, providerName string, hit
 			Artists:         hit.Artists,
 			Year:            hit.Year,
 			TrackCount:      hit.TrackCount,
+			Kind:            hit.Kind,
 		})
 		if err != nil {
 			return nil, nil, false, err
@@ -162,6 +163,7 @@ func (m *Matcher) matchAlbumLocked(ctx context.Context, providerName string, hit
 		Artists:         hit.Artists,
 		Year:            hit.Year,
 		TrackCount:      hit.TrackCount,
+		Kind:            hit.Kind,
 	})
 	if err != nil {
 		return nil, nil, false, err
@@ -172,6 +174,46 @@ func (m *Matcher) matchAlbumLocked(ctx context.Context, providerName string, hit
 		}
 	}
 	return album, variant, created, nil
+}
+
+// Threshold is the score a match has to reach to count as the same record. It is
+// exposed because the library adopts a release for an album that has none, and
+// that decision has to hold to the same bar the matcher does.
+func (m *Matcher) Threshold() float64 { return m.threshold }
+
+// AttachAlbumRelease records a provider release as a release of the named
+// canonical album, without asking which album it belongs to: the caller has the
+// album in hand - it is the page somebody is looking at - and the release is one
+// it found for it. A cover or a year the album does not have yet is filled in,
+// and nothing already known is touched.
+func (m *Matcher) AttachAlbumRelease(ctx context.Context, albumID uuid.UUID, providerName string, hit provider.Album) (*store.AlbumVariant, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	variant, _, err := m.db.AttachAlbumVariant(ctx, &store.AlbumVariant{
+		AlbumID:         albumID,
+		Provider:        providerName,
+		ProviderAlbumID: hit.ProviderAlbumID,
+		Title:           hit.Title,
+		Artists:         hit.Artists,
+		Year:            hit.Year,
+		TrackCount:      hit.TrackCount,
+		Kind:            hit.Kind,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if hit.ArtworkURL == "" {
+		return variant, nil
+	}
+	if err := m.db.SetAlbumVariantArtwork(ctx, variant.ID, hit.ArtworkURL); err != nil {
+		m.logger.Warn("match: set album variant artwork", "variant", variant.ID, "error", err)
+	}
+	if album, err := m.db.Album(ctx, albumID); err == nil && album.ArtworkURL == "" {
+		if err := m.db.SetAlbumArtwork(ctx, albumID, hit.ArtworkURL); err != nil {
+			m.logger.Warn("match: set album artwork", "album", albumID, "error", err)
+		}
+	}
+	return variant, nil
 }
 
 // findOrCreateAlbumLocked scores the provider release against the albums that

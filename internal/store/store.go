@@ -51,8 +51,13 @@ type Artist struct {
 // Album is a canonical album. Its identity is the title plus its primary
 // artist, so two artists may each have a "Greatest Hits".
 type Album struct {
-	ID        uuid.UUID
-	Title     string
+	ID    uuid.UUID
+	Title string
+	// Kind is what the album is to a listener. "album" is a record; "singles"
+	// is the container an artist's single releases are collected into, which is
+	// not a release of anybody's and carries no provider variant. What a
+	// *release* is - album, single or EP - lives on its AlbumVariant.Kind.
+	Kind      string
 	CreatedAt time.Time
 	// ArtworkURL is where the cover came from.
 	ArtworkURL string
@@ -397,7 +402,13 @@ CREATE INDEX IF NOT EXISTS variants_provider ON variants(provider);
 type migration struct {
 	version int
 	name    string
-	sql     string
+	// sql is the migration's statements, or empty when apply holds them.
+	sql string
+	// apply is a migration that has to look before it acts: adding a column is
+	// not idempotent in SQLite and testing for one is not expressible as DDL,
+	// so a migration that adds a column asks pragma_table_info first. It runs
+	// inside the migration's transaction, before sql when both are set.
+	apply func(context.Context, *sql.Tx) error
 }
 
 // schemaV23 gives each owner an explicit playlist-list order. It is a table
@@ -441,6 +452,52 @@ var migrations = []migration{
 	{version: 21, name: "read indexes", sql: schemaV21},
 	{version: 22, name: "favorite ratings and decimal votes", sql: schemaV22},
 	{version: 23, name: "playlist order", sql: schemaV23},
+	{version: 24, name: "release kinds", apply: addReleaseKinds},
+}
+
+// addReleaseKinds records what a release is. An artist's page mixes records with
+// the singles that came off them, and a single is not an album: the album list
+// has to be able to tell them apart, and the singles are collected into one
+// container album per artist rather than listed as records of their own.
+//
+// The variant column is empty for everything already stored - nobody said what
+// those releases were - and an empty kind reads as "not known yet", which the
+// next read of that release fills in. The album column defaults to "album",
+// which is what every row already there is apart from the containers.
+//
+// The columns are added rather than the tables rebuilt, so a database that
+// already knows what its releases are keeps knowing it when an older migration
+// is replayed in a test: ADD COLUMN has no "unless it is already there" form, so
+// each one is asked for first.
+func addReleaseKinds(ctx context.Context, tx *sql.Tx) error {
+	columns := []struct{ table, name, declaration string }{
+		{"albums", "kind", "TEXT NOT NULL DEFAULT 'album'"},
+		{"album_variants", "kind", "TEXT NOT NULL DEFAULT ''"},
+	}
+	for _, column := range columns {
+		if err := addColumnUnlessPresent(ctx, tx, column.table, column.name, column.declaration); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// addColumnUnlessPresent adds a column to a table that does not have it. The
+// names are this package's own constants, never anything a caller supplies.
+func addColumnUnlessPresent(ctx context.Context, tx *sql.Tx, table, column, declaration string) error {
+	var present int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT count(*) FROM pragma_table_info('`+table+`') WHERE name = '`+column+`'`).Scan(&present); err != nil {
+		return err
+	}
+	if present > 0 {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx,
+		`ALTER TABLE `+table+` ADD COLUMN `+column+` `+declaration); err != nil {
+		return err
+	}
+	return nil
 }
 
 // schemaV22 stores favorite ratings in integer tenths and gives room votes
@@ -493,8 +550,15 @@ func (d *DB) migrate(ctx context.Context) error {
 			continue
 		}
 		err := d.withTx(ctx, func(tx *sql.Tx) error {
-			if _, err := tx.ExecContext(ctx, m.sql); err != nil {
-				return err
+			if m.apply != nil {
+				if err := m.apply(ctx, tx); err != nil {
+					return err
+				}
+			}
+			if m.sql != "" {
+				if _, err := tx.ExecContext(ctx, m.sql); err != nil {
+					return err
+				}
 			}
 			_, err := tx.ExecContext(ctx,
 				`INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)`,

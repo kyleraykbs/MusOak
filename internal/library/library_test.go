@@ -490,8 +490,10 @@ func TestProviderSelectionIsHonoured(t *testing.T) {
 	if len(ytmusic.albumCalls) != 0 {
 		t.Errorf("ytmusic was called %v, want nothing", ytmusic.albumCalls)
 	}
-	if len(spotify.albumCalls) != 1 {
-		t.Errorf("spotify calls = %v, want one", spotify.albumCalls)
+	// A read that failed is asked a second time before it is believed, so this is
+	// one call or two; what matters is that only the selected provider was asked.
+	if len(spotify.albumCalls) == 0 {
+		t.Errorf("spotify was never asked, want at least one call")
 	}
 }
 
@@ -677,5 +679,289 @@ func TestSyncPlaylistOnAnUnknownPlaylist(t *testing.T) {
 	_, err := f.service.SyncPlaylist(context.Background(), uuid.New(), nil)
 	if !errors.Is(err, ErrNoPlaylist) {
 		t.Fatalf("err = %v, want ErrNoPlaylist", err)
+	}
+}
+
+// A discography is records and singles, and a page lists them apart: the records
+// under the artist, and everything they put out as a single collected into one
+// album of its own.
+func TestSyncArtistCollectsSinglesIntoOneAlbum(t *testing.T) {
+	release := func(id, title, year, kind, album string, titles ...string) (provider.Album, *provider.AlbumDetail) {
+		tracks := make([]provider.Track, 0, len(titles))
+		for i, song := range titles {
+			tracks = append(tracks, provider.Track{
+				ProviderTrackID: id + "-" + string(rune('a'+i)), Title: song,
+				Artists: []string{"Pink Floyd"}, Album: album, DurationMs: 200_000,
+			})
+		}
+		hit := provider.Album{
+			ProviderAlbumID: id, Title: title, Artists: []string{"Pink Floyd"},
+			Year: year, TrackCount: len(tracks), Kind: kind,
+		}
+		return hit, &provider.AlbumDetail{Album: hit, Tracks: tracks}
+	}
+	record, recordDetail := release("rel_album", "The Dark Side of the Moon", "1973",
+		store.ReleaseKindAlbum, "The Dark Side of the Moon", "Speak to Me", "Breathe (In the Air)")
+	single, singleDetail := release("rel_single", "Money (Early Mix)", "2020",
+		store.ReleaseKindSingle, "Money (Early Mix)", "Money (Early Mix)")
+	ep, epDetail := release("rel_ep", "Proper Education - EP", "2006",
+		store.ReleaseKindEP, "Proper Education - EP", "Proper Education", "Another Brick")
+	ytmusic := &fakeProvider{
+		name:     "ytmusic",
+		artists:  []provider.Artist{{ProviderArtistID: "UCpf", Name: "Pink Floyd"}},
+		byArtist: map[string][]provider.Album{"UCpf": {record, single, ep}},
+		details: map[string]*provider.AlbumDetail{
+			"rel_album": recordDetail, "rel_single": singleDetail, "rel_ep": epDetail,
+		},
+	}
+	f := newFixture(t, ytmusic)
+	ctx := context.Background()
+
+	artists, _, err := f.service.SearchArtists(ctx, "pink floyd", 5, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artistID := artists[0].ID
+
+	if _, err := f.service.SyncArtist(ctx, artistID, nil, true, false); err != nil {
+		t.Fatalf("SyncArtist: %v", err)
+	}
+
+	detailed, err := f.service.GetArtist(ctx, artistID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The container is first, then the releases newest first: the single, the EP,
+	// the record.
+	if len(detailed.Albums) != 4 {
+		t.Fatalf("albums = %d, want the container and three releases", len(detailed.Albums))
+	}
+	if detailed.Albums[0].Kind != store.AlbumKindSingles ||
+		detailed.Albums[0].Title != store.SinglesAlbumTitle {
+		t.Fatalf("first album = %+v, want the singles container", detailed.Albums[0])
+	}
+	containerTracks, err := f.db.AlbumTracks(ctx, detailed.Albums[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(containerTracks) != 3 {
+		t.Errorf("the container holds %d tracks, want the single and the EP's three",
+			len(containerTracks))
+	}
+
+	// What the API filters on, and what each release keeps: its own kind, and its
+	// own songs.
+	kindAndTracks := func(id uuid.UUID) (string, int) {
+		tracks, err := f.db.AlbumTracks(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		variants, err := f.db.AlbumVariants(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		kind := ""
+		for _, variant := range variants {
+			kind = variant.Kind
+		}
+		return kind, len(tracks)
+	}
+	want := map[string]struct {
+		kind   string
+		tracks int
+	}{
+		"The Dark Side of the Moon": {store.ReleaseKindAlbum, 2},
+		"Money (Early Mix)":         {store.ReleaseKindSingle, 1},
+		"Proper Education - EP":     {store.ReleaseKindEP, 2},
+	}
+	for _, album := range detailed.Albums[1:] {
+		expected, ok := want[album.Title]
+		if !ok {
+			t.Errorf("unexpected album %q", album.Title)
+			continue
+		}
+		if kind, tracks := kindAndTracks(album.ID); kind != expected.kind || tracks != expected.tracks {
+			t.Errorf("%q = %q with %d tracks, want %q with %d", album.Title, kind, tracks,
+				expected.kind, expected.tracks)
+		}
+	}
+}
+
+// Opening an album shows every song it has. An album a *track* created has no
+// release to read, which is how "The Dark Side of the Moon" sat there holding the
+// one song somebody had searched for: the page finds the release and reads it.
+func TestEnsureAlbumTracksAdoptsTheReleaseOfATrackBornAlbum(t *testing.T) {
+	ytmusic := &fakeProvider{name: "ytmusic"}
+	f := newFixture(t, ytmusic)
+	ctx := context.Background()
+
+	// One song searched: it creates the album holding only itself.
+	hit := provider.Track{
+		ProviderTrackID: "yt_time", Title: "Time", Artists: []string{"Pink Floyd"},
+		Album: "The Dark Side of the Moon", DurationMs: 414_000,
+	}
+	track, _, err := f.service.matcher.Attach(ctx, "ytmusic", hit)
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	albums, err := f.db.TrackAlbums(ctx, track.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(albums) != 1 {
+		t.Fatalf("albums for the track = %d, want 1", len(albums))
+	}
+	albumID := albums[0].ID
+	before, err := f.db.AlbumTracks(ctx, albumID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before) != 1 {
+		t.Fatalf("the album holds %d tracks before the page opens, want 1", len(before))
+	}
+	if variants, err := f.db.AlbumVariants(ctx, albumID); err != nil {
+		t.Fatal(err)
+	} else if len(variants) != 0 {
+		t.Fatalf("a track-born album has %d releases, want none", len(variants))
+	}
+
+	// The provider knows the record.
+	tracks := []provider.Track{
+		{ProviderTrackID: "yt_speak", Title: "Speak to Me", Artists: []string{"Pink Floyd"},
+			Album: "The Dark Side of the Moon", DurationMs: 66_000},
+		{ProviderTrackID: "yt_breathe", Title: "Breathe (In the Air)", Artists: []string{"Pink Floyd"},
+			Album: "The Dark Side of the Moon", DurationMs: 170_000},
+		{ProviderTrackID: "yt_ontherun", Title: "On the Run", Artists: []string{"Pink Floyd"},
+			Album: "The Dark Side of the Moon", DurationMs: 226_000},
+		// The same recording the search found, so it joins that song rather than
+		// becoming a second one.
+		{ProviderTrackID: "yt_time_album", Title: "Time", Artists: []string{"Pink Floyd"},
+			Album: "The Dark Side of the Moon", DurationMs: 414_000},
+	}
+	record := provider.Album{
+		ProviderAlbumID: "MPREb_dsotm", Title: "The Dark Side of the Moon",
+		Artists: []string{"Pink Floyd"}, Year: "1973", TrackCount: len(tracks),
+		Kind: store.ReleaseKindAlbum,
+	}
+	ytmusic.albums = []provider.Album{record}
+	ytmusic.details = map[string]*provider.AlbumDetail{"MPREb_dsotm": {Album: record, Tracks: tracks}}
+
+	f.service.EnsureAlbumTracks(ctx, albumID)
+
+	after, err := f.db.AlbumTracks(ctx, albumID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(tracks) {
+		t.Fatalf("the album holds %d tracks after the page opened, want %d", len(after), len(tracks))
+	}
+	variants, err := f.db.AlbumVariants(ctx, albumID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(variants) != 1 || variants[0].ProviderAlbumID != "MPREb_dsotm" {
+		t.Fatalf("the album's release was not recorded: %+v", variants)
+	}
+	if variants[0].TrackCount != len(tracks) {
+		t.Errorf("release track count = %d, want %d", variants[0].TrackCount, len(tracks))
+	}
+}
+
+// Opening an artist reads their whole catalogue in the background, and says how
+// far it has got while it does.
+func TestCatalogueReadsTheWholeDiscographyOnce(t *testing.T) {
+	release := func(id, title, year, kind string, tracks ...provider.Track) (provider.Album, *provider.AlbumDetail) {
+		hit := provider.Album{
+			ProviderAlbumID: id, Title: title, Artists: []string{"Pink Floyd"},
+			Year: year, TrackCount: len(tracks), Kind: kind,
+		}
+		return hit, &provider.AlbumDetail{Album: hit, Tracks: tracks}
+	}
+	song := func(id, title, album string, durationMs int64) provider.Track {
+		return provider.Track{ProviderTrackID: id, Title: title, Artists: []string{"Pink Floyd"},
+			Album: album, DurationMs: durationMs}
+	}
+	dsotm, dsotmDetail := release("rel_1", "The Dark Side of the Moon", "1973", store.ReleaseKindAlbum,
+		song("t1", "Time", "The Dark Side of the Moon", 414_000),
+		song("t2", "Money", "The Dark Side of the Moon", 383_000))
+	wish, wishDetail := release("rel_2", "Wish You Were Here", "1975", store.ReleaseKindAlbum,
+		song("t3", "Shine On You Crazy Diamond", "Wish You Were Here", 800_000))
+	single, singleDetail := release("rel_3", "The Machine Song (Demo #2)", "2023",
+		store.ReleaseKindSingle,
+		song("t4", "The Machine Song (Demo #2)", "The Machine Song (Demo #2)", 260_000))
+	ytmusic := &fakeProvider{
+		name:     "ytmusic",
+		artists:  []provider.Artist{{ProviderArtistID: "UCpf", Name: "Pink Floyd"}},
+		byArtist: map[string][]provider.Album{"UCpf": {dsotm, wish, single}},
+		details: map[string]*provider.AlbumDetail{
+			"rel_1": dsotmDetail, "rel_2": wishDetail, "rel_3": singleDetail,
+		},
+	}
+	f := newFixture(t, ytmusic)
+	ctx := context.Background()
+
+	artists, _, err := f.service.SearchArtists(ctx, "pink floyd", 5, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artistID := artists[0].ID
+
+	first := f.service.StartCatalogue(artistID)
+	if !first.Running {
+		t.Fatal("the catalogue read did not start")
+	}
+	state := first
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		state, _ = f.service.CatalogueStatus(artistID)
+		if !state.Running {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if state.Running {
+		t.Fatalf("the catalogue read never finished: %+v", state)
+	}
+	if state.Total != 3 || state.Done != 3 {
+		t.Errorf("read %d of %d releases, want 3 of 3", state.Done, state.Total)
+	}
+	if state.Added != 4 {
+		t.Errorf("added = %d, want the artist's four songs", state.Added)
+	}
+	if len(state.Errors) != 0 {
+		t.Errorf("errors = %+v", state.Errors)
+	}
+
+	// Every song is in the library, and the single is in the container.
+	songs, err := f.db.ArtistTracks(ctx, artistID, "", 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(songs) != 4 {
+		t.Errorf("songs = %d, want 4", len(songs))
+	}
+	detailed, err := f.service.GetArtist(ctx, artistID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(detailed.Albums) != 4 || detailed.Albums[0].Kind != store.AlbumKindSingles {
+		t.Fatalf("albums = %+v", detailed.Albums)
+	}
+	containerTracks, err := f.db.AlbumTracks(ctx, detailed.Albums[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(containerTracks) != 1 {
+		t.Errorf("the container holds %d tracks, want the single's one", len(containerTracks))
+	}
+
+	// Asking again while the read is fresh answers the same thing and asks the
+	// provider nothing.
+	reads := len(ytmusic.artistCalls)
+	again := f.service.StartCatalogue(artistID)
+	if again.Running || again.Done != state.Done {
+		t.Errorf("a fresh read was restarted: %+v", again)
+	}
+	if len(ytmusic.artistCalls) != reads {
+		t.Errorf("the provider was asked again: %d then %d", reads, len(ytmusic.artistCalls))
 	}
 }

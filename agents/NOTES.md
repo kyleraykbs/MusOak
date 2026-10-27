@@ -32,3 +32,10 @@ Traps for the next session:
 - `writeLocal()` persists `config` and `roomsShowing`; `loadLocal()` rehydrates neither.
 - `rooms-state.warmAhead` runs on the 500 ms follow tick with no in-flight dedup in
   `player._warm`.
+## [2026-10-27] Pink Floyd catalogue reproduction
+
+The real YT Music helper returned only 10 album entries and 10 singles from `get_artist` until its `params` continuations were followed. Following them returned **37 albums** and **26 singles** for Pink Floyd; The Dark Side of the Moon, Meddle, Atom Heart Mother, Piper and the other missing records were in the continuation. `get_album` returned complete tracklists in one call: DSotM 10/10 and The Wall 26/26.
+
+On the old path, syncing the whole artist in 48 seconds made YT Music return empty/non-JSON responses for four album reads, leaving those albums at zero tracks. A paced background catalogue with one retry completed all 63 Pink Floyd releases with 595 tracks and no errors in the scratch server. A bare album created by one track search held three tracks and no provider variant; `GET /albums/{id}` now searched for the release, attached it, and returned the full ten-track DSotM in 2.4 seconds.
+
+The API now exposes a searchable/paged artist songs list and catalogue progress. Store artist-track reads match case/whitespace-normalised artist names too, so old `Pink Floyd`/`PINK FLOYD` rows do not split the songs panel.

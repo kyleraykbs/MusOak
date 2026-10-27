@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -58,8 +60,28 @@ type Album struct {
 	Artists         []string
 	Year            string
 	TrackCount      int
+	// Kind is what the release is: "album", "single" or "ep", or "" when the
+	// provider does not say. A single is how one song came out, not a record, so
+	// the caller decides where it belongs rather than counting it among an
+	// artist's albums.
+	Kind string
 	// ArtworkURL is the best cover the provider offers.
 	ArtworkURL string
+}
+
+// YearValue reads a provider's year field as a number. The field is a string and
+// sometimes a full date, and only the year is ever compared: an album's own year
+// is its earliest release, and that is what an artist's albums are ordered by.
+func YearValue(year string) (int, bool) {
+	digits := strings.TrimSpace(year)
+	if len(digits) > 4 {
+		digits = digits[:4]
+	}
+	value, err := strconv.Atoi(digits)
+	if err != nil || value <= 0 {
+		return 0, false
+	}
+	return value, true
 }
 
 // Artist is a provider's artist hit.
@@ -105,7 +127,9 @@ type AlbumSearcher interface {
 // ArtistSearcher is implemented by providers that can browse artists.
 type ArtistSearcher interface {
 	SearchArtists(ctx context.Context, q string, opts SearchOpts) ([]Artist, error)
-	// ArtistAlbums lists an artist's albums.
+	// ArtistAlbums lists everything an artist released - albums and singles
+	// alike, the whole discography rather than the first page of it - each with
+	// its Kind, so the caller can tell a record from a single.
 	ArtistAlbums(ctx context.Context, providerArtistID string) ([]Album, error)
 }
 

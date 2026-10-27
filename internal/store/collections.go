@@ -122,7 +122,12 @@ type AlbumVariant struct {
 	Artists         []string
 	Year            string
 	TrackCount      int
-	CreatedAt       time.Time
+	// Kind is what the provider calls this release: "album", "single" or "ep",
+	// or "" when nobody has said yet. An EP and a single are both a song's
+	// release rather than a record, which is the distinction the artist page
+	// draws.
+	Kind      string
+	CreatedAt time.Time
 }
 
 // ArtistVariant is one provider's page for a canonical artist.
@@ -171,6 +176,9 @@ type AlbumRepo interface {
 	SetAlbumVariantTrackCount(ctx context.Context, variantID uuid.UUID, count int) error
 	AlbumTracks(ctx context.Context, albumID uuid.UUID) ([]Track, error)
 	AlbumsForArtist(ctx context.Context, artistID uuid.UUID) ([]Album, error)
+	// EnsureSinglesAlbum returns the container an artist's single releases are
+	// collected into, creating it when the artist does not have one yet.
+	EnsureSinglesAlbum(ctx context.Context, artistID uuid.UUID) (*Album, error)
 	AttachAlbumArtist(ctx context.Context, albumID, artistID uuid.UUID) error
 }
 
@@ -181,7 +189,31 @@ type ArtistRepo interface {
 	ArtistVariants(ctx context.Context, id uuid.UUID) ([]ArtistVariant, error)
 	AttachArtistVariant(ctx context.Context, v *ArtistVariant) (*ArtistVariant, bool, error)
 	ArtistByProviderID(ctx context.Context, provider, providerArtistID string) (*Artist, error)
+	// ArtistTracks lists the songs credited to an artist, by title, with query
+	// matched anywhere in the title, and CountArtistTracks is how many there are.
+	ArtistTracks(ctx context.Context, artistID uuid.UUID, query string, limit, offset int) ([]Track, error)
+	CountArtistTracks(ctx context.Context, artistID uuid.UUID, query string) (int, error)
 }
+
+// What a release is, in the provider's words and in this library's: an album is
+// a record, a single is one song's release, and an EP is a single with a few
+// more songs on it. A provider that says nothing leaves it empty, which means
+// "not known yet" rather than "album" - the next read of that release is what
+// fills it in.
+const (
+	ReleaseKindAlbum  = "album"
+	ReleaseKindSingle = "single"
+	ReleaseKindEP     = "ep"
+)
+
+// SinglesAlbumTitle is the name of the one album this library makes up.
+const SinglesAlbumTitle = "Singles"
+
+// AlbumKindSingles is the container an artist's single releases are collected
+// into, so an artist's page lists their records and one row for everything they
+// put out as a single, rather than twenty rows that are not records at all. It
+// carries no provider variant of its own and is never matched against one.
+const AlbumKindSingles = "singles"
 
 // albumIdentity is the comparison key of an album: its title and its primary
 // artist, both reduced to a stable form.
@@ -265,8 +297,8 @@ func (d *DB) Album(ctx context.Context, id uuid.UUID) (*Album, error) {
 		created int64
 	)
 	err := d.db.QueryRowContext(ctx,
-		`SELECT id, title, created_at, artwork_url FROM albums WHERE id = ?`, id.String()).
-		Scan(&idStr, &album.Title, &created, &album.ArtworkURL)
+		`SELECT id, title, kind, created_at, artwork_url FROM albums WHERE id = ?`, id.String()).
+		Scan(&idStr, &album.Title, &album.Kind, &created, &album.ArtworkURL)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -364,7 +396,7 @@ func (d *DB) AlbumYearsFor(ctx context.Context, albumIDs []uuid.UUID) (map[uuid.
 	return out, mapErr(rows.Err())
 }
 
-const albumVariantColumns = `id, album_id, provider, provider_album_id, title, artists_json, year, track_count, created_at`
+const albumVariantColumns = `id, album_id, provider, provider_album_id, title, artists_json, year, track_count, kind, created_at`
 
 func scanAlbumVariant(row rowScanner) (*AlbumVariant, error) {
 	var (
@@ -374,7 +406,7 @@ func scanAlbumVariant(row rowScanner) (*AlbumVariant, error) {
 		created     int64
 	)
 	if err := row.Scan(&id, &albumID, &variant.Provider, &variant.ProviderAlbumID, &variant.Title,
-		&artistsJSON, &variant.Year, &variant.TrackCount, &created); err != nil {
+		&artistsJSON, &variant.Year, &variant.TrackCount, &variant.Kind, &created); err != nil {
 		return nil, mapErr(err)
 	}
 	var err error
@@ -393,9 +425,19 @@ func scanAlbumVariant(row rowScanner) (*AlbumVariant, error) {
 
 // AttachAlbumVariant records a provider release of an album. It reports whether
 // the variant was created, so a sync can say what it learned.
+//
+// Re-attaching a release that is already stored fills in what nobody knew the
+// first time round - its kind, its length, its year, a title the provider has
+// since corrected - and changes nothing that is already known. That is what
+// tells the singles already in a library what they are: they were stored before
+// anything said, and the next read of that release is what says.
 func (d *DB) AttachAlbumVariant(ctx context.Context, v *AlbumVariant) (*AlbumVariant, bool, error) {
 	if existing, err := d.albumVariantByProviderID(ctx, v.Provider, v.ProviderAlbumID); err == nil {
-		return existing, false, nil
+		filled, err := d.fillAlbumVariant(ctx, existing, v)
+		if err != nil {
+			return nil, false, err
+		}
+		return filled, false, nil
 	} else if !isNotFound(err) {
 		return nil, false, err
 	}
@@ -413,19 +455,53 @@ func (d *DB) AttachAlbumVariant(ctx context.Context, v *AlbumVariant) (*AlbumVar
 	}
 
 	_, err = d.db.ExecContext(ctx,
-		`INSERT INTO album_variants (`+albumVariantColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO album_variants (`+albumVariantColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		v.ID.String(), v.AlbumID.String(), v.Provider, v.ProviderAlbumID, v.Title,
-		artistsJSON, v.Year, v.TrackCount, v.CreatedAt.UnixMilli())
+		artistsJSON, v.Year, v.TrackCount, v.Kind, v.CreatedAt.UnixMilli())
 	if err != nil {
 		if isConflict(err) {
 			// Another writer attached it first.
 			if existing, lookupErr := d.albumVariantByProviderID(ctx, v.Provider, v.ProviderAlbumID); lookupErr == nil {
-				return existing, false, nil
+				filled, fillErr := d.fillAlbumVariant(ctx, existing, v)
+				if fillErr != nil {
+					return nil, false, fillErr
+				}
+				return filled, false, nil
 			}
 		}
 		return nil, false, mapErr(err)
 	}
 	return v, true, nil
+}
+
+// fillAlbumVariant writes what the provider knows and this library does not onto
+// a release that is already stored. Nothing known is overwritten: the kind of a
+// release nobody classified, the length of one nobody measured, the year and
+// the title of one the provider has since filled in.
+func (d *DB) fillAlbumVariant(ctx context.Context, stored, read *AlbumVariant) (*AlbumVariant, error) {
+	kind, year, title, count := stored.Kind, stored.Year, stored.Title, stored.TrackCount
+	if kind == "" {
+		kind = read.Kind
+	}
+	if year == "" {
+		year = read.Year
+	}
+	if title == "" {
+		title = read.Title
+	}
+	if count <= 0 && read.TrackCount > 0 {
+		count = read.TrackCount
+	}
+	if kind == stored.Kind && year == stored.Year && title == stored.Title && count == stored.TrackCount {
+		return stored, nil
+	}
+	if _, err := d.db.ExecContext(ctx,
+		`UPDATE album_variants SET kind = ?, year = ?, title = ?, track_count = ? WHERE id = ?`,
+		kind, year, title, count, stored.ID.String()); err != nil {
+		return nil, mapErr(err)
+	}
+	stored.Kind, stored.Year, stored.Title, stored.TrackCount = kind, year, title, count
+	return stored, nil
 }
 
 func (d *DB) albumVariantByProviderID(ctx context.Context, provider, providerAlbumID string) (*AlbumVariant, error) {
@@ -600,13 +676,26 @@ func (d *DB) AlbumTracks(ctx context.Context, albumID uuid.UUID) ([]Track, error
 }
 
 // AlbumsForArtist lists the albums an artist is credited on.
+//
+// The order is the one an artist's page is read in: the singles container
+// first, because it is not a release and has no date to place it by, then
+// newest release first, and anything whose year nobody knows last rather than
+// pretending it is from year zero. A record's year is its earliest release's -
+// a remaster does not move the record to the year it was remastered - and
+// within one year the title decides, so the order is stable between reads.
 func (d *DB) AlbumsForArtist(ctx context.Context, artistID uuid.UUID) ([]Album, error) {
 	rows, err := d.db.QueryContext(ctx, `
-		SELECT al.id, al.title, al.created_at, al.artwork_url
+		SELECT al.id, al.title, al.kind, al.created_at, al.artwork_url
 		FROM albums al
 		JOIN album_artists aa ON aa.album_id = al.id
 		WHERE aa.artist_id = ?
-		ORDER BY al.title`, artistID.String())
+		ORDER BY
+			CASE WHEN al.kind = '`+AlbumKindSingles+`' THEN 0 ELSE 1 END,
+			(SELECT MIN(CAST(av.year AS INTEGER)) FROM album_variants av
+				WHERE av.album_id = al.id AND av.year <> '') IS NULL,
+			(SELECT MIN(CAST(av.year AS INTEGER)) FROM album_variants av
+				WHERE av.album_id = al.id AND av.year <> '') DESC,
+			al.title`, artistID.String())
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -620,6 +709,54 @@ func (d *DB) AttachAlbumArtist(ctx context.Context, albumID, artistID uuid.UUID)
 		`INSERT OR IGNORE INTO album_artists (album_id, artist_id, position) VALUES (?, ?, 0)`,
 		albumID.String(), artistID.String())
 	return mapErr(err)
+}
+
+// EnsureSinglesAlbum returns the container holding an artist's single releases,
+// creating it the first time that artist is asked about.
+//
+// The container is this library's invention, not a release: it has no provider
+// variant and so can never be matched to one, it is one row per artist, and its
+// tracklist is every song the artist put out as a single. It exists so a page
+// can list an artist's records and one row for the singles, rather than twenty
+// rows that are not records at all.
+func (d *DB) EnsureSinglesAlbum(ctx context.Context, artistID uuid.UUID) (*Album, error) {
+	var idStr string
+	err := d.db.QueryRowContext(ctx, `
+		SELECT al.id FROM albums al
+		JOIN album_artists aa ON aa.album_id = al.id
+		WHERE aa.artist_id = ? AND al.kind = ?
+		LIMIT 1`, artistID.String(), AlbumKindSingles).Scan(&idStr)
+	switch {
+	case err == nil:
+		id, parseErr := parseUUID(idStr)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		return d.Album(ctx, id)
+	case !isNotFound(err):
+		return nil, mapErr(err)
+	}
+
+	artist, err := d.Artist(ctx, artistID)
+	if err != nil {
+		return nil, err
+	}
+	titleKey, artistKey := albumIdentity(SinglesAlbumTitle, []string{artist.Name})
+	album := &Album{ID: uuid.New(), Title: SinglesAlbumTitle, Kind: AlbumKindSingles}
+	err = d.withTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO albums (id, title, kind, title_key, artist_key, created_at)
+			VALUES (?, ?, ?, ?, ?, ?)`,
+			album.ID.String(), album.Title, album.Kind, titleKey, artistKey,
+			time.Now().UnixMilli()); err != nil {
+			return mapErr(err)
+		}
+		return attachAlbumArtists(ctx, tx, album.ID, []string{artist.Name})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return album, nil
 }
 
 // Artist returns the canonical artist by id.
@@ -654,6 +791,66 @@ func (d *DB) ArtistByName(ctx context.Context, name string) (*Artist, error) {
 		return nil, err
 	}
 	return &artist, nil
+}
+
+// ArtistTracks lists the songs an artist is credited on, in title order, with
+// the query matched anywhere in the title the way a search box expects.
+//
+// Every credit counts, features included: a song the artist is on is a song
+// their page can offer, and separating "by" from "featuring" is the provider's
+// distinction, not one this library keeps.
+func (d *DB) ArtistTracks(ctx context.Context, artistID uuid.UUID, query string, limit, offset int) ([]Track, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := d.db.QueryContext(ctx, `
+		SELECT t.id, t.title, t.duration_ms, t.created_at, t.artwork_url
+		FROM tracks t
+		JOIN track_artists ta ON ta.track_id = t.id
+		JOIN artists a ON a.id = ta.artist_id
+		WHERE lower(trim(a.name)) = (SELECT lower(trim(name)) FROM artists WHERE id = ?)
+			AND t.title LIKE ? ESCAPE '\'
+		ORDER BY t.title COLLATE NOCASE
+		LIMIT ? OFFSET ?`, artistID.String(), trackPattern(query), limit, offset)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+
+	var tracks []Track
+	for rows.Next() {
+		track, err := scanTrack(rows)
+		if err != nil {
+			return nil, err
+		}
+		tracks = append(tracks, *track)
+	}
+	return tracks, mapErr(rows.Err())
+}
+
+// CountArtistTracks is how many songs that list holds, so a page can say how
+// many there are without reading them all.
+func (d *DB) CountArtistTracks(ctx context.Context, artistID uuid.UUID, query string) (int, error) {
+	var total int
+	if err := d.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM tracks t
+		JOIN track_artists ta ON ta.track_id = t.id
+		JOIN artists a ON a.id = ta.artist_id
+		WHERE lower(trim(a.name)) = (SELECT lower(trim(name)) FROM artists WHERE id = ?)
+			AND t.title LIKE ? ESCAPE '\'`,
+		artistID.String(), trackPattern(query)).Scan(&total); err != nil {
+		return 0, mapErr(err)
+	}
+	return total, nil
+}
+
+// trackPattern is a search box's query as a LIKE pattern: anywhere in the
+// title, and the wildcards somebody typed match themselves.
+func trackPattern(query string) string {
+	return "%" + strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(query) + "%"
 }
 
 const artistVariantColumns = `id, artist_id, provider, provider_artist_id, name, created_at`
@@ -762,10 +959,10 @@ func (d *DB) AlbumCandidates(ctx context.Context, titleKey, artistKey string, li
 		limit = 50
 	}
 	rows, err := d.db.QueryContext(ctx, `
-		SELECT id, title, created_at, artwork_url FROM albums
-		WHERE title_key = ? OR artist_key = ?
+		SELECT id, title, kind, created_at, artwork_url FROM albums
+		WHERE kind <> ? AND (title_key = ? OR artist_key = ?)
 		ORDER BY CASE WHEN title_key = ? THEN 0 ELSE 1 END, title
-		LIMIT ?`, titleKey, artistKey, titleKey, limit)
+		LIMIT ?`, AlbumKindSingles, titleKey, artistKey, titleKey, limit)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -800,7 +997,7 @@ func scanAlbums(rows interface {
 			idStr   string
 			created int64
 		)
-		if err := rows.Scan(&idStr, &album.Title, &created, &album.ArtworkURL); err != nil {
+		if err := rows.Scan(&idStr, &album.Title, &album.Kind, &created, &album.ArtworkURL); err != nil {
 			return nil, mapErr(err)
 		}
 		var err error

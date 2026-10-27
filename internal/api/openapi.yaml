@@ -2128,6 +2128,61 @@ paths:
               schema: { $ref: "#/components/schemas/Artist" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /api/v1/artists/{artistId}/tracks:
+    get:
+      tags: [library]
+      summary: An artist's songs, by title
+      description: |
+        Every song the artist is credited on, in title order - what the artist
+        page's songs panel lists and searches - with the query matched anywhere in
+        a title.
+      operationId: listArtistTracks
+      parameters:
+        - { $ref: "#/components/parameters/ArtistID" }
+        - name: q
+          in: query
+          description: Part of a title.
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 200 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200":
+          description: One page of the artist's songs, and how many there are.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tracks, total]
+                properties:
+                  tracks:
+                    type: array
+                    items: { $ref: "#/components/schemas/Track" }
+                  total: { type: integer }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/artists/{artistId}/catalogue:
+    get:
+      tags: [library]
+      summary: What an artist's catalogue read is doing
+      description: |
+        Opening an artist starts reading their catalogue - every release's
+        tracklist, singles included - so that their songs are in the library
+        without anyone pressing a button. This reports how far that read has got,
+        which is what a page showing songs as they arrive polls.
+      operationId: getArtistCatalogue
+      parameters: [{ $ref: "#/components/parameters/ArtistID" }]
+      responses:
+        "200":
+          description: The catalogue read's progress.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CatalogueState" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /api/v1/artists/{artistId}/sync:
     post:
       tags: [library]
@@ -2940,6 +2995,13 @@ components:
         trackCount:
           type: integer
           description: How many tracks the canonical album holds.
+        kind:
+          type: string
+          enum: [album, single, ep, singles]
+          description: |
+            What the album is. `singles` is the one container an artist's single
+            releases are collected into; the rest is what the album's releases
+            say it is, `album` when nobody has said.
         providers:
           type: array
           description: Providers that know this album.
@@ -2954,6 +3016,11 @@ components:
           type: array
           description: The tracklist, present on the album endpoint.
           items: { $ref: "#/components/schemas/Track" }
+        catalogue:
+          allOf: [{ $ref: "#/components/schemas/CatalogueState" }]
+          description: |
+            Present on the singles container: the artist's catalogue read is what
+            fills it, so the page can say it is still arriving.
 
     AlbumVariant:
       type: object
@@ -2992,6 +3059,35 @@ components:
         albums:
           type: array
           items: { $ref: "#/components/schemas/Album" }
+        catalogue:
+          allOf: [{ $ref: "#/components/schemas/CatalogueState" }]
+          description: |
+            The artist's catalogue read: opening an artist starts one, and a page
+            showing songs as they land polls it.
+
+    CatalogueState:
+      type: object
+      required: [artistId, running, done, total, added]
+      properties:
+        artistId: { type: string, format: uuid }
+        running:
+          type: boolean
+          description: Whether the read is still going.
+        done:
+          type: integer
+          description: How many of the artist's releases have been read.
+        total:
+          type: integer
+          description: How many releases the artist has.
+        added:
+          type: integer
+          description: How many songs the read brought into the library.
+        errors:
+          type: array
+          description: The releases that could not be read.
+          items: { $ref: "#/components/schemas/ProviderProblem" }
+        startedAt: { type: string, format: date-time }
+        finishedAt: { type: string, format: date-time }
 
     SyncRequest:
       type: object
