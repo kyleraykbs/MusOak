@@ -3009,7 +3009,21 @@ components:
         year: { type: string }
         trackCount:
           type: integer
-          description: How many tracks the canonical album holds.
+          description: |
+            How many tracks this library holds for the album right now. Until
+            the album has been read whole this is the handful that were matched
+            into it, not the length of the record.
+        releaseTrackCount:
+          type: integer
+          description: |
+            The length the provider's own release states, when a variant states
+            one. Zero when nobody does.
+        partial:
+          type: boolean
+          description: |
+            The album is not all here yet: fewer tracks are held than the
+            release has. Opening the album reads the release's tracklist whole,
+            so a row saying this is a row that has not been opened.
         kind:
           type: string
           enum: [album, single, ep, singles]

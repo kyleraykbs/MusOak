@@ -314,3 +314,57 @@ func TestTheSinglesContainerIsNotGivenASinglesCover(t *testing.T) {
 		t.Errorf("a record's artworkUrl = %q, want the server's own path", same.ArtworkURL)
 	}
 }
+
+// An album nobody has opened holds only the songs that have been matched into
+// it, and its row said "3 tracks" about a thirteen-song record. The response
+// carries the release's own length and says the album is not all here yet, so
+// the page can say that instead of a number that is wrong.
+func TestAnUnopenedAlbumSaysItIsNotWhole(t *testing.T) {
+	release := func(count int) store.AlbumVariant {
+		return store.AlbumVariant{Provider: "ytmusic", ProviderAlbumID: "v", TrackCount: count}
+	}
+	track := func(title string) store.Track {
+		return store.Track{ID: uuid.New(), Title: title}
+	}
+
+	partial := &library.Album{Album: store.Album{ID: uuid.New(), Title: "Record", Kind: store.ReleaseKindAlbum}}
+	partial.Variants = []store.AlbumVariant{release(13)}
+	partial.Tracks = []store.Track{track("One"), track("Two"), track("Three")}
+
+	response, err := (&Server{}).buildAlbum(context.Background(), partial, false)
+	if err != nil {
+		t.Fatalf("buildAlbum: %v", err)
+	}
+	if response.TrackCount != 3 {
+		t.Errorf("trackCount = %d, want the three this library holds", response.TrackCount)
+	}
+	if response.ReleaseTrackCount != 13 {
+		t.Errorf("releaseTrackCount = %d, want the release's own 13", response.ReleaseTrackCount)
+	}
+	if !response.Partial {
+		t.Error("an album holding 3 of 13 tracks says it is whole")
+	}
+
+	whole := &library.Album{Album: store.Album{ID: uuid.New(), Title: "Record", Kind: store.ReleaseKindAlbum}}
+	whole.Variants = []store.AlbumVariant{release(3)}
+	whole.Tracks = []store.Track{track("One"), track("Two"), track("Three")}
+	same, err := (&Server{}).buildAlbum(context.Background(), whole, false)
+	if err != nil {
+		t.Fatalf("buildAlbum: %v", err)
+	}
+	if same.Partial {
+		t.Error("a whole album says it is partial")
+	}
+
+	// The singles container has no release of its own, so nothing can say it is
+	// short: its length is however many singles have been read so far.
+	container := &library.Album{Album: store.Album{ID: uuid.New(), Title: store.SinglesAlbumTitle, Kind: store.AlbumKindSingles}}
+	container.Tracks = []store.Track{track("Single")}
+	read, err := (&Server{}).buildAlbum(context.Background(), container, false)
+	if err != nil {
+		t.Fatalf("buildAlbum: %v", err)
+	}
+	if read.Partial || read.ReleaseTrackCount != 0 {
+		t.Errorf("the singles container reports partial=%v release=%d, want neither", read.Partial, read.ReleaseTrackCount)
+	}
+}

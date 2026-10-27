@@ -164,9 +164,9 @@ kept because of what the household did with it:
 | kept | for |
 | --- | --- |
 | in a playlist, or a favourite | for ever - never swept, quota or not |
-| played by one account | a week after the newest play |
-| played by two accounts | three months after the newest play |
-| played by more accounts | a further month per listener, capped at a year |
+| played by one account | a month after the newest play |
+| each further account that played it | another month (two listeners, two months) |
+| a dozen listeners or more | a year - and past that a play only resets it |
 | fetched but never played | a week after it was downloaded |
 | imported or uploaded (a `local`/`upload` rendition) | for ever - it is the only copy |
 

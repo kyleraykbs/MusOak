@@ -24,11 +24,21 @@ type albumVariantResponse struct {
 }
 
 type albumResponse struct {
-	ID         string   `json:"id"`
-	Title      string   `json:"title"`
-	Artists    []string `json:"artists"`
-	Year       string   `json:"year,omitempty"`
-	TrackCount int      `json:"trackCount"`
+	ID      string   `json:"id"`
+	Title   string   `json:"title"`
+	Artists []string `json:"artists"`
+	Year    string   `json:"year,omitempty"`
+	// TrackCount is what this library holds for the album right now, which is
+	// not the same as how long the album is until it has been read whole.
+	TrackCount int `json:"trackCount"`
+	// ReleaseTrackCount is the length the provider's own release states, when
+	// any variant states one: 0 when nobody does.
+	ReleaseTrackCount int `json:"releaseTrackCount,omitempty"`
+	// Partial says the album is not all here yet - shorter than its release,
+	// which is what an album nobody has opened looks like. Opening it reads the
+	// release's tracklist whole, so a row that says this is a row that has not
+	// been opened.
+	Partial bool `json:"partial,omitempty"`
 	// Kind is "album", "single" or "ep" for a release, and "singles" for the
 	// container an artist's single releases are collected into.
 	Kind       string                 `json:"kind,omitempty"`
@@ -100,6 +110,19 @@ func (s *Server) buildAlbum(ctx context.Context, album *library.Album, withTrack
 	// each draws its own idea of the container instead.
 	if album.Album.ArtworkURL != "" && kind != store.AlbumKindSingles {
 		out.ArtworkURL = artworkPath(store.ArtworkAlbum, album.Album.ID)
+	}
+	// The release's own length, which is what "the whole album" means: a
+	// track-born album holds the handful of songs that were matched into it,
+	// and saying "3 tracks" about a thirteen-song record is simply wrong.
+	longest := 0
+	for _, variant := range album.Variants {
+		if variant.TrackCount > longest {
+			longest = variant.TrackCount
+		}
+	}
+	if kind != store.AlbumKindSingles && longest > 0 {
+		out.ReleaseTrackCount = longest
+		out.Partial = len(album.Tracks) < longest
 	}
 	seen := map[string]bool{}
 	earliest := 0

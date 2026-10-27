@@ -19,8 +19,7 @@ func TestKeepUntilIsTheHouseholdsRetentionPolicy(t *testing.T) {
 	now := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
 	week := 7 * 24 * time.Hour
 	month := 30 * 24 * time.Hour
-	threeMonths := 90 * 24 * time.Hour
-	year := 365 * 24 * time.Hour
+	year := 12 * month
 
 	cases := []struct {
 		name       string
@@ -33,11 +32,12 @@ func TestKeepUntilIsTheHouseholdsRetentionPolicy(t *testing.T) {
 		{"a playlist keeps it for ever", now.Add(-year), now.Add(-year), 1, true, time.Time{}},
 		{"a favourite keeps it for ever", now.Add(-year), time.Time{}, 0, true, time.Time{}},
 		{"fetched and never played", now, time.Time{}, 0, false, now.Add(week)},
-		{"one listener", now.Add(-year), now, 1, false, now.Add(week)},
-		{"two listeners", now.Add(-year), now, 2, false, now.Add(threeMonths)},
-		{"three listeners", now.Add(-year), now, 3, false, now.Add(threeMonths + month)},
-		{"a household of ten", now.Add(-year), now, 10, false, now.Add(threeMonths + 8*month)},
-		{"past the cap, the span stops at a year", now.Add(-year), now, 30, false, now.Add(year)},
+		{"one listener is a month", now.Add(-year), now, 1, false, now.Add(month)},
+		{"two listeners are two", now.Add(-year), now, 2, false, now.Add(2 * month)},
+		{"three listeners are three", now.Add(-year), now, 3, false, now.Add(3 * month)},
+		{"a household of ten", now.Add(-year), now, 10, false, now.Add(10 * month)},
+		{"the twelfth listener hits the cap", now.Add(-year), now, 12, false, now.Add(year)},
+		{"past the cap, a listen only resets the year", now.Add(-year), now, 30, false, now.Add(year)},
 	}
 	for _, test := range cases {
 		got := KeepUntil(test.downloaded, test.lastPlay, test.listeners, test.pinned)

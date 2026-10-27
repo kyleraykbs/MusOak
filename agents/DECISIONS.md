@@ -345,10 +345,10 @@
 - Decision: the media cache sweeps hourly (and once at startup, so a restart
   does not postpone it): a track in any playlist or favourited by anybody is
   kept for ever and is never swept, quota or not; a played track is kept a week
-  after its newest play; a track played by two accounts is kept three months
-  after the newest play, each further listener adds a month up to a year (at
-  which point a play only resets the timer); a fetched track nobody played is
-  kept a week from its download. `local`/`upload` renditions are never swept -
+  after its newest play; each further account that has played it adds a month -
+  one listener a month, two two, three three - up to a year (at which point a
+  play only resets the timer); a fetched track nobody played is kept a week from
+  its download. `local`/`upload` renditions are never swept -
   they are the only copy. The quota stays soft and off by default (0): when set,
   it evicts least-recently-served renditions that are not pinned.
 - Why: Kyle's policy, verbatim: "If song is in a playlist -> Keep locally

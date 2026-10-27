@@ -8,31 +8,25 @@ import (
 
 // How long a stored song stays, by what has been done with it.
 //
-// Kyle's policy, in his words: a song in a playlist or a favourite is kept
-// locally for ever; a played song is kept for a week; a song more than one
-// person has played is kept for three months, and each new person who listens
-// adds a month to that up to a year - at which point a listen only resets the
-// timer - and a song that was fetched but never played is kept for a week from
-// its download.
+// Kyle's policy: a song in a playlist or a favourite is kept locally for ever; a
+// played song is kept a month for each account that has played it - one listener
+// a month, two two months, three three - up to a year; a song that was fetched
+// but never played is kept a week from its download.
 //
-// Every clock here runs from the newest listen, so a song played again is kept
-// again: that is what "every time a person plays the song it should reset the
-// timer" means, and it is the same rule for the one-person tier.
+// Every clock runs from the newest listen, so a song played again is kept again:
+// that is what "every time a person plays the song it should reset the timer"
+// means.
 const (
 	// retentionNeverPlayed is how long a fetched song nobody has listened to
 	// survives: long enough for a prefetched queue to be wanted, short enough
 	// that a skipped song does not sit on the disk for ever.
 	retentionNeverPlayed = 7 * 24 * time.Hour
-	// retentionPlayed is the one-listener tier.
-	retentionPlayed = 7 * 24 * time.Hour
-	// retentionShared is the two-listener tier - the "more than 1 person" rule -
-	// and retentionPerListener is what each further listener adds.
-	retentionShared      = 90 * 24 * time.Hour
+	// retentionPerListener is what each account that has played a song adds:
+	// one listener, one month.
 	retentionPerListener = 30 * 24 * time.Hour
-	// retentionSharedCap is where adding months stops: a song everybody keeps
-	// coming back to stays a year past the last person who played it, and a
-	// listen at that point only resets that year.
-	retentionSharedCap = 365 * 24 * time.Hour
+	// retentionCap is where adding months stops - twelve of them - and past
+	// which a listen only resets the clock.
+	retentionCap = 12 * retentionPerListener
 )
 
 // KeepUntil says when a stored song may be deleted, from the facts the store
@@ -41,7 +35,8 @@ const (
 // downloaded is when the file landed, lastPlay the newest recorded listen (zero
 // when nobody has played it), listeners how many distinct accounts have played
 // it ever, and pinned whether it is in a playlist or a favourite - which is what
-// makes an answer of "for ever".
+// makes an answer of "for ever". One listener keeps a song a month, and every
+// further listener another, up to twelve.
 func KeepUntil(downloaded, lastPlay time.Time, listeners int, pinned bool) time.Time {
 	if pinned {
 		return time.Time{}
@@ -52,12 +47,9 @@ func KeepUntil(downloaded, lastPlay time.Time, listeners int, pinned bool) time.
 		}
 		return downloaded.Add(retentionNeverPlayed)
 	}
-	if listeners == 1 {
-		return lastPlay.Add(retentionPlayed)
-	}
-	span := retentionShared + time.Duration(listeners-2)*retentionPerListener
-	if span > retentionSharedCap {
-		span = retentionSharedCap
+	span := time.Duration(listeners) * retentionPerListener
+	if span > retentionCap {
+		span = retentionCap
 	}
 	return lastPlay.Add(span)
 }
