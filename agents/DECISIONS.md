@@ -340,3 +340,24 @@
   2.7 MB GIF, and a 32px song row downloaded whatever was there. The container's
   cover was a single's, shown under the container's name.
 - Reversible: yes
+
+## 2026-10-27 Songs are kept by what the household does with them
+- Decision: the media cache sweeps hourly (and once at startup, so a restart
+  does not postpone it): a track in any playlist or favourited by anybody is
+  kept for ever and is never swept, quota or not; a played track is kept a week
+  after its newest play; a track played by two accounts is kept three months
+  after the newest play, each further listener adds a month up to a year (at
+  which point a play only resets the timer); a fetched track nobody played is
+  kept a week from its download. `local`/`upload` renditions are never swept -
+  they are the only copy. The quota stays soft and off by default (0): when set,
+  it evicts least-recently-served renditions that are not pinned.
+- Why: Kyle's policy, verbatim: "If song is in a playlist -> Keep locally
+  forever... played -> a week... played by more than 1 person -> 3 months (every
+  time a person plays the song it should reset the 3 month timer)", extended to
+  "for each new person that listens ... add a month up until ... 1 year in which
+  case each listen should still just reset the timer", "keep 1 week from
+  download" for the never-played, and "By default there should be no quota ...
+  this is a local media server, I want it to be able to store as much shit as we
+  want". The three-month floor for two listeners is his earlier rule and is what
+  the year cap is reached from.
+- Reversible: yes

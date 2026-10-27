@@ -148,13 +148,30 @@ the client; a missing file at the last location is not an error (defaults apply)
 | `rateLimit.searchPerMinute` | `30` | Per-client search budget; 0 disables it. |
 | `rateLimit.loginPerMinute` | `10` | Per-client register/login budget; 0 disables it. |
 | `trustedProxies` | `[]` | CIDRs of reverse proxies whose `X-Forwarded-For` is believed, so rate limits key on the real client instead of the proxy. Leave empty when clients reach the server directly; set it only when something in front forwards to it (e.g. `["127.0.0.1/32", "10.0.0.0/8"]`). |
-| `media.quotaMB` | `0` | Cap for `media/`; 0 means unlimited. Over it, least recently served renditions are evicted. |
+| `media.quotaMB` | `0` | Cap for `media/`; 0 means unlimited, which is the default: this is a local media server. When a cap is set, renditions past it are evicted least recently served first - never a song a playlist or a favourite keeps. |
 | `media.prefetchPlaylists` | `true` | Keeps the songs in people's playlists downloaded before anybody plays them: one song at a time in the background, so a first play costs nothing. |
 | `listenTogether.skipThreshold` | `2.0` | Mean vote below which the room skips. |
 | `listenTogether.minVotersForSkip` | `2` | Voters needed before a skip can fire. |
 | `listenTogether.voterFractionForSkip` | `0.5` | Fraction of the room that must have voted. |
 | `client.serverURL` | `""` | Server to talk to. Empty runs the server inside the CLI. |
 | `client.cacheDir` | `$XDG_CACHE_HOME/musoak` | Client-side media cache, queue and session token. |
+
+### What stays on disk
+
+The media cache sweeps itself hourly (and once at startup). A stored song is
+kept because of what the household did with it:
+
+| kept | for |
+| --- | --- |
+| in a playlist, or a favourite | for ever - never swept, quota or not |
+| played by one account | a week after the newest play |
+| played by two accounts | three months after the newest play |
+| played by more accounts | a further month per listener, capped at a year |
+| fetched but never played | a week after it was downloaded |
+| imported or uploaded (a `local`/`upload` rendition) | for ever - it is the only copy |
+
+Any play resets the clock, so a song everybody keeps coming back to stays. Files
+being served are skipped and looked at again next hour.
 
 Runtime dependencies (bundled by the Nix packages, otherwise on `PATH`):
 `python3` with `ytmusicapi`, `yt-dlp`, `ffmpeg`/`ffprobe`, and `mpv` for the CLI.

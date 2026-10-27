@@ -220,3 +220,82 @@ func (d *DB) MediaBytes(ctx context.Context) (int64, error) {
 	}
 	return *total, nil
 }
+
+// MediaRetentionRow is one stored rendition with what the retention policy needs
+// to decide how long it stays: whether its track is in somebody's playlist or a
+// favourite (kept for ever), when it was last played, and how many people have
+// played it at all.
+type MediaRetentionRow struct {
+	MediaFile
+	TrackID uuid.UUID
+	// LastPlay is the newest recorded listen of the track, or zero when nobody
+	// has listened to it.
+	LastPlay time.Time
+	// Listeners is how many distinct accounts have played the track ever.
+	Listeners int
+	// Pinned says the track is in a playlist or a favourite.
+	Pinned bool
+}
+
+// MediaRetention lists every stored rendition whose provider is one this library
+// cannot simply re-download for free, with the facts its retention depends on.
+// Local files and uploads are left out: they are not fetched from anywhere, so
+// there is no copy behind them to fetch again.
+func (d *DB) MediaRetention(ctx context.Context) ([]MediaRetentionRow, error) {
+	rows, err := d.db.QueryContext(ctx, `
+		SELECT mf.variant_id, mf.path, mf.sha256, mf.duration_ms, mf.bytes,
+		       mf.downloaded_at, mf.accessed_at,
+		       v.track_id,
+		       COALESCE((SELECT MAX(p.started_at_ms) FROM play_history p
+		                  WHERE p.track_id = v.track_id), 0),
+		       (SELECT COUNT(DISTINCT p.user_id) FROM play_history p
+		         WHERE p.track_id = v.track_id),
+		       (EXISTS (SELECT 1 FROM playlist_items pi WHERE pi.track_id = v.track_id)
+		        OR EXISTS (SELECT 1 FROM favorites f WHERE f.track_id = v.track_id))
+		FROM media_files mf
+		JOIN variants v ON v.id = mf.variant_id
+		WHERE v.provider NOT IN (?, ?)`,
+		LocalProvider, UploadProvider)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+
+	var out []MediaRetentionRow
+	for rows.Next() {
+		var (
+			row                          MediaRetentionRow
+			variant                      string
+			track                        string
+			downloaded, accessed, played int64
+			pinned                       bool
+		)
+		if err := rows.Scan(&variant, &row.Path, &row.SHA256, &row.DurationMs, &row.Bytes,
+			&downloaded, &accessed, &track, &played, &row.Listeners, &pinned); err != nil {
+			return nil, mapErr(err)
+		}
+		id, err := parseUUID(variant)
+		if err != nil {
+			return nil, err
+		}
+		row.VariantID = id
+		if row.TrackID, err = parseUUID(track); err != nil {
+			return nil, err
+		}
+		row.DownloadedAt = millisTime(downloaded)
+		row.AccessedAt = millisTime(accessed)
+		row.LastPlay = millisTime(played)
+		row.Pinned = pinned
+		out = append(out, row)
+	}
+	return out, mapErr(rows.Err())
+}
+
+// millisTime is a stored millisecond stamp as a time, with zero - "never" in
+// every column this uses it for - left as the zero time rather than 1970.
+func millisTime(value int64) time.Time {
+	if value == 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(value).UTC()
+}

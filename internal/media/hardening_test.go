@@ -302,7 +302,7 @@ func TestEvictionLeavesAServedFileAlone(t *testing.T) {
 
 	// It is being read: the sweep takes the other one and leaves it.
 	done := manager.beginServing(first.ID)
-	manager.sweep(ctx)
+	manager.sweepQuota(ctx)
 	if _, err := db.MediaFile(ctx, first.ID); err != nil {
 		t.Errorf("the rendition being read was evicted: %v", err)
 	}

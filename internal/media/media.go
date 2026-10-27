@@ -196,12 +196,12 @@ type Manager struct {
 	// does not delete the bytes a listener is in the middle of.
 	serving map[uuid.UUID]int
 	// downloadTimeout is how long one attempt may take; see downloadTimeout.
-	downloadTimeout  time.Duration
-	background       map[uuid.UUID]backgroundFetch
+	downloadTimeout time.Duration
+	background      map[uuid.UUID]backgroundFetch
 	// playing is the download somebody is waiting to hear, by variant. A play
 	// that starts after it - the listener skipped - stops it, so the song they
 	// are waiting for is not sharing the provider's pipe with the one they left.
-	playing map[uuid.UUID]*backgroundFetch
+	playing          map[uuid.UUID]*backgroundFetch
 	paused           []uuid.UUID
 	downloadAttempts int
 	downloadBackoff  time.Duration
@@ -665,7 +665,7 @@ func (m *Manager) evict(ctx context.Context) {
 func (m *Manager) sweepLoop(ctx context.Context) {
 	for {
 		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), evictionTimeout)
-		m.sweep(sctx)
+		m.sweepQuota(sctx)
 		cancel()
 		// The exit and the flag reset are one critical section, so an evict that
 		// arrives as this finishes sees either "still running" - and is carried
@@ -683,11 +683,11 @@ func (m *Manager) sweepLoop(ctx context.Context) {
 	}
 }
 
-// sweep brings the media directory back under its quota, least recently served
-// first. It skips anything a request is reading: the bytes may be somebody's
+// sweepQuota brings the media directory back under its quota, least recently
+// served first. It skips anything a request is reading: the bytes may be somebody's
 // song half way through, and deleting them is a listener cut off mid-word that
 // the next request pays for again.
-func (m *Manager) sweep(ctx context.Context) {
+func (m *Manager) sweepQuota(ctx context.Context) {
 	if m.quotaBytes <= 0 {
 		return
 	}

@@ -195,6 +195,11 @@ type MediaRepo interface {
 	TouchMediaFile(ctx context.Context, variantID uuid.UUID, at time.Time) error
 	// MediaBytes is the total size of the media cache.
 	MediaBytes(ctx context.Context) (int64, error)
+	// MediaRetention lists the stored provider renditions with what the
+	// retention policy needs to know about each: its track's newest listen, how
+	// many people have played it, and whether it is pinned by a playlist or a
+	// favourite.
+	MediaRetention(ctx context.Context) ([]MediaRetentionRow, error)
 	// MediaEvictionCandidates lists only the files an eviction has to remove to
 	// free excessBytes, least recently served first: an eviction reads the rows
 	// it will delete rather than the whole cache. A rendition fetched from a

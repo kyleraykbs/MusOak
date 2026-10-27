@@ -43,10 +43,14 @@ const ProviderTimeout = 15 * time.Second
 // Server is the HTTP server. Everything the daemon does is reachable through
 // it; the CLI and any bot are plain API clients.
 type Server struct {
-	cfg       *config.Config
-	logger    *slog.Logger
-	mux       *http.ServeMux
-	store     *store.DB
+	cfg    *config.Config
+	logger *slog.Logger
+	mux    *http.ServeMux
+	store  *store.DB
+	// ctx and stop are what Close cancels: the work the server starts that
+	// outlives a request (the room clock, the retention sweep).
+	ctx       context.Context
+	stop      context.CancelFunc
 	providers *provider.Registry
 	media     *media.Manager
 	matcher   *match.Matcher
@@ -97,10 +101,17 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		searches:  newSearchAnswers(SearchAnswerTTL, 256),
 	}
 	quotaBytes := int64(cfg.Media.QuotaMB) * 1024 * 1024
+	// Everything the server starts that outlives a request watches this, so a
+	// Close stops it rather than leaving it running under a closed database.
+	s.ctx, s.stop = context.WithCancel(context.Background())
 	// The artwork cache is built first: it is the seam the media pipeline
 	// files the covers imported files carry through.
 	s.artwork = artwork.New(filepath.Join(cfg.StorageDir, "artwork"), db, logger)
 	s.media = media.New(filepath.Join(cfg.StorageDir, "media"), quotaBytes, db, s.providers, importArtwork{s.artwork}, logger)
+	// The songs a household keeps are decided by what it does with them: a
+	// playlist or a favourite keeps one for ever, a play keeps it a while, and a
+	// listen from somebody new keeps it longer. The sweep runs now and hourly.
+	s.media.StartRetention(s.ctx, time.Hour)
 	s.matcher = match.New(db, s.providers, cfg.Match.Threshold, logger)
 	s.auth = auth.New(cfg, db, logger)
 	s.ranking = ranking.New(db, cfg.DefaultProviderOrder, logger)
@@ -166,6 +177,9 @@ func localArtworkSource(id uuid.UUID) string { return "local:" + id.String() }
 
 // Close releases the server's resources.
 func (s *Server) Close() error {
+	if s.stop != nil {
+		s.stop()
+	}
 	if s.rooms != nil {
 		s.rooms.Close()
 	}
