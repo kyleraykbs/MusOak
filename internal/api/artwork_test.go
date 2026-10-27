@@ -87,6 +87,21 @@ func TestArtworkEndpointServesAndCachesCovers(t *testing.T) {
 		t.Errorf("the provider was asked %d times, want 1", hits)
 	}
 
+	// A row that asks for a small cover asks for a width. What is stored here
+	// is not an image at all, so the resize cannot run: the cover is served as
+	// it is rather than the row going without one.
+	rec = c.do(http.MethodGet, track.ArtworkURL+"?w=64", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("artwork with a width = %d: %s", rec.Code, rec.Body.String())
+	}
+	if body := rec.Body.String(); body != "fake-png-bytes" {
+		t.Errorf("a cover that cannot be shrunk was not served: body = %q", body)
+	}
+	// Garbage in the width is not an error either: it is read as "no width".
+	if rec := c.do(http.MethodGet, track.ArtworkURL+"?w=nonsense", "", nil); rec.Code != http.StatusOK {
+		t.Errorf("artwork with a nonsense width = %d, want the cover", rec.Code)
+	}
+
 	// An entity the providers never gave a cover to answers 404.
 	lonely := seedTracks(t, c, "No Cover")[0]
 	rec = c.do(http.MethodGet, "/api/v1/artwork/track/"+lonely.ID.String(), "", nil)

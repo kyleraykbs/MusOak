@@ -79,6 +79,13 @@ paths:
         downloaded once for the whole household. Responses carry a strong ETag
         and a long cache lifetime; artwork that has not been supplied yet
         answers 404.
+
+        `w` asks for a copy no wider than that many pixels, for the places a
+        cover is drawn small: a song row is 32px and the stored image may be a
+        megabyte of phone photo. The copy is made once, cached beside the
+        original, and answered as `image/jpeg` with its own ETag. A width the
+        server does not offer is taken to the nearest one it does, and a copy
+        that cannot be made falls back to the original.
       operationId: getArtwork
       parameters:
         - name: kind
@@ -89,6 +96,14 @@ paths:
           in: path
           required: true
           schema: { type: string, format: uuid }
+        - name: w
+          in: query
+          required: false
+          description: |
+            Width in pixels for a downscaled copy. The server answers one of
+            64, 112, 160, 256 or 336 - the nearest at least as wide - and only
+            ever shrinks: a cover already narrower is served unchanged.
+          schema: { type: integer, minimum: 1, maximum: 512 }
       responses:
         "200":
           description: The image.

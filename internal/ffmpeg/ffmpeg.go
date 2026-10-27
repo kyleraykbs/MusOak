@@ -79,6 +79,31 @@ func ToOpus(ctx context.Context, src, dst string) error {
 	return trimTo(ctx, src, dst, TrailingSilence(ctx, src), 0, nil)
 }
 
+// ScaleImage writes dst as a JPEG no wider than width, keeping the aspect ratio.
+//
+// A cover is stored at whatever the provider or the uploader had - this library
+// holds 4-megapixel phone photos next to 544px provider art - and a song row
+// draws it in 32px. The derivative is for the row; the original stays for the
+// pages that draw it large.
+//
+// Only downscaling happens: `min(iw,W)` keeps a source that is already narrower
+// as it is, because an upscaled thumbnail is a bigger file of no more picture.
+// The first frame is what is taken, which is the whole of a JPEG or PNG and the
+// opening image of a GIF.
+func ScaleImage(ctx context.Context, src, dst string, width int) error {
+	if width < 1 {
+		return fmt.Errorf("ffmpeg: refusing a thumbnail width of %d", width)
+	}
+	_, err := run(ctx, ffmpegName,
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-i", src,
+		"-frames:v", "1",
+		"-vf", fmt.Sprintf("scale='min(iw,%d)':-2", width),
+		"-q:v", "4",
+		"-f", "mjpeg", dst)
+	return err
+}
+
 // ProgressFunc receives a transcode's own position while it runs: done out of
 // total, both millisecond counts. Total <= 0 means the source's length is not
 // known, which is reported rather than guessed. Nil is allowed.

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -74,6 +75,19 @@ func (s *Server) handleArtwork(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A request that names a width gets a copy at that width: a song row draws
+	// 32px, and the original may be a megabyte of phone photo. The copy is a
+	// file of its own in the cache, so the next row that asks costs a stat, and
+	// a copy that cannot be made falls back to the original rather than to a
+	// missing cover.
+	if width := artworkRequestedWidth(r); width > 0 {
+		if shot, err := s.artwork.Thumbnail(r.Context(), item, width); err == nil {
+			item = shot
+		} else {
+			s.logger.Debug("artwork thumbnail failed", "kind", kind, "id", id, "width", width, "error", err)
+		}
+	}
+
 	file, err := os.Open(item.Path)
 	if err != nil {
 		http.Error(w, "artwork missing", http.StatusNotFound)
@@ -88,4 +102,24 @@ func (s *Server) handleArtwork(w http.ResponseWriter, r *http.Request) {
 	// A cover never changes once fetched, so let clients keep it.
 	w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
 	http.ServeContent(w, r, filepath.Base(item.Path), time.Time{}, file)
+}
+
+// artworkRequestedWidth is the width a cover request asked to be shrunk to, or
+// zero for "send it as it is".
+//
+// A song row draws 32px of cover; the image behind it is whatever the provider
+// or the uploader had, which in this library is anything from 8 KB to a 2.7 MB
+// photo of an album sleeve. The width travels in the URL rather than in a
+// header because the browser's own <img> request is what carries it, and each
+// width is a file the fetcher caches, so the second row that asks is free.
+func artworkRequestedWidth(r *http.Request) int {
+	raw := r.URL.Query().Get("w")
+	if raw == "" {
+		return 0
+	}
+	width, err := strconv.Atoi(raw)
+	if err != nil || width <= 0 {
+		return 0
+	}
+	return artwork.ThumbnailWidth(width)
 }

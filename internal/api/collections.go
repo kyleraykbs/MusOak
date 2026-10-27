@@ -80,19 +80,25 @@ type syncResponse struct {
 }
 
 func (s *Server) buildAlbum(ctx context.Context, album *library.Album, withTracks bool) (albumResponse, error) {
+	kind := albumKind(album)
 	out := albumResponse{
 		ID:         album.Album.ID.String(),
 		Title:      album.Album.Title,
 		Artists:    make([]string, 0, len(album.Artists)),
 		TrackCount: len(album.Tracks),
-		Kind:       albumKind(album),
+		Kind:       kind,
 		Providers:  make([]string, 0, len(album.Variants)),
 		Variants:   make([]albumVariantResponse, 0, len(album.Variants)),
 	}
 	for _, artist := range album.Artists {
 		out.Artists = append(out.Artists, artist.Name)
 	}
-	if album.Album.ArtworkURL != "" {
+	// The singles container is not a release and has no cover of its own: the
+	// one it can hold is a single's, inherited when its tracks linked their
+	// albums. Serving it under the container's name is one single's sleeve
+	// presented as the artist's singles, so no client is told there is one -
+	// each draws its own idea of the container instead.
+	if album.Album.ArtworkURL != "" && kind != store.AlbumKindSingles {
 		out.ArtworkURL = artworkPath(store.ArtworkAlbum, album.Album.ID)
 	}
 	seen := map[string]bool{}

@@ -6,7 +6,11 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/google/uuid"
+
+	"github.com/kyleraykbs/MusOak/internal/library"
 	"github.com/kyleraykbs/MusOak/internal/provider"
+	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
 // fakeCollectionsProvider serves album and artist browsing.
@@ -268,5 +272,45 @@ func TestCollectionSearchErrorShape(t *testing.T) {
 		if _, ok := problem["error"]; !ok {
 			t.Errorf("%s: no lowercase \"error\" key: %v", path, problem)
 		}
+	}
+}
+
+// The singles container is not a release, so it has no cover of its own. The
+// one it can hold is a single's, inherited when that single's track linked its
+// album: serving it under "Singles" shows one sleeve as the artist's whole
+// singles, which is what Kyle saw on the container's page while the row on the
+// artist page wore the app's mark.
+func TestTheSinglesContainerIsNotGivenASinglesCover(t *testing.T) {
+	album := &library.Album{Album: store.Album{
+		ID:         uuid.New(),
+		Title:      store.SinglesAlbumTitle,
+		Kind:       store.AlbumKindSingles,
+		ArtworkURL: "https://cdn.example.com/one-single.jpg",
+	}}
+
+	response, err := (&Server{}).buildAlbum(context.Background(), album, false)
+	if err != nil {
+		t.Fatalf("buildAlbum: %v", err)
+	}
+	if response.Kind != store.AlbumKindSingles {
+		t.Fatalf("kind = %q, want %q", response.Kind, store.AlbumKindSingles)
+	}
+	if response.ArtworkURL != "" {
+		t.Errorf("the singles container answers artworkUrl %q, want none", response.ArtworkURL)
+	}
+
+	// A record the same way: its own cover is served.
+	record := &library.Album{Album: store.Album{
+		ID:         uuid.New(),
+		Title:      "A Record",
+		Kind:       store.ReleaseKindAlbum,
+		ArtworkURL: "https://cdn.example.com/record.jpg",
+	}}
+	same, err := (&Server{}).buildAlbum(context.Background(), record, false)
+	if err != nil {
+		t.Fatalf("buildAlbum: %v", err)
+	}
+	if same.ArtworkURL != artworkPath(store.ArtworkAlbum, record.Album.ID) {
+		t.Errorf("a record's artworkUrl = %q, want the server's own path", same.ArtworkURL)
 	}
 }

@@ -328,3 +328,15 @@
 - Decision: follow YT Music artist-section continuations instead of accepting its first ten releases; carry album/single/EP kind; show albums newest-first by earliest release year; collect an artist's singles into one synthetic `Singles` album; start a paced, resumable catalogue read when an artist opens; and make an album GET wait for a complete tracklist, including adopting a provider release for a track-born album.
 - Why: Pink Floyd's first page omitted 27 albums including The Dark Side of the Moon, singles polluted the album list, and a track-born Dark Side of the Moon held only the song that created it. YT Music has no bulk all-songs call: `get_album` is complete per release, so the artist-wide read must be background work.
 - Reversible: yes
+
+## 2026-10-27 A cover is served at the width a page draws it
+- Decision: `GET /api/v1/artwork/{kind}/{id}?w=` answers a downscaled copy at
+  one of 64/112/160/256/336/512 (the nearest at least as wide), cached beside the
+  original as `<hash>@<w>.jpg`, answered as image/jpeg with its own ETag and the
+  same immutable lifetime. Only downscaling (`scale='min(iw,W)':-2`), one resize
+  per (source, width) shared by singleflight, and a failed resize serves the
+  original. The singles container no longer emits `artworkUrl`.
+- Why: the cache holds 544px provider art next to 4-megapixel phone photos and a
+  2.7 MB GIF, and a 32px song row downloaded whatever was there. The container's
+  cover was a single's, shown under the container's name.
+- Reversible: yes
