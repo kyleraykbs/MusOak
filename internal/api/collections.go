@@ -27,7 +27,10 @@ type albumResponse struct {
 	ID      string   `json:"id"`
 	Title   string   `json:"title"`
 	Artists []string `json:"artists"`
-	Year    string   `json:"year,omitempty"`
+	// ArtistIDs runs parallel to Artists, the same as a track's: an artist line
+	// is a link to that artist's page, and a name alone cannot name one.
+	ArtistIDs []string `json:"artistIds,omitempty"`
+	Year      string   `json:"year,omitempty"`
 	// TrackCount is what this library holds for the album right now, which is
 	// not the same as how long the album is until it has been read whole.
 	TrackCount int `json:"trackCount"`
@@ -100,8 +103,10 @@ func (s *Server) buildAlbum(ctx context.Context, album *library.Album, withTrack
 		Providers:  make([]string, 0, len(album.Variants)),
 		Variants:   make([]albumVariantResponse, 0, len(album.Variants)),
 	}
+	out.ArtistIDs = make([]string, 0, len(album.Artists))
 	for _, artist := range album.Artists {
 		out.Artists = append(out.Artists, artist.Name)
+		out.ArtistIDs = append(out.ArtistIDs, artist.ID.String())
 	}
 	// The singles container is not a release and has no cover of its own: the
 	// one it can hold is a single's, inherited when its tracks linked their

@@ -3006,6 +3006,12 @@ components:
         id: { type: string, format: uuid }
         title: { type: string }
         artists: { type: array, items: { type: string } }
+        artistIds:
+          type: array
+          description: |
+            Parallel to `artists`: the canonical artist ids, so a client can link
+            the name to that artist's page.
+          items: { type: string, format: uuid }
         year: { type: string }
         trackCount:
           type: integer
@@ -3060,6 +3066,12 @@ components:
         providerAlbumId: { type: string }
         title: { type: string }
         artists: { type: array, items: { type: string } }
+        artistIds:
+          type: array
+          description: |
+            Parallel to `artists`: the canonical artist ids, so a client can link
+            a name to that artist's page.
+          items: { type: string, format: uuid }
         year: { type: string }
         trackCount: { type: integer }
 
