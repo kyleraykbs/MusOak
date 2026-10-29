@@ -926,11 +926,6 @@ func (g *primaryGate) wait(ctx context.Context) error {
 	}
 }
 
-// resumeWindow is how long a background download must have been running before
-// a play leaves it alone. What is nearly done frees the pipe by itself; what
-// has just started is stopped, and started again when the play is over.
-const resumeWindow = 20 * time.Second
-
 // registerBackground makes a background download cancellable and remembers it,
 // so a play arriving can stop it. The returned function forgets it again.
 func (m *Manager) registerBackground(ctx context.Context, variantID uuid.UUID) (context.Context, func()) {
@@ -983,8 +978,14 @@ func (m *Manager) enterPrimary(variantID uuid.UUID, cancel context.CancelFunc) *
 	}
 	record := &backgroundFetch{cancel: cancel, startedAt: now}
 	m.playing[variantID] = record
+	// Every other background fetch stops, however long it has been running: a
+	// play owns the pipe, and what a background fetch was downloading is either
+	// behind the song now playing or not wanted at all. Age is no argument -
+	// twenty seconds into a download is not nearly done, it is half the pipe the
+	// listener is waiting on - and what was stopped is put back when the play is
+	// over, so the work is deferred rather than lost.
 	for id, fetch := range m.background {
-		if id == variantID || now.Sub(fetch.startedAt) >= resumeWindow {
+		if id == variantID {
 			continue
 		}
 		stop = append(stop, fetch.cancel)

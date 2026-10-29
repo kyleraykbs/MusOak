@@ -578,3 +578,44 @@ func TestCancelStopsABackgroundDownload(t *testing.T) {
 		t.Errorf("state after a fresh fetch = %s, want %s", state, StateReady)
 	}
 }
+
+// A background fetch that has been running a while stops too. Age used to excuse
+// it - "what is nearly done frees the pipe by itself" - but a download twenty
+// seconds in is exactly the pipe the listener is waiting on, and the rule is that
+// the queue's transfers follow the song being played.
+func TestEnsurePrimaryStopsAnOlderBackgroundFetch(t *testing.T) {
+	dir := t.TempDir()
+	fixture := tone(t, dir, "fixture.opus", 1.0)
+	fake := &fakeProvider{name: "ytmusic", fixture: fixture, delay: 300 * time.Millisecond}
+	m, db := newTestManager(t, fake)
+
+	background := seedVariant(t, db, true, "ytmusic")
+	playing := seedVariant(t, db, true, "ytmusic")
+
+	backgroundErr := make(chan error, 1)
+	go func() {
+		_, err := m.Ensure(context.Background(), background.ID)
+		backgroundErr <- err
+	}()
+	waitForCalls(t, fake, 1)
+
+	// It has been running far longer than an exemption would allow.
+	m.mu.Lock()
+	if fetch, ok := m.background[background.ID]; ok {
+		fetch.startedAt = time.Now().Add(-time.Hour)
+	}
+	m.mu.Unlock()
+
+	playingErr := make(chan error, 1)
+	go func() {
+		_, err := m.EnsurePrimary(context.Background(), playing.ID)
+		playingErr <- err
+	}()
+
+	if err := <-playingErr; err != nil {
+		t.Fatalf("the play failed: %v", err)
+	}
+	if err := <-backgroundErr; !errors.Is(err, context.Canceled) {
+		t.Errorf("an old background download = %v, want it cancelled for the play", err)
+	}
+}

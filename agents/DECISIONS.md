@@ -361,3 +361,14 @@
   want". The three-month floor for two listeners is his earlier rule and is what
   the year cap is reached from.
 - Reversible: yes
+
+## 2026-10-28 A play stops every other download, whatever its age
+- Decision: `enterPrimary` cancels every other background fetch, not only those
+  younger than `resumeWindow` (20s, now gone). What is stopped goes on the paused
+  list and is resumed when the play is over, as before.
+- Why: the age exemption let a long-running background download keep half the
+  provider pipe while the song somebody was waiting to hear was fetched - the
+  web player's own row for the old song kept its download bar, and the new song
+  waited behind it. Kyle's rule: the queue's transfers follow the song being
+  played, exactly.
+- Reversible: yes
