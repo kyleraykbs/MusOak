@@ -372,3 +372,13 @@
   waited behind it. Kyle's rule: the queue's transfers follow the song being
   played, exactly.
 - Reversible: yes
+
+## 2026-10-30 The retention sweep reads a clock a test can move
+- Decision: `media.Manager` carries `now func() time.Time` (set to `time.Now` by
+  `New`), and the sweep reads it. `TestRetentionWalksTheCalendar` walks it through
+  a year - +8d, +31d, +91d, +361d - and asserts exactly which songs survive, with
+  a played song proving a play resets the clock.
+- Why: a policy counted in months cannot be exercised by waiting, and a sweep
+  that calls `time.Now()` directly is a sweep no test can walk a year of. Kyle
+  chose the seam over the pure-function table alone.
+- Reversible: yes

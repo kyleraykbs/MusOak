@@ -66,7 +66,7 @@ func (m *Manager) sweepRetention(ctx context.Context) int64 {
 		m.logger.Warn("media: retention check failed", "error", err)
 		return 0
 	}
-	now := time.Now()
+	now := m.now()
 	freed := int64(0)
 	for _, row := range rows {
 		if ctx.Err() != nil {

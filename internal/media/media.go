@@ -206,6 +206,11 @@ type Manager struct {
 	downloadAttempts int
 	downloadBackoff  time.Duration
 
+	// now is where the retention sweep reads the calendar from. A field, not
+	// `time.Now()` at the call site: a policy counted in months can be tested
+	// only by moving the clock, and a sweep that reads the wall clock directly
+	// is a sweep no test can walk a year of.
+	now func() time.Time
 	// evictMu guards evicting: a sweep runs at most one at a time, and never on
 	// the request that grew the cache. evictAgain carries a request that arrived
 	// while one was running, so no request is lost to coalescing.
@@ -250,6 +255,7 @@ func New(dir string, quotaBytes int64, db Store, providers *provider.Registry, a
 		downloadAttempts: downloadAttempts,
 		downloadBackoff:  downloadBackoff,
 		downloadTimeout:  downloadTimeout,
+		now:              time.Now,
 	}
 }
 
