@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"time"
 
 	"github.com/google/uuid"
@@ -28,7 +29,7 @@ UPDATE media_files
  WHERE path LIKE '/%' AND instr(path, '/media/') > 0;
 `
 
-const mediaColumns = `variant_id, path, sha256, duration_ms, bytes, downloaded_at, accessed_at`
+const mediaColumns = `variant_id, path, sha256, duration_ms, bytes, downloaded_at, accessed_at, loudness_lufs`
 
 // pathIn is a media path as it is stored: relative to the storage directory,
 // so the directory can move without the database pointing at where it was. A
@@ -60,10 +61,12 @@ func (d *DB) scanMediaFile(row rowScanner) (*MediaFile, error) {
 		variantID  string
 		downloaded int64
 		accessed   int64
+		loudness   sql.NullFloat64
 	)
-	if err := row.Scan(&variantID, &m.Path, &m.SHA256, &m.DurationMs, &m.Bytes, &downloaded, &accessed); err != nil {
+	if err := row.Scan(&variantID, &m.Path, &m.SHA256, &m.DurationMs, &m.Bytes, &downloaded, &accessed, &loudness); err != nil {
 		return nil, mapErr(err)
 	}
+	m.LoudnessLUFS, m.LoudnessKnown = loudness.Float64, loudness.Valid
 	var err error
 	if m.VariantID, err = parseUUID(variantID); err != nil {
 		return nil, err
@@ -82,19 +85,43 @@ func (d *DB) UpsertMediaFile(ctx context.Context, m *MediaFile) error {
 	if m.AccessedAt.IsZero() {
 		m.AccessedAt = m.DownloadedAt
 	}
+	// A file replaced is measured again: the loudness written is this file's,
+	// or unknown, never the one it replaced.
+	var loudness any
+	if m.LoudnessKnown {
+		loudness = m.LoudnessLUFS
+	}
 	_, err := d.db.ExecContext(ctx, `
-		INSERT INTO media_files (variant_id, path, sha256, duration_ms, bytes, downloaded_at, accessed_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO media_files (variant_id, path, sha256, duration_ms, bytes, downloaded_at, accessed_at, loudness_lufs)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (variant_id) DO UPDATE SET
 			path = excluded.path,
 			sha256 = excluded.sha256,
 			duration_ms = excluded.duration_ms,
 			bytes = excluded.bytes,
 			downloaded_at = excluded.downloaded_at,
-			accessed_at = excluded.accessed_at`,
+			accessed_at = excluded.accessed_at,
+			loudness_lufs = excluded.loudness_lufs`,
 		m.VariantID.String(), d.pathIn(m.Path), m.SHA256, m.DurationMs, m.Bytes,
-		m.DownloadedAt.UnixMilli(), m.AccessedAt.UnixMilli())
+		m.DownloadedAt.UnixMilli(), m.AccessedAt.UnixMilli(), loudness)
 	return mapErr(err)
+}
+
+// SetMediaLoudness records a stored file's measured loudness.
+func (d *DB) SetMediaLoudness(ctx context.Context, variantID uuid.UUID, lufs float64) error {
+	res, err := d.db.ExecContext(ctx,
+		`UPDATE media_files SET loudness_lufs = ? WHERE variant_id = ?`, lufs, variantID.String())
+	if err != nil {
+		return mapErr(err)
+	}
+	return rowsAffectedOrNotFound(res)
+}
+
+// MediaWithoutLoudness lists up to limit stored files nobody has measured yet,
+// most recently served first: the songs people are playing are levelled first.
+func (d *DB) MediaWithoutLoudness(ctx context.Context, limit int) ([]MediaFile, error) {
+	return d.queryMediaFiles(ctx,
+		`SELECT `+mediaColumns+` FROM media_files WHERE loudness_lufs IS NULL ORDER BY accessed_at DESC LIMIT ?`, limit)
 }
 
 // MediaFile returns the file record for a variant.
@@ -154,6 +181,19 @@ func (d *DB) MediaFilesFor(ctx context.Context, variantIDs []uuid.UUID) (map[uui
 	return out, mapErr(rows.Err())
 }
 
+// evictableMedia is the WHERE clause for the files the quota is about: fetched
+// from a provider, so there is a copy to fetch again, and not pinned. A track in
+// anybody's playlist or favourites is kept for ever, "quota or not" - the same
+// rule MediaRetention reads for the hourly sweep - so its files are neither
+// offered for eviction nor counted against the quota: counted and not offered,
+// a household whose playlists outgrow the quota would lose every other song the
+// moment it arrived. It takes two arguments: LocalProvider, UploadProvider.
+const evictableMedia = `variant_id IN (
+			SELECT v.id FROM variants v
+			WHERE v.provider NOT IN (?, ?)
+			  AND NOT EXISTS (SELECT 1 FROM playlist_items pi WHERE pi.track_id = v.track_id)
+			  AND NOT EXISTS (SELECT 1 FROM favorites f WHERE f.track_id = v.track_id))`
+
 // MediaEvictionCandidates lists the files an eviction may remove, least
 // recently served first, and only as many as it takes to cover excessBytes: the
 // query sums sizes in that order and stops once the running total reaches the
@@ -168,7 +208,7 @@ func (d *DB) MediaEvictionCandidates(ctx context.Context, excessBytes int64) ([]
 			SELECT `+mediaColumns+`,
 			       SUM(bytes) OVER (ORDER BY accessed_at, downloaded_at) AS freed
 			FROM media_files
-			WHERE variant_id IN (SELECT id FROM variants WHERE provider NOT IN (?, ?))
+			WHERE `+evictableMedia+`
 		)
 		WHERE freed - bytes < ?
 		ORDER BY accessed_at, downloaded_at`, LocalProvider, UploadProvider, excessBytes)
@@ -211,7 +251,7 @@ func (d *DB) TouchMediaFile(ctx context.Context, variantID uuid.UUID, at time.Ti
 func (d *DB) MediaBytes(ctx context.Context) (int64, error) {
 	var total *int64
 	if err := d.db.QueryRowContext(ctx, `SELECT SUM(bytes) FROM media_files
-		WHERE variant_id IN (SELECT id FROM variants WHERE provider NOT IN (?, ?))`,
+		WHERE `+evictableMedia,
 		LocalProvider, UploadProvider).Scan(&total); err != nil {
 		return 0, mapErr(err)
 	}
@@ -282,6 +322,10 @@ func (d *DB) MediaRetention(ctx context.Context) ([]MediaRetentionRow, error) {
 		if row.TrackID, err = parseUUID(track); err != nil {
 			return nil, err
 		}
+		// Stored relative to the storage directory, like every other read of
+		// this table: the sweep removes this path, and a relative one is only
+		// the file when the process happens to be standing in that directory.
+		row.Path = d.pathOut(row.Path)
 		row.DownloadedAt = millisTime(downloaded)
 		row.AccessedAt = millisTime(accessed)
 		row.LastPlay = millisTime(played)

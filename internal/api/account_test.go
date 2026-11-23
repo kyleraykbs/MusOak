@@ -21,6 +21,8 @@ func TestIconUploadCarriesAnImagePastTheSmallBodyLimit(t *testing.T) {
 	for i := range photo {
 		photo[i] = byte(i % 251)
 	}
+	// What is kept is what the bytes show to be an image, so it opens as one.
+	copy(photo, []byte{0xFF, 0xD8, 0xFF, 0xE0})
 	rec := c.do(http.MethodPost, "/api/v1/me/icon", token,
 		map[string]string{"data": base64.StdEncoding.EncodeToString(photo), "contentType": "image/jpeg"})
 	if rec.Code != http.StatusOK {
@@ -308,5 +310,39 @@ func TestAccountWritesNeedLogin(t *testing.T) {
 		if rec := c.do(call.method, call.path, "", call.body); rec.Code != http.StatusUnauthorized {
 			t.Errorf("%s %s as guest = %d, want 401: %s", call.method, call.path, rec.Code, rec.Body.String())
 		}
+	}
+}
+
+// The type an image claims is only a claim: what is stored is served back from
+// this server's own origin, so the bytes have to be an image themselves.
+func TestIconUploadRefusesWhatIsNotAnImage(t *testing.T) {
+	c := newHTTPTestServer(t, nil)
+	token := c.register("notanimage", "hunter2hunter2")
+
+	page := base64.StdEncoding.EncodeToString([]byte("<html><script>alert(1)</script></html>"))
+	rec := c.do(http.MethodPost, "/api/v1/me/icon", token, map[string]string{"data": page, "contentType": "image/png"})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("markup as an icon = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// A display name is carried by every room event and every list of people, so
+// it has a length; and the small account bodies are read as small bodies.
+func TestDisplayNameHasALength(t *testing.T) {
+	c := newHTTPTestServer(t, nil)
+	token := c.register("longname", "hunter2hunter2")
+
+	rec := c.do(http.MethodPatch, "/api/v1/me", token, map[string]string{"displayName": strings.Repeat("a", maxDisplayNameBytes+1)})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("an over-long display name = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+	rec = c.do(http.MethodPatch, "/api/v1/me", token, map[string]string{"displayName": strings.Repeat("a", maxDisplayNameBytes)})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("a display name at the limit = %d: %s", rec.Code, rec.Body.String())
+	}
+	// Two megabytes is an image's envelope, not a name's.
+	rec = c.do(http.MethodPatch, "/api/v1/me", token, map[string]string{"displayName": strings.Repeat("a", 2<<20)})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("a two megabyte account body = %d, want 400: %s", rec.Code, rec.Body.String())
 	}
 }

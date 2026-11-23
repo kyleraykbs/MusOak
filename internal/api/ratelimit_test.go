@@ -229,3 +229,45 @@ func TestLimiterSweepsAnIdleBucket(t *testing.T) {
 		t.Fatal("an idle bucket survived the sweep")
 	}
 }
+
+// Every route that puts a question to the providers spends from the search
+// budget, and the account changes that hash a password spend from the login one.
+func TestRateLimitCoversEveryProviderRoute(t *testing.T) {
+	for _, tc := range []struct {
+		method, path string
+		providers    bool
+		passwords    bool
+	}{
+		{"GET", "/api/v1/search", true, false},
+		{"GET", "/api/v1/albums/search", true, false},
+		{"GET", "/api/v1/artists/search", true, false},
+		{"GET", "/api/v1/playlists/search", true, false},
+		{"GET", "/api/v1/provider-playlists/abc", true, false},
+		{"POST", "/api/v1/radio", true, false},
+		{"POST", "/api/v1/albums/x/sync", true, false},
+		{"GET", "/api/v1/tracks/x", false, false},
+		{"POST", "/api/v1/me/password", false, true},
+		{"POST", "/api/v1/auth/login", false, true},
+	} {
+		r := httptest.NewRequest(tc.method, tc.path, nil)
+		if got := asksProviders(r); got != tc.providers {
+			t.Errorf("%s %s asks providers = %v, want %v", tc.method, tc.path, got, tc.providers)
+		}
+		if got := hashesPasswords(r); got != tc.passwords {
+			t.Errorf("%s %s hashes passwords = %v, want %v", tc.method, tc.path, got, tc.passwords)
+		}
+	}
+}
+
+// Two addresses in one IPv6 /64 are one client; IPv4 is keyed as it is.
+func TestRateKeyGroupsAnIPv6Network(t *testing.T) {
+	if rateKey("2001:db8::1") != rateKey("2001:db8::ffff:2") {
+		t.Error("two addresses of one /64 have two buckets")
+	}
+	if rateKey("2001:db8::1") == rateKey("2001:db8:0:1::1") {
+		t.Error("two /64 networks share a bucket")
+	}
+	if rateKey("192.0.2.7") != "192.0.2.7" {
+		t.Errorf("IPv4 key = %q", rateKey("192.0.2.7"))
+	}
+}

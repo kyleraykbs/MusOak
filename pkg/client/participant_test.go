@@ -38,6 +38,12 @@ func newServer(t *testing.T, mutate func(*config.Config)) *client.Client {
 	if err != nil {
 		t.Fatalf("api.New: %v", err)
 	}
+	// The tests seed songs by importing files off this disk, which is what the
+	// CLI's own in-process server lets its one user do.
+	server.TrustLocalOwner()
+	// The tests seed songs by importing files off this disk, which is what the
+	// CLI's own in-process server lets its one user do.
+	server.TrustLocalOwner()
 	httpServer := httptest.NewServer(server.Handler())
 	t.Cleanup(func() {
 		httpServer.Close()

@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"path/filepath"
 	"strings"
 
 	"github.com/kyleraykbs/MusOak/internal/store"
@@ -25,6 +26,33 @@ type importedTrack struct {
 	Variant variantResponse `json:"variant"`
 }
 
+// importAllowed reports whether path lies inside one of the roots. Both are
+// resolved first, so a link inside a root cannot name a place outside it, and
+// a path that does not exist is nobody's to import.
+func importAllowed(roots []string, path string) bool {
+	target, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return false
+	}
+	if target, err = filepath.Abs(target); err != nil {
+		return false
+	}
+	for _, root := range roots {
+		resolved, err := filepath.EvalSymlinks(root)
+		if err != nil {
+			continue
+		}
+		if resolved, err = filepath.Abs(resolved); err != nil {
+			continue
+		}
+		rel, err := filepath.Rel(resolved, target)
+		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
 // handleLibraryImport adds local files to the library, matching them onto
 // canonical tracks like any other provider's rendition.
 func (s *Server) handleLibraryImport(w http.ResponseWriter, r *http.Request) {
@@ -40,6 +68,20 @@ func (s *Server) handleLibraryImport(w http.ResponseWriter, r *http.Request) {
 	if req.Path != "" && req.Dir != "" {
 		writeError(w, http.StatusBadRequest, "path and dir are mutually exclusive")
 		return
+	}
+	// The import reads the path it is given as the server's own user: a file
+	// to probe and transcode, or a whole directory to walk. Over the network
+	// that is for somebody with an account, inside the directories the owner
+	// named - not for whoever can reach the port, and not for "/".
+	if !s.localOwner {
+		if _, ok := s.requireUser(w, r); !ok {
+			return
+		}
+		if !importAllowed(s.cfg.Media.ImportDirs, req.Path+req.Dir) {
+			writeError(w, http.StatusForbidden,
+				"that path is not inside a directory this server imports from (media.importDirs)")
+			return
+		}
 	}
 
 	var (

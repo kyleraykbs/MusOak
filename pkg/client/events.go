@@ -72,11 +72,11 @@ const (
 // dialSocket opens a WebSocket, carrying the client's credentials.
 func (c *Client) dialSocket(ctx context.Context, path string) (*websocket.Conn, error) {
 	header := http.Header{}
-	if c.token != "" {
-		header.Set("Authorization", "Bearer "+c.token)
+	if token := c.Token(); token != "" {
+		header.Set("Authorization", "Bearer "+token)
 	}
-	if c.memberID != "" {
-		header.Set("X-Member-Id", c.memberID)
+	if memberID := c.MemberID(); memberID != "" {
+		header.Set("X-Member-Id", memberID)
 	}
 
 	conn, _, err := websocket.Dial(ctx, c.socketURL(path), &websocket.DialOptions{HTTPHeader: header})

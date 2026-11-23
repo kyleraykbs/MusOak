@@ -198,7 +198,14 @@ func (s *Service) assemble(ctx context.Context, results []provider.Result, seedT
 			hit := queue[round]
 			track, _, err := s.matcher.Attach(ctx, names[i], hit)
 			if err != nil {
-				return nil, fmt.Errorf("radio: match %s/%s: %w", names[i], hit.ProviderTrackID, err)
+				// One suggestion that will not go into the library is one song
+				// fewer, not a station that never happens. A request that has
+				// been called off is the exception: nothing after it will work.
+				if ctx.Err() != nil {
+					return nil, fmt.Errorf("radio: match %s/%s: %w", names[i], hit.ProviderTrackID, err)
+				}
+				s.logger.Warn("radio: a suggestion could not be matched", "provider", names[i], "track", hit.ProviderTrackID, "error", err)
+				continue
 			}
 			if seen[track.ID] {
 				continue
@@ -229,10 +236,18 @@ func (s *Service) selectProviders(requested []string) []string {
 		return available
 	}
 
+	// Once each: every name is a station of its own - a helper process and a
+	// provider call - and a list that says one provider fifty times is not
+	// fifty stations.
 	selected := make([]string, 0, len(requested))
+	seen := make(map[string]bool, len(requested))
 	for _, name := range requested {
+		if seen[name] {
+			continue
+		}
 		for _, candidate := range available {
 			if candidate == name {
+				seen[name] = true
 				selected = append(selected, name)
 				break
 			}

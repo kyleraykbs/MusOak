@@ -34,8 +34,8 @@ func TestJobRegistryPrunesOnGet(t *testing.T) {
 	}
 }
 
-// add stays O(1): it stores without walking the registry, so a finished job is
-// left for the next read to drop rather than swept on every add.
+// add does not walk the registry each time: within a minute of the last sweep
+// it only stores, and a finished job is left for the next read to drop.
 func TestJobRegistryAddDoesNotSweep(t *testing.T) {
 	reg := newJobRegistry[testJob](time.Minute, func(job *testJob) time.Time { return job.ended })
 	past := time.Now().Add(-2 * time.Minute)
@@ -47,5 +47,36 @@ func TestJobRegistryAddDoesNotSweep(t *testing.T) {
 	reg.mu.Unlock()
 	if grown != 50 {
 		t.Fatalf("add swept the registry: %d entries, want 50", grown)
+	}
+}
+
+// A job that never ends is the one nothing used to forget: an archive asked for
+// and never downloaded. The registry's own stamp of when it arrived bounds it,
+// and a registry that is only ever added to still sweeps.
+func TestJobRegistryForgetsAJobThatNeverEnded(t *testing.T) {
+	reg := newJobRegistry[testJob](time.Minute, func(job *testJob) time.Time { return job.ended })
+	now := time.Now()
+	reg.now = func() time.Time { return now }
+
+	abandoned := reg.add(&testJob{})
+	now = now.Add(jobMaxAge - time.Minute)
+	if _, ok := reg.get(abandoned); !ok {
+		t.Fatal("a job inside its lifetime was dropped")
+	}
+
+	// Past the lifetime, with nobody ever looking it up again: the next add
+	// is what finds it.
+	now = now.Add(2 * time.Minute)
+	fresh := reg.add(&testJob{})
+	reg.mu.Lock()
+	_, kept := reg.entries[abandoned]
+	_, added := reg.entries[fresh]
+	stamps := len(reg.created)
+	reg.mu.Unlock()
+	if kept {
+		t.Error("a job that never ended was remembered past jobMaxAge")
+	}
+	if !added || stamps != 1 {
+		t.Errorf("after the sweep: fresh job kept = %v, %d creation stamps, want true and 1", added, stamps)
 	}
 }

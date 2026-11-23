@@ -190,3 +190,31 @@ func copyFile(from, to string) error {
 	}
 	return out.Close()
 }
+
+// Retention deletes the path it is handed. A relative one is only the file when
+// the process is standing in the storage directory, which a daemon started from
+// anywhere else is not: the row went, the file stayed, and the disk filled with
+// songs the store no longer knew about.
+func TestRetentionRowsCarryAPathOnThisDisk(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "musoak.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	ctx := context.Background()
+	variantID := seedVariantForFile(t, db)
+	onDisk := filepath.Join(dir, "media", variantID.String()+".opus")
+	if err := db.UpsertMediaFile(ctx, &MediaFile{VariantID: variantID, Path: onDisk, SHA256: "sum"}); err != nil {
+		t.Fatalf("UpsertMediaFile: %v", err)
+	}
+
+	rows, err := db.MediaRetention(ctx)
+	if err != nil {
+		t.Fatalf("MediaRetention: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Path != onDisk {
+		t.Fatalf("retention rows = %+v, want the one file at %q", rows, onDisk)
+	}
+}

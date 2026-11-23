@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -235,18 +236,21 @@ func TestASecondSearchWritesNothing(t *testing.T) {
 	}
 }
 
+// codedError is an error with an SQLite result code, as the driver's are.
+type codedError int
+
+func (e codedError) Error() string { return "sqlite error" }
+func (e codedError) Code() int     { return int(e) }
+
 func TestABusyDatabaseIsRetried(t *testing.T) {
-	// The retry is about timing, so this checks the predicate the store uses.
-	for _, message := range []string{
-		"database is locked (5) (SQLITE_BUSY)",
-		"SQLITE_BUSY: database is locked",
-		"database table is locked",
-	} {
-		if !isBusy(errors.New(message)) {
-			t.Errorf("isBusy(%q) = false", message)
+	// The retry is about timing, so this checks the predicate the store uses:
+	// the driver's code, never its wording.
+	for _, code := range []int{5, 6, 517 /* SQLITE_BUSY_SNAPSHOT */, 262 /* SQLITE_LOCKED_SHAREDCACHE */} {
+		if !isBusy(fmt.Errorf("wrapped: %w", codedError(code))) {
+			t.Errorf("isBusy(code %d) = false", code)
 		}
 	}
-	if isBusy(nil) || isBusy(errors.New("no such table")) {
-		t.Error("isBusy must only match a lock")
+	if isBusy(nil) || isBusy(codedError(1)) || isBusy(errors.New("database is locked")) {
+		t.Error("isBusy must only match a lock the driver reported")
 	}
 }

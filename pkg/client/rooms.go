@@ -136,7 +136,7 @@ func (c *Client) CreateRoom(ctx context.Context, name, controls string) (*RoomCl
 		return nil, err
 	}
 	if out.MemberID != "" {
-		c.memberID = out.MemberID
+		c.SetMemberID(out.MemberID)
 	}
 	return &RoomClient{client: c, RoomID: out.Room.ID, MemberID: out.MemberID}, nil
 }
@@ -148,7 +148,7 @@ func (c *Client) JoinRoom(ctx context.Context, roomID string) (*RoomClient, erro
 		return nil, err
 	}
 	if out.MemberID != "" {
-		c.memberID = out.MemberID
+		c.SetMemberID(out.MemberID)
 	}
 	return &RoomClient{client: c, RoomID: out.Room.ID, MemberID: out.MemberID}, nil
 }

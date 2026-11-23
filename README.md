@@ -250,6 +250,9 @@ specification and the routes cannot drift apart.
   variant that is not on disk yet (`409`, naming the download to start) — it
   never starts work itself.
 * `POST /api/v1/library/import` — local files become first-class variants.
+  Against a daemon this needs an account and a path inside `media.importDirs`
+  (empty by default, so nothing on the server's disk is importable until the
+  owner names a directory); the CLI's own in-process server imports anything.
 * `GET/POST /api/v1/me/playlists...` — playlists, including positional edits.
 * `POST /api/v1/radio` — a station from a seed, mixed from the providers you name.
 * `GET /api/v1/albums/search`, `GET /api/v1/albums/{id}`,

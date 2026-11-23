@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -372,5 +373,47 @@ func TestConfiguredNeedsBothHalvesOfTheCredentials(t *testing.T) {
 	}
 	if !(&Provider{clientID: "id", clientSecret: "secret"}).configured() {
 		t.Fatal("both halves are configured")
+	}
+}
+
+// A playlist longer than one page arrives whole, and a pasted share link with a
+// tracking query is read as its id.
+func TestPlaylistReadsEveryPage(t *testing.T) {
+	fake := newFakeSpotify(t)
+	const total = 150
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if !strings.HasSuffix(r.URL.Path, "/tracks") {
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "abc", "name": "Long", "tracks": map[string]any{"total": total}})
+			return
+		}
+		offset := 0
+		fmt.Sscan(r.URL.Query().Get("offset"), &offset)
+		items := []any{}
+		for i := offset; i < total && i < offset+100; i++ {
+			items = append(items, map[string]any{"track": map[string]any{"id": fmt.Sprint("t", i), "name": fmt.Sprint("Song ", i)}})
+		}
+		next := ""
+		if offset+100 < total {
+			next = "more"
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": items, "next": next})
+	}))
+	defer server.Close()
+
+	p := fake.provider(t)
+	p.apiBase = server.URL
+	detail, err := p.Playlist(context.Background(), "https://open.spotify.com/playlist/abc?si=xyz")
+	if err != nil {
+		t.Fatalf("Playlist: %v", err)
+	}
+	if len(detail.Tracks) != total {
+		t.Fatalf("tracks = %d, want %d", len(detail.Tracks), total)
+	}
+	for _, path := range paths {
+		if path != "/playlists/abc" && path != "/playlists/abc/tracks" {
+			t.Errorf("asked for %q: the pasted link was not read as its id", path)
+		}
 	}
 }

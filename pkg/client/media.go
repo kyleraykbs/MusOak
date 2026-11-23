@@ -237,6 +237,14 @@ type localPlayback struct {
 	fetchTries  int
 }
 
+// inHand is the rendition a song has and how long it runs, read under the lock:
+// the fetch that brings the file writes them from its own goroutine.
+func (p *Participant) inHand(local *localPlayback) (CacheEntry, int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return local.entry, local.length()
+}
+
 // length is how long the song runs: the file's own length once it is here, and
 // the length the room reports while the rendition is still arriving.
 func (l *localPlayback) length() int64 {
@@ -574,7 +582,7 @@ func (p *Participant) load(ctx context.Context, current *RoomPlayback, expected 
 	p.mu.Unlock()
 
 	if local != nil && local.itemID == item.ID {
-		if local.entry.Path == "" {
+		if entry, _ := p.inHand(local); entry.Path == "" {
 			// The same song, still not here: the fetch that is bringing it
 			// plays it the moment it lands.
 			p.fetchForPlay(ctx, local)
@@ -741,15 +749,19 @@ func (p *Participant) measureLoad(took time.Duration) {
 // watched through to the sink playing so its cost is measured; an already-loaded
 // file has nothing to measure.
 func (p *Participant) play(ctx context.Context, local *localPlayback, item QueueItem, expected int64, issuedAt time.Time) {
-	if local == nil || local.entry.Path == "" {
+	if local == nil {
+		return
+	}
+	entry, length := p.inHand(local)
+	if entry.Path == "" {
 		return
 	}
 	if expected < 0 {
 		expected = 0
 	}
 	slot := SinkTrack{
-		TrackID: local.trackID, VariantID: local.entry.VariantID, Title: item.Title,
-		Path: local.entry.Path, DurationMs: local.length(), PositionMs: expected,
+		TrackID: local.trackID, VariantID: entry.VariantID, Title: item.Title,
+		Path: entry.Path, DurationMs: length, PositionMs: expected,
 	}
 	if p.OnTrack != nil {
 		p.OnTrack(slot)
@@ -884,7 +896,7 @@ func (p *Participant) correctDrift(ctx context.Context, local *localPlayback, cu
 			"from_ms", previous, "to_ms", expected)
 	}
 
-	if length := local.length(); length > 0 && expected >= length {
+	if _, length := p.inHand(local); length > 0 && expected >= length {
 		// This client's file is over; the room is still on it. Wait for the
 		// room to move, which is what "a song ends slightly early" means.
 		return

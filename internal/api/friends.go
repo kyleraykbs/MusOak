@@ -83,6 +83,12 @@ func (s *Server) buildPublicUser(ctx context.Context, viewerID uuid.UUID, u stor
 		out.Online = time.Since(u.LastPlayedAt) <= presenceWindow
 	}
 
+	// Where somebody is in a song is for their friends, the rule the playback
+	// endpoint itself keeps: the same document handed out here to anyone who
+	// can list accounts would make that rule mean nothing.
+	if rel != store.RelFriend && u.ID != viewerID {
+		return out, nil
+	}
 	state, updated, err := s.store.RecentPlayback(ctx, u.ID)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
@@ -280,8 +286,8 @@ func (s *Server) handleUserSearch(w http.ResponseWriter, r *http.Request) {
 // shows — their playlists, their favourites, the songs in their last
 // playback state, and everything they shared with the caller.
 //
-// Playlist privacy is not modelled anywhere in the schema, so every playlist
-// a user owns counts as public here.
+// Their playlists are the ones they made public; your own page shows all of
+// yours.
 func (s *Server) handleUserGet(w http.ResponseWriter, r *http.Request) {
 	viewer, ok := s.requireUser(w, r)
 	if !ok {
@@ -677,6 +683,12 @@ func (s *Server) handleShareCreate(w http.ResponseWriter, r *http.Request) {
 		share.TrackID = &trackID
 		kind = "share"
 	case req.RoomID != "":
+		// An invite is to a room that is there. Anything else is a string of
+		// the sender's choosing, of any length, delivered to somebody's bell.
+		if _, err := s.rooms.Get(req.RoomID); err != nil {
+			writeError(w, http.StatusNotFound, "room not found")
+			return
+		}
 		kind = "room-invite"
 	default:
 		writeError(w, http.StatusBadRequest, "share a track or a room")

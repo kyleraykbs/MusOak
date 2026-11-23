@@ -89,6 +89,11 @@ type MediaFile struct {
 	// AccessedAt is when the file was last served; eviction uses it as the
 	// least-recently-used key.
 	AccessedAt time.Time
+	// LoudnessLUFS is the file's integrated loudness (EBU R128), measured once;
+	// it is meaningful only when LoudnessKnown. A player levels songs from
+	// different providers with it, which otherwise jump in volume.
+	LoudnessLUFS  float64
+	LoudnessKnown bool
 }
 
 // User is a local account.
@@ -182,6 +187,10 @@ type SourceRepo interface {
 // MediaRepo maps variants to finished files on disk.
 type MediaRepo interface {
 	UpsertMediaFile(ctx context.Context, m *MediaFile) error
+	// SetMediaLoudness and MediaWithoutLoudness are the loudness each stored
+	// file is levelled with: written once measured, and the files still to do.
+	SetMediaLoudness(ctx context.Context, variantID uuid.UUID, lufs float64) error
+	MediaWithoutLoudness(ctx context.Context, limit int) ([]MediaFile, error)
 	MediaFile(ctx context.Context, variantID uuid.UUID) (*MediaFile, error)
 	MediaFileBySHA256(ctx context.Context, sha256 string) (*MediaFile, error)
 	DeleteMediaFile(ctx context.Context, variantID uuid.UUID) error
@@ -327,7 +336,12 @@ func Open(path string) (*DB, error) {
 	if strings.Contains(dsn, "?") {
 		sep = "&"
 	}
-	dsn += sep + "_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+	// _txlock=immediate begins every transaction holding the write lock. A
+	// deferred one that reads and then writes is refused outright under WAL
+	// (SQLITE_BUSY_SNAPSHOT) when another writer committed in between, and the
+	// busy timeout cannot wait that out; taken up front, the lock is what the
+	// timeout waits for.
+	dsn += sep + "_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_txlock=immediate"
 	if !memory {
 		// WAL commits still fsync unless synchronous is relaxed, and the library
 		// is rewritten constantly by matching, downloads and uploads; NORMAL
@@ -404,6 +418,31 @@ CREATE INDEX IF NOT EXISTS album_artists_artist_id ON album_artists(artist_id);
 CREATE INDEX IF NOT EXISTS variants_provider ON variants(provider);
 `
 
+// schemaV25 indexes the two tables retention reads per stored file. Its
+// subqueries ask for a track's listens and favourites, and neither table had an
+// index that leads with the track: every file was a scan of all history, and a
+// grown library's sweep ran out its minute without sweeping anything.
+const schemaV25 = `
+CREATE INDEX IF NOT EXISTS play_history_track ON play_history(track_id, started_at_ms);
+CREATE INDEX IF NOT EXISTS favorites_track ON favorites(track_id);
+`
+
+// addReleaseReadAt stamps a release with when its tracklist was last read. A
+// release's completeness used to be inferred from counts, and a count that was
+// never met - a listed track with nothing playable behind it, two entries that
+// are one song - left the album "incomplete" for ever: every view of it read
+// the provider again.
+func addReleaseReadAt(ctx context.Context, tx *sql.Tx) error {
+	return addColumnUnlessPresent(ctx, tx, "album_variants", "tracks_read_at", "INTEGER NOT NULL DEFAULT 0")
+}
+
+// addMediaLoudness is where each stored file's measured loudness is kept.
+// Unknown is NULL: a file stored before this, or one ffmpeg could not measure,
+// is measured later by the background pass, and played unlevelled until then.
+func addMediaLoudness(ctx context.Context, tx *sql.Tx) error {
+	return addColumnUnlessPresent(ctx, tx, "media_files", "loudness_lufs", "REAL")
+}
+
 type migration struct {
 	version int
 	name    string
@@ -458,6 +497,9 @@ var migrations = []migration{
 	{version: 22, name: "favorite ratings and decimal votes", sql: schemaV22},
 	{version: 23, name: "playlist order", sql: schemaV23},
 	{version: 24, name: "release kinds", apply: addReleaseKinds},
+	{version: 25, name: "retention indexes", sql: schemaV25},
+	{version: 26, name: "media loudness", apply: addMediaLoudness},
+	{version: 27, name: "release read stamps", apply: addReleaseReadAt},
 }
 
 // addReleaseKinds records what a release is. An artist's page mixes records with
@@ -645,10 +687,17 @@ func isBusy(err error) bool {
 	if err == nil {
 		return false
 	}
-	message := err.Error()
-	return strings.Contains(message, "database is locked") ||
-		strings.Contains(message, "SQLITE_BUSY") ||
-		strings.Contains(message, "database table is locked")
+	// The driver's own code, not its words: 5 is SQLITE_BUSY and 6
+	// SQLITE_LOCKED, and an extended code keeps the primary one in its low byte.
+	var coded interface{ Code() int }
+	if errors.As(err, &coded) {
+		switch coded.Code() & 0xff {
+		case 5, 6:
+			return true
+		}
+		return false
+	}
+	return false
 }
 
 // mapErr translates driver errors into the package's sentinels.
@@ -666,9 +715,6 @@ func mapErr(err error) error {
 		case 19, 1555, 2067, 787:
 			return fmt.Errorf("%w: %v", ErrConflict, err)
 		}
-	}
-	if strings.Contains(err.Error(), "constraint failed") {
-		return fmt.Errorf("%w: %v", ErrConflict, err)
 	}
 	return err
 }

@@ -177,6 +177,7 @@ func startEmbedded(cfg *config.Config, logger *slog.Logger) (*embeddedServer, er
 	if err != nil {
 		return nil, err
 	}
+	server.TrustLocalOwner()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		_ = server.Close()

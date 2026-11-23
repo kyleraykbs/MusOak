@@ -108,7 +108,7 @@ const maxNotifications = 100
 // publicUserColumns are the account columns anyone may see. The password hash
 // is deliberately not among them: these rows end up in other people's API
 // responses.
-const publicUserColumns = `id, username, display_name, icon_url, last_played_at, created_at`
+const publicUserColumns = `id, username, display_name, icon_url, icon_version, last_played_at, created_at`
 
 func scanPublicUser(row rowScanner) (*User, error) {
 	var (
@@ -117,7 +117,7 @@ func scanPublicUser(row rowScanner) (*User, error) {
 		created    int64
 		lastPlayed int64
 	)
-	if err := row.Scan(&id, &u.Username, &u.DisplayName, &u.IconURL, &lastPlayed, &created); err != nil {
+	if err := row.Scan(&id, &u.Username, &u.DisplayName, &u.IconURL, &u.IconVersion, &lastPlayed, &created); err != nil {
 		return nil, mapErr(err)
 	}
 	var err error
@@ -207,7 +207,7 @@ func (d *DB) RemoveFriend(ctx context.Context, userID, friendID uuid.UUID) error
 // Friends lists the accepted friends, most recently added first.
 func (d *DB) Friends(ctx context.Context, userID uuid.UUID) ([]User, error) {
 	rows, err := d.db.QueryContext(ctx, `
-		SELECT u.id, u.username, u.display_name, u.icon_url, u.last_played_at, u.created_at
+		SELECT u.id, u.username, u.display_name, u.icon_url, u.icon_version, u.last_played_at, u.created_at
 		FROM friendships f
 		JOIN users u ON u.id = CASE WHEN f.user_id = ? THEN f.friend_id ELSE f.user_id END
 		WHERE (f.user_id = ? OR f.friend_id = ?) AND f.state = ?
@@ -222,7 +222,7 @@ func (d *DB) Friends(ctx context.Context, userID uuid.UUID) ([]User, error) {
 // IncomingFriendRequests lists the people waiting for userID's answer.
 func (d *DB) IncomingFriendRequests(ctx context.Context, userID uuid.UUID) ([]User, error) {
 	rows, err := d.db.QueryContext(ctx, `
-		SELECT u.id, u.username, u.display_name, u.icon_url, u.last_played_at, u.created_at
+		SELECT u.id, u.username, u.display_name, u.icon_url, u.icon_version, u.last_played_at, u.created_at
 		FROM friendships f
 		JOIN users u ON u.id = f.user_id
 		WHERE f.friend_id = ? AND f.state = ?
@@ -250,7 +250,7 @@ func (d *DB) CountIncomingFriendRequests(ctx context.Context, userID uuid.UUID) 
 // OutgoingFriendRequests lists the requests userID is still waiting on.
 func (d *DB) OutgoingFriendRequests(ctx context.Context, userID uuid.UUID) ([]User, error) {
 	rows, err := d.db.QueryContext(ctx, `
-		SELECT u.id, u.username, u.display_name, u.icon_url, u.last_played_at, u.created_at
+		SELECT u.id, u.username, u.display_name, u.icon_url, u.icon_version, u.last_played_at, u.created_at
 		FROM friendships f
 		JOIN users u ON u.id = f.friend_id
 		WHERE f.user_id = ? AND f.state = ?

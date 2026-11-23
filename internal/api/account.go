@@ -1,13 +1,11 @@
 package api
 
 import (
-	"encoding/base64"
 	"errors"
 	"net/http"
 	"regexp"
 	"strings"
 
-	"github.com/kyleraykbs/MusOak/internal/artwork"
 	"github.com/kyleraykbs/MusOak/internal/auth"
 	"github.com/kyleraykbs/MusOak/internal/store"
 )
@@ -65,6 +63,10 @@ type usernameChangeRequest struct {
 	Username string `json:"username"`
 }
 
+// maxDisplayNameBytes is the longest display name an account may take: twice a
+// username, which is room for a full name in any script.
+const maxDisplayNameBytes = 64
+
 // usernameLike mirrors the username policy registration enforces (internal/auth
 // keeps its own copy unexported). A rename must not admit a name that signing
 // up would reject.
@@ -80,7 +82,7 @@ func (s *Server) handleMePatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req profilePatchRequest
-	if !decodeImageJSON(w, r, &req) {
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	// Validate everything before writing, so a bad name changes nothing.
@@ -98,6 +100,11 @@ func (s *Server) handleMePatch(w http.ResponseWriter, r *http.Request) {
 			}
 			platforms = append(platforms, name)
 		}
+	}
+	if req.DisplayName != nil && len(strings.TrimSpace(*req.DisplayName)) > maxDisplayNameBytes {
+		// A display name rides every room event and every list of people.
+		writeError(w, http.StatusBadRequest, "that display name is too long")
+		return
 	}
 	if req.DisplayName != nil {
 		displayName := strings.TrimSpace(*req.DisplayName)
@@ -134,23 +141,8 @@ func (s *Server) handleMeIcon(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	contentType := artwork.ContentType(req.ContentType)
-	extension, known := artwork.ExtensionFor(contentType)
-	if !known {
-		writeError(w, http.StatusBadRequest, "an image is needed: png, jpeg, webp, gif or avif")
-		return
-	}
-	data, err := base64.StdEncoding.DecodeString(req.Data)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "data must be base64")
-		return
-	}
-	if len(data) == 0 {
-		writeError(w, http.StatusBadRequest, "the image is empty")
-		return
-	}
-	if len(data) > maxArtworkBytes {
-		writeError(w, http.StatusRequestEntityTooLarge, "the image is too large")
+	data, extension, ok := decodeImage(w, req.ContentType, req.Data, "data")
+	if !ok {
 		return
 	}
 
@@ -180,7 +172,7 @@ func (s *Server) handleMePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req passwordChangeRequest
-	if !decodeImageJSON(w, r, &req) {
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.NewPassword == "" {
@@ -221,7 +213,7 @@ func (s *Server) handleMeUsername(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req usernameChangeRequest
-	if !decodeImageJSON(w, r, &req) {
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	match, err := auth.VerifyPassword(req.Password, user.PasswordHash)

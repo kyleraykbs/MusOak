@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -27,7 +28,10 @@ const DefaultTimeout = 30 * time.Second
 // Client talks to one MusOak server.
 type Client struct {
 	baseURL string
-	token   string
+	// idMu guards token and memberID: a login, a room join or a reconnect
+	// writes them while other goroutines are sending requests with them.
+	idMu  sync.RWMutex
+	token string
 	// memberID identifies a guest in rooms; authenticated clients use their
 	// account instead.
 	memberID string
@@ -88,16 +92,32 @@ func (c *Client) MediaURL(variantID string, startMs int64) string {
 }
 
 // Token returns the current bearer token, empty for a guest.
-func (c *Client) Token() string { return c.token }
+func (c *Client) Token() string {
+	c.idMu.RLock()
+	defer c.idMu.RUnlock()
+	return c.token
+}
 
 // MemberID returns the guest member id, empty when none is set.
-func (c *Client) MemberID() string { return c.memberID }
+func (c *Client) MemberID() string {
+	c.idMu.RLock()
+	defer c.idMu.RUnlock()
+	return c.memberID
+}
 
 // SetToken replaces the bearer token (after login or logout).
-func (c *Client) SetToken(token string) { c.token = token }
+func (c *Client) SetToken(token string) {
+	c.idMu.Lock()
+	c.token = token
+	c.idMu.Unlock()
+}
 
 // SetMemberID replaces the guest room member id.
-func (c *Client) SetMemberID(memberID string) { c.memberID = memberID }
+func (c *Client) SetMemberID(memberID string) {
+	c.idMu.Lock()
+	c.memberID = memberID
+	c.idMu.Unlock()
+}
 
 // APIError is a non-2xx response.
 type APIError struct {
@@ -187,6 +207,14 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	return lastErr
 }
 
+// longCall marks a request context whose answer may take longer than
+// DefaultTimeout; see long.
+type longCall struct{}
+
+// long is ctx for a call that waits on the server's work rather than asking it
+// something: it runs for as long as ctx allows, not for DefaultTimeout.
+func long(ctx context.Context) context.Context { return context.WithValue(ctx, longCall{}, true) }
+
 // attempt is one try of do's request.
 func (c *Client) attempt(ctx context.Context, method, path string, raw []byte, hasBody bool, out any) error {
 	var reader io.Reader
@@ -203,7 +231,17 @@ func (c *Client) attempt(ctx context.Context, method, path string, raw []byte, h
 	}
 	c.decorate(req)
 
-	resp, err := c.http.Do(req)
+	hc := c.http
+	if ctx.Value(longCall{}) != nil && hc.Timeout != 0 {
+		// A call whose work is the wait - a download, an import, a station - is
+		// bounded by its context alone. The client's own timeout is for the
+		// ordinary request, and a fetch the server is still finishing at
+		// thirty-one seconds is not a failure.
+		unbounded := *hc
+		unbounded.Timeout = 0
+		hc = &unbounded
+	}
+	resp, err := hc.Do(req)
 	if err != nil {
 		return err
 	}
@@ -254,11 +292,11 @@ func sleepBackoff(ctx context.Context, attempt int) error {
 }
 
 func (c *Client) decorate(req *http.Request) {
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+	if token := c.Token(); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	if c.memberID != "" {
-		req.Header.Set("X-Member-Id", c.memberID)
+	if memberID := c.MemberID(); memberID != "" {
+		req.Header.Set("X-Member-Id", memberID)
 	}
 }
 
@@ -483,7 +521,7 @@ func (c *Client) ResolveTrack(ctx context.Context, trackID string) ([]Variant, b
 // ImportPath adds one local file to the library.
 func (c *Client) ImportPath(ctx context.Context, path string) (*ImportResult, error) {
 	var out ImportResult
-	if err := c.do(ctx, http.MethodPost, "/api/v1/library/import", map[string]string{"path": path}, &out); err != nil {
+	if err := c.do(long(ctx), http.MethodPost, "/api/v1/library/import", map[string]string{"path": path}, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -492,7 +530,7 @@ func (c *Client) ImportPath(ctx context.Context, path string) (*ImportResult, er
 // ImportDir adds every audio file under a directory to the library.
 func (c *Client) ImportDir(ctx context.Context, dir string) (*ImportResult, error) {
 	var out ImportResult
-	if err := c.do(ctx, http.MethodPost, "/api/v1/library/import", map[string]string{"dir": dir}, &out); err != nil {
+	if err := c.do(long(ctx), http.MethodPost, "/api/v1/library/import", map[string]string{"dir": dir}, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -522,7 +560,7 @@ func (c *Client) StartDownload(ctx context.Context, variantID string) (*MediaSta
 func (c *Client) StartDownloadAndWait(ctx context.Context, variantID string) (*MediaStatus, error) {
 	var out MediaStatus
 	path := "/api/v1/media/" + variantID + "/download?wait=1"
-	if err := c.do(ctx, http.MethodPost, path, nil, &out); err != nil {
+	if err := c.do(long(ctx), http.MethodPost, path, nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -588,7 +626,7 @@ func (c *Client) Register(ctx context.Context, username, password string) (*Auth
 	if err := c.do(ctx, http.MethodPost, "/api/v1/auth/register", body, &out); err != nil {
 		return nil, err
 	}
-	c.token = out.Token
+	c.SetToken(out.Token)
 	return &out, nil
 }
 
@@ -599,7 +637,7 @@ func (c *Client) Login(ctx context.Context, username, password string) (*Auth, e
 	if err := c.do(ctx, http.MethodPost, "/api/v1/auth/login", body, &out); err != nil {
 		return nil, err
 	}
-	c.token = out.Token
+	c.SetToken(out.Token)
 	return &out, nil
 }
 
@@ -608,7 +646,7 @@ func (c *Client) Logout(ctx context.Context) error {
 	if err := c.do(ctx, http.MethodPost, "/api/v1/auth/logout", nil, nil); err != nil {
 		return err
 	}
-	c.token = ""
+	c.SetToken("")
 	return nil
 }
 

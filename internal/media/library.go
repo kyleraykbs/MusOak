@@ -71,6 +71,17 @@ func (m *Manager) Import(ctx context.Context, path string) (*store.Variant, erro
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return nil, err
 	}
+	// That lookup only ever finds a file that was already Opus when it came in:
+	// what is stored is the conversion, and its hash is not the source's. The
+	// source's own hash is what the variant is named for, so that is where a
+	// second import of the same mp3 is recognised - before the minute of
+	// ffmpeg, and before a track row is made for a song that is already here.
+	sourceID := "sha256:" + sum
+	if existing, err := m.db.VariantByProviderTrack(ctx, store.LocalProvider, sourceID); err == nil {
+		return existing, nil
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return nil, err
+	}
 
 	// Duration comes from the stored file, not the source: one probe, and it
 	// describes exactly what is served.
@@ -121,7 +132,7 @@ func (m *Manager) Import(ctx context.Context, path string) (*store.Variant, erro
 		ID:              variantID,
 		TrackID:         track.ID,
 		Provider:        store.LocalProvider,
-		ProviderTrackID: "sha256:" + sum,
+		ProviderTrackID: sourceID,
 		Title:           meta.Title,
 		Artists:         meta.Artists,
 		Album:           meta.Album,
@@ -130,6 +141,10 @@ func (m *Manager) Import(ctx context.Context, path string) (*store.Variant, erro
 	}
 	if err := m.db.CreateVariant(ctx, variant); err != nil {
 		_ = os.Remove(tmp)
+		// The track made a moment ago has no rendition and never will: left
+		// behind it is a row with a title and a length that a later search hit
+		// can be matched onto instead of the real song.
+		_ = m.db.DeleteTrack(ctx, track.ID)
 		if errors.Is(err, store.ErrConflict) {
 			if existing, lookupErr := m.db.VariantByProviderTrack(ctx, store.LocalProvider, variant.ProviderTrackID); lookupErr == nil {
 				return existing, nil
@@ -151,6 +166,7 @@ func (m *Manager) Import(ctx context.Context, path string) (*store.Variant, erro
 		DurationMs: stored.DurationMs,
 		Bytes:      stored.Bytes,
 	}
+	m.measure(ctx, file)
 	if err := m.db.UpsertMediaFile(ctx, file); err != nil {
 		return nil, err
 	}

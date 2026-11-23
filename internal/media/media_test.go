@@ -738,3 +738,33 @@ func TestUploadWithNoFileBlamesTheFileNotAProvider(t *testing.T) {
 		t.Error("a failed status carries no reason to show")
 	}
 }
+
+// What is stored is the conversion, so its hash is not the source's: a second
+// import of the same mp3 has to be recognised by the source's own hash. It used
+// to be converted all over again, and to leave a track with no rendition behind
+// each time - a row a later search hit could be matched onto.
+func TestReimportingAConvertedFileMakesNothingNew(t *testing.T) {
+	dir := t.TempDir()
+	source, _ := mp3WithCover(t, dir)
+	m, db := newTestManager(t, nil)
+	ctx := context.Background()
+
+	first, err := m.Import(ctx, source)
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	again, err := m.Import(ctx, source)
+	if err != nil {
+		t.Fatalf("second Import: %v", err)
+	}
+	if again.ID != first.ID {
+		t.Errorf("re-import made a new variant: %s vs %s", again.ID, first.ID)
+	}
+	tracks, err := db.CandidateTracks(ctx, first.DurationMs, 60_000, 50)
+	if err != nil {
+		t.Fatalf("CandidateTracks: %v", err)
+	}
+	if len(tracks) != 1 {
+		t.Errorf("tracks after a re-import = %d, want the one song", len(tracks))
+	}
+}

@@ -120,6 +120,14 @@ func (d *DB) UpsertExternalPlaylist(
 		playlist.ID.String(), playlist.Provider, playlist.ProviderPlaylistID,
 		playlist.Title, playlist.Owner, playlist.Description, playlist.TrackCount,
 		playlist.ArtworkURL, playlist.CreatedAt.UnixMilli()); err != nil {
+		// Two searches that found the same new playlist at once: the other one
+		// inserted it between the read above and this write. Its row is the
+		// answer to this call too, not a conflict to fail the search with.
+		if errors.Is(mapErr(err), ErrConflict) {
+			if existing, readErr := d.externalPlaylistByProviderID(ctx, playlist.Provider, playlist.ProviderPlaylistID); readErr == nil {
+				return existing, false, nil
+			}
+		}
 		return nil, false, mapErr(err)
 	}
 	return playlist, true, nil

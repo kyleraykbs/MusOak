@@ -193,3 +193,27 @@ func TestPlaylistCascadesAndOwnership(t *testing.T) {
 		t.Errorf("append to a missing playlist: err = %v", err)
 	}
 }
+
+// A playlist made private is private from its first moment: the column's
+// default is public, so an insert that leaves it out publishes the list.
+func TestCreatePlaylistKeepsItPrivateWhenAsked(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	user := mustUserNamed(t, db, "kyle")
+
+	private := &Playlist{UserID: user.ID, Name: "mine", Public: false}
+	shown := &Playlist{UserID: user.ID, Name: "everyone's", Public: true}
+	for _, playlist := range []*Playlist{private, shown} {
+		if err := db.CreatePlaylist(ctx, playlist); err != nil {
+			t.Fatalf("CreatePlaylist: %v", err)
+		}
+	}
+
+	public, err := db.PublicPlaylistsForUser(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("PublicPlaylistsForUser: %v", err)
+	}
+	if len(public) != 1 || public[0].ID != shown.ID {
+		t.Fatalf("public playlists = %+v, want only the one made public", public)
+	}
+}

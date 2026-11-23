@@ -86,7 +86,9 @@ func newFixture(t *testing.T) *fixture {
 	t.Cleanup(func() { _ = db.Close() })
 
 	dir := filepath.Join(t.TempDir(), "artwork")
-	return &fixture{fetcher: New(dir, db, slog.New(slog.DiscardHandler)), db: db, dir: dir}
+	fetcher := New(dir, db, slog.New(slog.DiscardHandler))
+	fetcher.AllowPrivateHosts() // the image server is on 127.0.0.1
+	return &fixture{fetcher: fetcher, db: db, dir: dir}
 }
 
 func (f *fixture) trackWithArtwork(t *testing.T, url string) uuid.UUID {
@@ -396,5 +398,15 @@ func TestFetchRemembersARefusal(t *testing.T) {
 	}
 	if item.Bytes != int64(len(pngBytes)) {
 		t.Errorf("bytes = %d, want %d", item.Bytes, len(pngBytes))
+	}
+}
+
+// Out of tests a cover is never fetched from this machine or its network: the
+// address can come from a client, and the server must not be a way in.
+func TestCoversFromPrivateAddressesAreRefused(t *testing.T) {
+	image := newImageServer(t)
+	fetcher := New(t.TempDir(), nil, slog.New(slog.DiscardHandler))
+	if _, err := fetcher.http.Get(image.server.URL); err == nil || !strings.Contains(err.Error(), "not a public address") {
+		t.Fatalf("a cover on 127.0.0.1 was fetched: %v", err)
 	}
 }

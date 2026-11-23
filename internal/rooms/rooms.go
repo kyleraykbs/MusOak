@@ -2,6 +2,7 @@ package rooms
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"log/slog"
 	"math"
@@ -575,6 +576,36 @@ func (m *Manager) List() []Snapshot {
 	return out
 }
 
+// OpenTo reports whether memberID may see everything in a room: anybody, for a
+// room without a password; its members only, for a room with one. A room that
+// is no longer there has nothing left to hide, so the event that says it closed
+// still reaches the sockets that were following it.
+func (m *Manager) OpenTo(roomID, memberID string) bool {
+	m.mu.Lock()
+	defer m.unlock()
+	room, ok := m.rooms[roomID]
+	if !ok {
+		return true
+	}
+	if room.password == "" {
+		return true
+	}
+	_, member := room.members[memberID]
+	return memberID != "" && member
+}
+
+// Redacted is what somebody outside a password room may know of it: that it
+// is there, what it is called and how many are in it - enough to find it and
+// knock - and none of who they are or what they are playing.
+func (s Snapshot) Redacted() Snapshot {
+	return Snapshot{
+		ID: s.ID, Name: s.Name, Controls: s.Controls, CreatedAtMs: s.CreatedAtMs,
+		MemberCount: s.MemberCount, HasPassword: s.HasPassword,
+		ServerNowMs: s.ServerNowMs, Seq: s.Seq, Skip: s.Skip,
+		Members: []Member{}, Queues: map[string][]QueueItem{}, MasterQueue: []QueueItem{},
+	}
+}
+
 // Get returns one room's state.
 func (m *Manager) Get(roomID string) (*Snapshot, error) {
 	m.mu.Lock()
@@ -667,7 +698,7 @@ func (m *Manager) Join(roomID string, member Member, password, supersedes string
 	if err != nil {
 		return nil, err
 	}
-	if room.password != "" && room.password != password {
+	if room.password != "" && subtle.ConstantTimeCompare([]byte(room.password), []byte(password)) != 1 {
 		return nil, ErrWrongPassword
 	}
 	_, known := room.members[member.ID]
@@ -676,9 +707,37 @@ func (m *Manager) Join(roomID string, member Member, password, supersedes string
 		room.queues[member.ID] = []QueueItem{}
 	}
 	if supersedes != "" && supersedes != member.ID {
-		if _, wasThere := room.members[supersedes]; wasThere {
+		// Only a guest is replaced: a browser that signed in takes over the
+		// guest it was. An account is never somebody else's earlier self.
+		if previous, wasThere := room.members[supersedes]; wasThere && previous.UserID == nil {
 			if len(room.queues[member.ID]) == 0 {
-				room.queues[member.ID] = append([]QueueItem(nil), room.queues[supersedes]...)
+				// Every item says whose queue it is in, and that is how a
+				// played song is found again to be dropped: an item carried
+				// across under the old id is never found, stays in the queue,
+				// and plays again the next time the order is rebuilt.
+				adopted := append([]QueueItem(nil), room.queues[supersedes]...)
+				for i := range adopted {
+					adopted[i].AddedBy = member.ID
+				}
+				room.queues[member.ID] = adopted
+				if room.current != nil && room.current.item.AddedBy == supersedes {
+					room.current.item.AddedBy = member.ID
+				}
+			}
+			// The same person's turn and vote, under the id they have now.
+			if at, had := room.lastPlayedAtMs[supersedes]; had {
+				if at > room.lastPlayedAtMs[member.ID] {
+					room.lastPlayedAtMs[member.ID] = at
+				}
+				delete(room.lastPlayedAtMs, supersedes)
+			}
+			if room.current != nil {
+				if score, voted := room.current.votes[supersedes]; voted {
+					if _, already := room.current.votes[member.ID]; !already {
+						room.current.votes[member.ID] = score
+					}
+					delete(room.current.votes, supersedes)
+				}
 			}
 			// The member being replaced is the same person: if they were leading
 			// the room, the id taking their place leads it now.

@@ -889,6 +889,40 @@ func TestSupersedesJoinTakesOverTheMembership(t *testing.T) {
 	}
 }
 
+// A guest who signs in mid-song keeps their queue, and a song of theirs that has
+// played is gone from it: carried across under the old member id, it was never
+// found again and came back round.
+func TestASupersededQueueStillDrainsAsItPlays(t *testing.T) {
+	f := newFixture(t, nil)
+	guestMember := guest("browser-1")
+	room := f.create("party", ControlsEveryone, "", guestMember)
+	f.attach(guestMember.ID)
+	first := f.track("first", 100_000)
+	second := f.track("second", 100_000)
+	f.enqueue(room.ID, guestMember.ID, first.ID)
+	f.enqueue(room.ID, guestMember.ID, second.ID)
+	f.tick()
+
+	id := uuid.New()
+	account := Member{ID: id.String(), UserID: &id, Name: "someone"}
+	if _, err := f.m.Join(room.ID, account, "", guestMember.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.attach(account.ID)
+
+	// The first song runs out and the room moves to the second.
+	f.advance(101 * time.Second)
+	snap := f.get(room.ID)
+	if snap.Current == nil || snap.Current.Item.TrackID != second.ID {
+		t.Fatalf("after the first song the room is on %+v, want the second", snap.Current)
+	}
+	for _, item := range snap.Queues[account.ID] {
+		if item.TrackID == first.ID {
+			t.Fatalf("the song that played is still queued: %+v", snap.Queues[account.ID])
+		}
+	}
+}
+
 func TestSeqCountsEveryEvent(t *testing.T) {
 	f := newFixture(t, nil)
 	host := guest("host-1")
@@ -1155,5 +1189,50 @@ func TestEnqueueDoesNotBlockOtherRoomsOnTheStore(t *testing.T) {
 	close(blocked.release)
 	if err := <-done; err != nil {
 		t.Fatalf("enqueue: %v", err)
+	}
+}
+
+// A room without a password is open to anybody; one with a password only to its
+// members; one that has closed has nothing left to hide.
+func TestOpenToFollowsThePasswordAndTheMembership(t *testing.T) {
+	f := newFixture(t, nil)
+	open := f.create("open", ControlsEveryone, "", guest("host-a"))
+	locked := f.create("locked", ControlsEveryone, "sesame", guest("host-b"))
+
+	if !f.m.OpenTo(open.ID, "") || !f.m.OpenTo(open.ID, "stranger") {
+		t.Error("a room without a password is not open to everybody")
+	}
+	if f.m.OpenTo(locked.ID, "") || f.m.OpenTo(locked.ID, "stranger") {
+		t.Error("a password room is open to somebody it did not let in")
+	}
+	if !f.m.OpenTo(locked.ID, "host-b") {
+		t.Error("a password room is closed to its own host")
+	}
+	if _, err := f.m.Join(locked.ID, guest("friend"), "sesame", ""); err != nil {
+		t.Fatal(err)
+	}
+	if !f.m.OpenTo(locked.ID, "friend") {
+		t.Error("a member who gave the password is still kept out")
+	}
+	if !f.m.OpenTo("no-such-room", "") {
+		t.Error("a room that is gone hides its closing from the sockets that followed it")
+	}
+}
+
+// What an outsider sees of a password room: enough to find it and knock.
+func TestARedactedSnapshotKeepsOnlyWhatFindsTheRoom(t *testing.T) {
+	f := newFixture(t, nil)
+	room := f.create("locked", ControlsHost, "sesame", guest("host"))
+	f.enqueue(room.ID, "host", f.track("song", 60_000).ID)
+	full := f.get(room.ID)
+	redacted := full.Redacted()
+	if redacted.ID != full.ID || redacted.Name != "locked" || redacted.MemberCount != 1 || !redacted.HasPassword {
+		t.Errorf("redacted = %+v, lost what finds the room", redacted)
+	}
+	if redacted.Host != "" || len(redacted.Members) != 0 || len(redacted.Queues) != 0 || len(redacted.MasterQueue) != 0 || redacted.Current != nil {
+		t.Errorf("redacted = %+v, still says who is in it or what it plays", redacted)
+	}
+	if redacted.Members == nil || redacted.Queues == nil || redacted.MasterQueue == nil {
+		t.Error("redacted lists must be empty, not null: clients read them as lists")
 	}
 }

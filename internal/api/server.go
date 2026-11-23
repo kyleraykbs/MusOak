@@ -77,7 +77,18 @@ type Server struct {
 
 	// prefetcher keeps the playlists downloaded; nil when it is turned off.
 	prefetcher *prefetch.Prefetcher
+
+	// localOwner says this server has one client and it is the person running
+	// it: the CLI's in-process server. See TrustLocalOwner.
+	localOwner bool
 }
+
+// TrustLocalOwner marks this server as the CLI's own, in-process one: bound to
+// loopback for the life of one command, with the person at the keyboard as its
+// only client. What a network daemon keeps for signed-in users inside
+// configured directories - reading files off this disk into the library - that
+// person may simply do: they could read the same files with any other program.
+func (s *Server) TrustLocalOwner() { s.localOwner = true }
 
 // New builds the server: it opens the store and instantiates the enabled
 // providers and the media pipeline.
@@ -321,7 +332,13 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), ShutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("shutdown: %w", err)
+		// Something was still open when the wait ran out - a song being sent, a
+		// long poll, an event stream, none of which end by themselves. Closing
+		// them is the shutdown that was asked for, not a failure of it: an
+		// error here exits non-zero and skips the store's own close, and a
+		// routine restart with a listener connected is recorded as a crash.
+		s.logger.Info("closing the connections still open", "reason", err)
+		_ = srv.Close()
 	}
 	s.logger.Info("stopped")
 	return nil

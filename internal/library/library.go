@@ -79,6 +79,11 @@ type Service struct {
 	// artist, and the last one kept while it is still fresh.
 	catalogueMu sync.Mutex
 	catalogues  map[uuid.UUID]*catalogue
+
+	// releaseMisses is when an album was last looked for on the providers and
+	// not found, by album. An album with no release to read is asked about
+	// again only once releaseRetry has passed, not on every view of its page.
+	releaseMisses sync.Map
 }
 
 // New returns the service.
@@ -362,7 +367,7 @@ func (s *Service) ImportPlaylist(
 	if title == "" {
 		title = "Imported playlist"
 	}
-	playlist := &store.Playlist{UserID: userID, Name: title}
+	playlist := &store.Playlist{UserID: userID, Name: title, Public: true}
 	if err := s.db.CreatePlaylist(ctx, playlist); err != nil {
 		return nil, err
 	}
@@ -541,6 +546,11 @@ func (s *Service) SyncAlbum(ctx context.Context, albumID uuid.UUID, providers []
 		// The release's size is what tells a client whether this album is
 		// complete, and the tracklist is the only place to learn it.
 		if err := s.db.SetAlbumVariantTrackCount(ctx, variant.ID, len(detail.Tracks)); err != nil {
+			return nil, err
+		}
+		// Read whole: what this release has is what is coming, whatever count
+		// anybody listed for it. See releaseComplete.
+		if err := s.db.MarkAlbumVariantRead(ctx, variant.ID, time.Now()); err != nil {
 			return nil, err
 		}
 

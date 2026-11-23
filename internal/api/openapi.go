@@ -156,7 +156,8 @@ func (s *Server) routes() {
 }
 
 // publicPaths are the endpoints reachable without a token when requireLogin is
-// set. They are derived from the OpenAPI document's own list.
+// set, whatever the method. The list is kept by hand; isPublic narrows the
+// room and media prefixes by method.
 var publicPaths = map[string]bool{
 	"/healthz":              true,
 	"/api/v1/auth/register": true,
@@ -174,25 +175,26 @@ var publicPaths = map[string]bool{
 	"/api/v1/ws": true,
 }
 
-// A room is joined by anybody who has the link - that is what a room is for -
-// and hearing what it is playing needs the audio, so the media path is open
-// with it. Search is also read-only discovery: guests may search before deciding
-// whether this server is worth signing in to. Personal library data and writes
-// still require an account.
-var publicPrefixes = []string{
-	"/api/v1/rooms",
-	"/api/v1/media/",
-}
-
-// isPublic reports whether a guest may reach this path.
-func isPublic(path string) bool {
+// isPublic reports whether a guest may make this request when requireLogin is
+// set.
+//
+// A room guest needs to read rooms, join one, and act in it, and to hear the
+// room: the files, their status, and asking for a file to be fetched - at play
+// priority too, and letting it go, since a play and a cancel now reach only the
+// requester's own downloads (EnsurePrimaryFor, CancelFor). What is left for
+// accounts is making rooms.
+func isPublic(r *http.Request) bool {
+	path := r.URL.Path
 	if publicPaths[path] {
 		return true
 	}
-	for _, prefix := range publicPrefixes {
-		if strings.HasPrefix(path, prefix) {
-			return true
-		}
+	switch {
+	case path == "/api/v1/rooms":
+		return r.Method == http.MethodGet
+	case strings.HasPrefix(path, "/api/v1/rooms/"):
+		return true
+	case strings.HasPrefix(path, "/api/v1/media/"):
+		return true
 	}
 	return false
 }

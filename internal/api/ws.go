@@ -85,6 +85,13 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		if member, ok := s.callerMember(r, false); ok {
 			identity = member.ID
 		}
+	} else if s.namesAccount(r, identity) {
+		// A socket counts as an account's presence only when it is that
+		// account's: anybody else naming it could close the socket and take the
+		// member out of every room through the leave grace.
+		if user := s.currentUser(r); user == nil || user.ID.String() != identity {
+			identity = ""
+		}
 	}
 	if identity != "" {
 		s.rooms.Connect(identity)
@@ -113,15 +120,18 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			if writeCtx, err := s.writeSocket(ctx, conn, pong); err != nil {
-				if writeCtx.Err() == nil {
-					return
-				}
-				// The client is behind rather than gone: another ping will do.
+			if err := s.writeSocket(ctx, conn, pong); err != nil {
+				return
 			}
 		case event, ok := <-events:
 			if !ok {
 				return
+			}
+			// A password room's events are for its members: a socket that is
+			// nobody, or somebody it did not let in, is not told who is in it
+			// or what it is playing.
+			if !s.rooms.OpenTo(event.RoomID, identity) {
+				continue
 			}
 			message := serverMessage{
 				Type:   string(event.Type),
@@ -130,17 +140,12 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 				AtMs:   event.AtMs,
 				Data:   event.Data,
 			}
-			if writeCtx, err := s.writeSocket(ctx, conn, message); err != nil {
-				if writeCtx.Err() == nil {
-					return
-				}
-				// Too slow to take this event: it is skipped rather than costing
-				// the connection. The counter in the next event shows the gap,
-				// and a client that sees a gap refetches the room - which is
-				// better than a member appearing to leave and come back, taking
-				// their queue with them.
-				s.logger.Debug("ws: event skipped, the client is behind",
-					"room", event.RoomID, "seq", event.Seq)
+			if err := s.writeSocket(ctx, conn, message); err != nil {
+				// The library closes a connection whose write ran out of time,
+				// so there is no skipping one event and carrying on: the socket
+				// is gone either way, and the client's reconnect refetches the
+				// room.
+				return
 			}
 		}
 	}
@@ -197,20 +202,15 @@ func (s *Server) readSocket(ctx context.Context, conn *websocket.Conn, pongs cha
 	}
 }
 
-// writeSocket writes one message and says what went wrong.
-//
-// A write that runs out of time is a client that is not taking its messages
-// fast enough, not one that has gone - the difference matters because the
-// caller closes the socket on an error, and closing it here is what made a slow
-// moment look like a disconnect. The client sees the gap in the event counter
-// and refetches the room. The context is handed back so the caller can tell
-// which of the two it was.
-func (s *Server) writeSocket(ctx context.Context, conn *websocket.Conn, message serverMessage) (context.Context, error) {
+// writeSocket writes one message, bounded by wsWriteTimeout. A write that runs
+// out of time has closed the connection (coder/websocket closes it rather than
+// leave a frame half sent), so any error here is the end of this socket.
+func (s *Server) writeSocket(ctx context.Context, conn *websocket.Conn, message serverMessage) error {
 	writeCtx, cancel := context.WithTimeout(ctx, wsWriteTimeout)
 	defer cancel()
 	if err := wsjson.Write(writeCtx, conn, message); err != nil {
 		s.logger.Debug("ws: write failed", "error", err)
-		return writeCtx, err
+		return err
 	}
-	return writeCtx, nil
+	return nil
 }

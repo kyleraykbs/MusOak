@@ -56,6 +56,24 @@ func (d *DB) MergeTracks(ctx context.Context, keep, drop uuid.UUID) error {
 			}
 		}
 
+		// Listens and words name a track without a foreign key, so nothing
+		// carries or clears them when the row goes. Left behind, the listens
+		// drop out of history and out of what retention counts for the kept
+		// track - a well-played song reads as one nobody has heard.
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE play_history SET track_id = ? WHERE track_id = ?`,
+			keep.String(), drop.String()); err != nil {
+			return mapErr(err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE OR IGNORE lyrics SET track_id = ? WHERE track_id = ?`,
+			keep.String(), drop.String()); err != nil {
+			return mapErr(err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM lyrics WHERE track_id = ?`, drop.String()); err != nil {
+			return mapErr(err)
+		}
+
 		if _, err := tx.ExecContext(ctx, `DELETE FROM tracks WHERE id = ?`, drop.String()); err != nil {
 			return mapErr(err)
 		}

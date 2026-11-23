@@ -236,15 +236,30 @@ func TestShareCreatesExactlyOneNotification(t *testing.T) {
 		}
 	}
 
+	// An invite is to a room that exists: anything else is the sender's own
+	// string in somebody's bell.
+	if rec := c.do(http.MethodPost, "/api/v1/me/shares", kyle, map[string]string{
+		"userId": samID.String(), "roomId": "no-such-room",
+	}); rec.Code != http.StatusNotFound {
+		t.Fatalf("invite to a room that is not there = %d, want 404: %s", rec.Code, rec.Body.String())
+	}
+
 	// A room invite is its own single entry.
+	rec = c.do(http.MethodPost, "/api/v1/rooms", kyle, map[string]string{"name": "party"})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("room = %d: %s", rec.Code, rec.Body.String())
+	}
+	var party roomResponse
+	c.decode(rec, &party)
+	roomID := party.Room.ID
 	rec = c.do(http.MethodPost, "/api/v1/me/shares", kyle, map[string]string{
-		"userId": samID.String(), "roomId": "room-1",
+		"userId": samID.String(), "roomId": roomID,
 	})
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("invite = %d: %s", rec.Code, rec.Body.String())
 	}
 	c.decode(rec, &created)
-	if created.Share.RoomID == nil || *created.Share.RoomID != "room-1" || created.Share.TrackID != nil {
+	if created.Share.RoomID == nil || *created.Share.RoomID != roomID || created.Share.TrackID != nil {
 		t.Errorf("invite = %+v", created.Share)
 	}
 
@@ -391,6 +406,15 @@ func TestPlaybackVisibleToFriendsOnly(t *testing.T) {
 	}
 	if rec := c.do(http.MethodGet, playbackPath, "", nil); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("guest playback = %d, want 401", rec.Code)
+	}
+	// And the account's own page does not hand a stranger the same document
+	// under another name.
+	var strangerPage struct {
+		User publicUserResponse `json:"user"`
+	}
+	c.decode(c.do(http.MethodGet, "/api/v1/users/"+kyleID.String(), sam, nil), &strangerPage)
+	if listening := string(strangerPage.User.Listening); listening != "" && listening != "null" {
+		t.Errorf("a stranger was shown what kyle is playing: %s", listening)
 	}
 
 	// sam asks, kyle accepts.

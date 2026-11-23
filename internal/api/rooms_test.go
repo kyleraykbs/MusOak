@@ -357,3 +357,64 @@ func TestRoomQueuesOverHTTP(t *testing.T) {
 		t.Errorf("clearing someone else's queue: %d %s, want 403", steal.Code, steal.Body.String())
 	}
 }
+
+// An account's member id is published in every snapshot. Presented without that
+// account's token it acts as nobody: a stranger cannot pause, skip or take the
+// host's place by copying it out of the room list.
+func TestAGuestCannotActAsAnAccountMember(t *testing.T) {
+	c := newHTTPTestServer(t, nil)
+	alice := c.register("alice", "hunter2hunter2")
+	aliceID := friendsUserID(t, c, "alice")
+
+	rec := c.do(http.MethodPost, "/api/v1/rooms", alice, map[string]string{"name": "party", "controls": "host"})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body.String())
+	}
+	var created roomResponse
+	c.decode(rec, &created)
+	roomID := created.Room.ID
+
+	for _, path := range []string{"/pause", "/skip", "/leave", "/join"} {
+		rec := c.doAs(http.MethodPost, "/api/v1/rooms/"+roomID+path, aliceID.String(), nil)
+		if rec.Code < 400 {
+			t.Errorf("POST %s as alice's id without her token = %d, want refused", path, rec.Code)
+		}
+	}
+	snap := c.do(http.MethodGet, "/api/v1/rooms/"+roomID, alice, nil)
+	var room rooms.Snapshot
+	c.decode(snap, &room)
+	if room.Host != aliceID.String() || room.MemberCount != 1 {
+		t.Errorf("after the attempts the room is %+v, want alice still its only member and host", room)
+	}
+}
+
+// A password room tells outsiders that it is there and how many are in it, and
+// nothing about who they are or what they are playing.
+func TestAPasswordRoomShowsOutsidersOnlyThatItIsThere(t *testing.T) {
+	c := newHTTPTestServer(t, nil)
+	alice := c.register("alice", "hunter2hunter2")
+	bob := c.register("bob", "hunter2hunter2")
+	rec := c.do(http.MethodPost, "/api/v1/rooms", alice, map[string]string{"name": "party", "controls": "everyone", "password": "sesame"})
+	var created roomResponse
+	c.decode(rec, &created)
+	roomID := created.Room.ID
+
+	var outside rooms.Snapshot
+	c.decode(c.do(http.MethodGet, "/api/v1/rooms/"+roomID, bob, nil), &outside)
+	if len(outside.Members) != 0 || outside.Host != "" || outside.MemberCount != 1 || !outside.HasPassword || outside.Name != "party" {
+		t.Errorf("an outsider sees %+v, want the name, the count and nothing else", outside)
+	}
+	var listed struct {
+		Rooms []rooms.Snapshot `json:"rooms"`
+	}
+	c.decode(c.do(http.MethodGet, "/api/v1/rooms", "", nil), &listed)
+	if len(listed.Rooms) != 1 || len(listed.Rooms[0].Members) != 0 {
+		t.Errorf("the room list shows a guest %+v", listed.Rooms)
+	}
+
+	var inside rooms.Snapshot
+	c.decode(c.do(http.MethodGet, "/api/v1/rooms/"+roomID, alice, nil), &inside)
+	if len(inside.Members) != 1 || inside.Host == "" {
+		t.Errorf("a member sees %+v, want the whole room", inside)
+	}
+}

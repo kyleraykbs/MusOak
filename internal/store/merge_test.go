@@ -135,3 +135,28 @@ func TestMergeTracksCollapsesAPlaylistHoldingBoth(t *testing.T) {
 		t.Errorf("entries = %+v, want the other song then the kept one", items)
 	}
 }
+
+// Listens name a track without a foreign key, so a merge has to carry them: a
+// song's history must not vanish because two of its rows turned out to be one.
+func TestMergeTracksCarriesTheListens(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	user := mustUserNamed(t, db, "kyle")
+	keep := mustTrack(t, db, "Song")
+	drop := mustTrack(t, db, "Song (duplicate)")
+
+	if err := db.RecordPlay(ctx, &PlayRecord{UserID: user.ID, TrackID: drop.ID, PlayedMs: 120_000}); err != nil {
+		t.Fatalf("RecordPlay: %v", err)
+	}
+	if err := db.MergeTracks(ctx, keep.ID, drop.ID); err != nil {
+		t.Fatalf("MergeTracks: %v", err)
+	}
+
+	history, err := db.History(ctx, user.ID, 10)
+	if err != nil {
+		t.Fatalf("History: %v", err)
+	}
+	if len(history) != 1 || history[0].TrackID != keep.ID {
+		t.Fatalf("history after the merge = %+v, want the one listen on the kept track", history)
+	}
+}

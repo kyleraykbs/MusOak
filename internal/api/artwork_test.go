@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -37,12 +38,51 @@ func (a *artworkProvider) Search(ctx context.Context, q string, opts provider.Se
 	}}, nil
 }
 
+// tinyPNG is a 1x1 PNG: the cover cache keeps what the bytes show to be an
+// image, so a stand-in has to be one.
+var tinyPNG = []byte{
+	0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+	0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+	0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+	0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+	0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41,
+	0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+	0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
+	0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+	0x42, 0x60, 0x82,
+}
+
+// A cover's address can be handed in by a client, so what comes back from it is
+// only kept when it is a picture: a page served under an image's name is not
+// stored, and not served from this server's own origin.
+func TestArtworkEndpointRefusesWhatIsNotAnImage(t *testing.T) {
+	notAnImage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write([]byte("<html><script>alert(1)</script></html>"))
+	}))
+	defer notAnImage.Close()
+
+	c := newHTTPTestServer(t, nil)
+	c.providers.Register(&artworkProvider{name: "ytmusic", artwork: notAnImage.URL + "/cover.png"})
+	rec := c.do(http.MethodGet, "/api/v1/search?q=anything", "", nil)
+	var search searchResponse
+	c.decode(rec, &search)
+	if len(search.Groups) == 0 || search.Groups[0].Track.ArtworkURL == "" {
+		t.Fatalf("search = %s", rec.Body.String())
+	}
+
+	rec = c.do(http.MethodGet, search.Groups[0].Track.ArtworkURL, "", nil)
+	if rec.Code == http.StatusOK {
+		t.Fatalf("markup was served as a cover: %q (%s)", rec.Body.String(), rec.Header().Get("Content-Type"))
+	}
+}
+
 func TestArtworkEndpointServesAndCachesCovers(t *testing.T) {
 	var imageHits atomic.Int32
 	image := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		imageHits.Add(1)
 		w.Header().Set("Content-Type", "image/png")
-		_, _ = w.Write([]byte("fake-png-bytes"))
+		_, _ = w.Write(tinyPNG)
 	}))
 	defer image.Close()
 
@@ -75,7 +115,7 @@ func TestArtworkEndpointServesAndCachesCovers(t *testing.T) {
 	if rec.Header().Get("ETag") == "" {
 		t.Error("a cached cover should carry an ETag")
 	}
-	if body := rec.Body.String(); body != "fake-png-bytes" {
+	if body := rec.Body.Bytes(); !bytes.Equal(body, tinyPNG) {
 		t.Errorf("body = %q", body)
 	}
 
@@ -87,15 +127,14 @@ func TestArtworkEndpointServesAndCachesCovers(t *testing.T) {
 		t.Errorf("the provider was asked %d times, want 1", hits)
 	}
 
-	// A row that asks for a small cover asks for a width. What is stored here
-	// is not an image at all, so the resize cannot run: the cover is served as
-	// it is rather than the row going without one.
+	// A row that asks for a small cover asks for a width: the answer is the
+	// cover either way, shrunk where it can be and as it is where it cannot.
 	rec = c.do(http.MethodGet, track.ArtworkURL+"?w=64", "", nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("artwork with a width = %d: %s", rec.Code, rec.Body.String())
 	}
-	if body := rec.Body.String(); body != "fake-png-bytes" {
-		t.Errorf("a cover that cannot be shrunk was not served: body = %q", body)
+	if got := rec.Header().Get("Content-Type"); got != "image/jpeg" && got != "image/png" {
+		t.Errorf("a cover asked for at a width came back as %q", got)
 	}
 	// Garbage in the width is not an error either: it is read as "no width".
 	if rec := c.do(http.MethodGet, track.ArtworkURL+"?w=nonsense", "", nil); rec.Code != http.StatusOK {

@@ -250,3 +250,33 @@ func TestToOpusWithProgressClimbsToComplete(t *testing.T) {
 		t.Errorf("stored %v of a %v source, want the trailing silence cut", dstDur, srcDur)
 	}
 }
+
+func TestLoudnessReadsTheIntegratedValue(t *testing.T) {
+	summary := "[Parsed_ebur128_0 @ 0x1] Summary:\n\n  Integrated loudness:\n    I:         -21.8 LUFS\n    Threshold: -31.8 LUFS\n\n  Loudness range:\n    LRA:        20.0 LU\n"
+	got, err := parseIntegratedLoudness(summary)
+	if err != nil || got != -21.8 {
+		t.Fatalf("loudness = %v, %v; want -21.8", got, err)
+	}
+	if _, err := parseIntegratedLoudness("no summary here"); err == nil {
+		t.Error("output with no summary was read as a loudness")
+	}
+}
+
+func TestLoudnessMeasuresARealFile(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg unavailable")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tone.opus")
+	if _, err := run(context.Background(), ffmpegName, "-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-c:a", "libopus", path); err != nil {
+		t.Fatalf("render tone: %v", err)
+	}
+	got, err := Loudness(context.Background(), path)
+	if err != nil {
+		t.Fatalf("Loudness: %v", err)
+	}
+	if got > -5 || got < -40 {
+		t.Errorf("a sine tone measured %v LUFS, not a plausible loudness", got)
+	}
+}

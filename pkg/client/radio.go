@@ -47,7 +47,7 @@ func (c *Client) Radio(ctx context.Context, seedTrackID string, opts RadioOption
 	}
 
 	var out RadioResult
-	if err := c.do(ctx, http.MethodPost, "/api/v1/radio", body, &out); err != nil {
+	if err := c.do(long(ctx), http.MethodPost, "/api/v1/radio", body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

@@ -619,3 +619,91 @@ func TestEnsurePrimaryStopsAnOlderBackgroundFetch(t *testing.T) {
 		t.Errorf("an old background download = %v, want it cancelled for the play", err)
 	}
 }
+
+// A download stopped on purpose is not a download that failed. A background
+// fetch is stopped every time a play takes the pipe, and one remembered as
+// failed is skipped by the prefetcher from then on and shown to every client as
+// a song that cannot be had.
+func TestACancelledBackgroundDownloadIsNotAFailure(t *testing.T) {
+	dir := t.TempDir()
+	fixture := tone(t, dir, "fixture.opus", 0.5)
+	fake := &fakeProvider{name: "ytmusic", fixture: fixture, delay: 300 * time.Millisecond}
+	m, db := newTestManager(t, fake)
+	variant := seedVariant(t, db, true, "ytmusic")
+	ctx := context.Background()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.Ensure(ctx, variant.ID)
+		done <- err
+	}()
+	waitForCalls(t, fake, 1)
+	m.Cancel(variant.ID)
+	<-done
+
+	if m.Failed(ctx, variant.ID) {
+		t.Errorf("status after a cancel = %+v, want it forgotten rather than failed", m.Status(ctx, variant.ID))
+	}
+}
+
+// Two listeners starting songs at once each keep their own download: one
+// person's play is not the other person skipping.
+func TestTwoListenersPlaysDoNotCancelEachOther(t *testing.T) {
+	dir := t.TempDir()
+	fixture := tone(t, dir, "fixture.opus", 0.5)
+	fake := &fakeProvider{name: "ytmusic", fixture: fixture, delay: 300 * time.Millisecond}
+	m, db := newTestManager(t, fake)
+
+	first := seedVariant(t, db, true, "ytmusic")
+	second := seedVariant(t, db, true, "ytmusic")
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := m.EnsurePrimaryFor(context.Background(), first.ID, "alice")
+		firstDone <- err
+	}()
+	waitForCalls(t, fake, 1)
+
+	if _, err := m.EnsurePrimaryFor(context.Background(), second.ID, "bob"); err != nil {
+		t.Fatalf("bob's play failed: %v", err)
+	}
+	if err := <-firstDone; err != nil {
+		t.Fatalf("alice's play was stopped by bob's: %v", err)
+	}
+	for _, variant := range []*store.Variant{first, second} {
+		if state := m.Status(context.Background(), variant.ID).State; state != StateReady {
+			t.Errorf("%s = %s, want both songs downloaded", variant.ID, state)
+		}
+	}
+}
+
+// A song two people are waiting on is not stopped when one of them lets it go.
+func TestOneListenerLettingASharedSongGoKeepsItForTheOther(t *testing.T) {
+	dir := t.TempDir()
+	fixture := tone(t, dir, "fixture.opus", 0.5)
+	fake := &fakeProvider{name: "ytmusic", fixture: fixture, delay: 300 * time.Millisecond}
+	m, db := newTestManager(t, fake)
+	shared := seedVariant(t, db, true, "ytmusic")
+
+	aliceDone := make(chan error, 1)
+	go func() {
+		_, err := m.EnsurePrimaryFor(context.Background(), shared.ID, "alice")
+		aliceDone <- err
+	}()
+	waitForCalls(t, fake, 1)
+	bobDone := make(chan error, 1)
+	go func() {
+		_, err := m.EnsurePrimaryFor(context.Background(), shared.ID, "bob")
+		bobDone <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	m.CancelFor(shared.ID, "alice")
+	if err := <-bobDone; err != nil {
+		t.Fatalf("bob lost the song alice let go: %v", err)
+	}
+	<-aliceDone
+	if state := m.Status(context.Background(), shared.ID).State; state != StateReady {
+		t.Errorf("shared song = %s, want it downloaded for bob", state)
+	}
+}

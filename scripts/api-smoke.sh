@@ -7,11 +7,18 @@
 #
 # Every check prints ok/FAIL and the script exits non-zero if anything failed.
 # Search hits the real providers, so run it with ytmusic enabled.
+#
+# The import check reads a file off the server's disk, which a daemon only does
+# for an account and from a directory its config names: put the directory this
+# script generates its tone in under "media": { "importDirs": [...] } and pass
+# it as the second argument (default /tmp/musoak-smoke).
 set -uo pipefail
 
 base="${1:-http://127.0.0.1:8080}"
+importdir="${2:-/tmp/musoak-smoke}"
 workdir="$(mktemp -d)"
-tone="$workdir/track.opus"
+mkdir -p "$importdir"
+tone="$importdir/track.opus"
 
 ffmpeg -hide_banner -loglevel error -y \
   -f lavfi -i "sine=frequency=440:duration=0.6" \
@@ -59,11 +66,15 @@ check "search" 200 "$(req GET '/api/v1/search?q=Rick%20Astley%20Never%20Gonna%20
 echo "     groups: $(jqr '.groups | length'), providerErrors: $(jqr '.providerErrors // [] | length')"
 
 echo "== local library =="
+check "library/import as a guest" 401 "$(req POST /api/v1/library/import "{\"path\":\"$tone\"}")"
+username="curl-$(date +%s)"
+check "auth register" 201 "$(req POST /api/v1/auth/register "{\"username\":\"$username\",\"password\":\"hunter2hunter2\"}")"
+auth="$(jqr .token)"
 check "library/import" 200 "$(req POST /api/v1/library/import "{\"path\":\"$tone\"}")"
 local_track="$(jqr '.imported[0].track.id')"
 variant="$(jqr '.imported[0].variant.id')"
 printf '     imported %s as %s (%s)\n' "$(jqr '.imported[0].track.title')" "$variant" "$(jqr '.imported[0].variant.provider')"
-check "library/import bad path" 400 "$(req POST /api/v1/library/import '{"path":"/nope/nothing.opus"}')"
+check "library/import outside the import dirs" 403 "$(req POST /api/v1/library/import '{"path":"/nope/nothing.opus"}')"
 
 echo "== tracks =="
 check "tracks/{id}" 200 "$(req GET "/api/v1/tracks/$local_track")"
@@ -87,9 +98,6 @@ check "media range length" 100 "$(stat -c %s "$workdir/range")"
 check "media file unknown" 404 "$(curl -s -o /dev/null -w '%{http_code}' "$base/api/v1/media/00000000-0000-0000-0000-000000000000")"
 
 echo "== accounts, favorites, ranking =="
-username="curl-$(date +%s)"
-check "auth register" 201 "$(req POST /api/v1/auth/register "{\"username\":\"$username\",\"password\":\"hunter2hunter2\"}")"
-auth="$(jqr .token)"
 check "me" 200 "$(req GET /api/v1/me)"
 check "me authenticated" true "$(jqr .authenticated)"
 check "favorites add" 204 "$(req POST /api/v1/me/favorites "{\"trackId\":\"$local_track\"}")"

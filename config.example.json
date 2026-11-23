@@ -21,7 +21,7 @@
   "match": { "threshold": 0.8 },
   "rateLimit": { "searchPerMinute": 30, "loginPerMinute": 10 },
   "trustedProxies": [],
-  "media": { "quotaMB": 0, "prefetchPlaylists": true },
+  "media": { "quotaMB": 0, "prefetchPlaylists": true, "importDirs": [] },
   "client": {
     "serverURL": "",
     "cacheDir": "/home/alice/.cache/musoak"

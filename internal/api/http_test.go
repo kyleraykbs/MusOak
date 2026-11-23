@@ -15,6 +15,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"github.com/kyleraykbs/MusOak/internal/config"
 	"github.com/kyleraykbs/MusOak/internal/store"
 )
@@ -41,6 +43,8 @@ func newHTTPTestServer(t *testing.T, mutate func(*config.Config)) *testClient {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	// Test covers are served from httptest servers on 127.0.0.1.
+	s.artwork.AllowPrivateHosts()
 	t.Cleanup(func() {
 		if err := s.Close(); err != nil {
 			t.Errorf("Close: %v", err)
@@ -358,6 +362,7 @@ func TestLibraryImportAndMediaServing(t *testing.T) {
 	c := newHTTPTestServer(t, nil)
 	source := toneFile(t, t.TempDir(), "My Song.opus")
 
+	c.TrustLocalOwner() // the CLI's own server: its one client may import any file
 	rec := c.do(http.MethodPost, "/api/v1/library/import", "", map[string]string{"path": source})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("import = %d: %s", rec.Code, rec.Body.String())
@@ -399,6 +404,10 @@ func TestLibraryImportAndMediaServing(t *testing.T) {
 	rec = c.do(http.MethodGet, mediaPath, "", nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("media = %d", rec.Code)
+	}
+	// The file was measured as it came in, and says how loud it is.
+	if lufs := rec.Header().Get("X-Loudness-LUFS"); lufs == "" {
+		t.Error("an imported file was served without its loudness")
 	}
 	if rec.Header().Get("ETag") == "" {
 		t.Error("media response has no ETag")
@@ -444,6 +453,7 @@ func TestLibraryImportRecordsEmbeddedCover(t *testing.T) {
 		t.Fatalf("read the embedded picture: %v", err)
 	}
 
+	c.TrustLocalOwner() // the CLI's own server: its one client may import any file
 	rec := c.do(http.MethodPost, "/api/v1/library/import", "", map[string]string{"path": source})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("import = %d: %s", rec.Code, rec.Body.String())
@@ -493,6 +503,7 @@ func TestLibraryImportWithoutCoverRecordsNone(t *testing.T) {
 	c := newHTTPTestServer(t, nil)
 	source := toneFile(t, t.TempDir(), "Bare.opus")
 
+	c.TrustLocalOwner() // the CLI's own server: its one client may import any file
 	rec := c.do(http.MethodPost, "/api/v1/library/import", "", map[string]string{"path": source})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("import = %d: %s", rec.Code, rec.Body.String())
@@ -582,4 +593,91 @@ func renderFFmpeg(t *testing.T, args ...string) error {
 		return fmt.Errorf("%w: %s", err, stderr.String())
 	}
 	return nil
+}
+
+// Over the network an import reads the server's own disk, so it is for an
+// account and for the directories the owner named - not for whoever can reach
+// the port, and not for any path at all.
+func TestLibraryImportIsForAccountsInsideTheImportDirs(t *testing.T) {
+	music := t.TempDir()
+	elsewhere := t.TempDir()
+	c := newHTTPTestServer(t, func(cfg *config.Config) { cfg.Media.ImportDirs = []string{music} })
+	inside := toneFile(t, music, "Inside.opus")
+	outside := toneFile(t, elsewhere, "Outside.opus")
+	token := c.register("kyle", "hunter2hunter2")
+
+	if rec := c.do(http.MethodPost, "/api/v1/library/import", "", map[string]string{"path": inside}); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("a guest's import = %d, want 401", rec.Code)
+	}
+	if rec := c.do(http.MethodPost, "/api/v1/library/import", token, map[string]string{"path": outside}); rec.Code != http.StatusForbidden {
+		t.Fatalf("an import from outside the import dirs = %d, want 403: %s", rec.Code, rec.Body.String())
+	}
+	if rec := c.do(http.MethodPost, "/api/v1/library/import", token, map[string]string{"dir": "/"}); rec.Code != http.StatusForbidden {
+		t.Fatalf("an import of the whole disk = %d, want 403", rec.Code)
+	}
+	// A way out of the directory by name is still outside it.
+	escape := filepath.Join(music, "..", filepath.Base(elsewhere), "Outside.opus")
+	if rec := c.do(http.MethodPost, "/api/v1/library/import", token, map[string]string{"path": escape}); rec.Code != http.StatusForbidden {
+		t.Fatalf("an import through .. = %d, want 403", rec.Code)
+	}
+	if rec := c.do(http.MethodPost, "/api/v1/library/import", token, map[string]string{"path": inside}); rec.Code != http.StatusOK {
+		t.Fatalf("an account's import from an import dir = %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// With no directories named, nothing on the server's disk is importable over
+// the API, account or not.
+func TestLibraryImportIsOffUntilADirectoryIsNamed(t *testing.T) {
+	c := newHTTPTestServer(t, nil)
+	source := toneFile(t, t.TempDir(), "Song.opus")
+	token := c.register("kyle", "hunter2hunter2")
+	if rec := c.do(http.MethodPost, "/api/v1/library/import", token, map[string]string{"path": source}); rec.Code != http.StatusForbidden {
+		t.Fatalf("import with no import dirs = %d, want 403", rec.Code)
+	}
+}
+
+// With requireLogin on, a room guest can still follow and act in a room and
+// hear it - its own plays and cancels reach only its own downloads - but not
+// make rooms.
+func TestRequireLoginLeavesGuestsWhatARoomNeeds(t *testing.T) {
+	for _, tc := range []struct {
+		method, target string
+		public         bool
+	}{
+		{"GET", "/api/v1/rooms", true},
+		{"POST", "/api/v1/rooms", false},
+		{"POST", "/api/v1/rooms/r1/join", true},
+		{"POST", "/api/v1/rooms/r1/skip", true},
+		{"GET", "/api/v1/media/v1", true},
+		{"GET", "/api/v1/media/v1/status", true},
+		{"POST", "/api/v1/media/v1/download", true},
+		{"POST", "/api/v1/media/v1/download?priority=1", true},
+		{"DELETE", "/api/v1/media/v1/download", true},
+		{"GET", "/api/v1/me/playlists", false},
+		{"GET", "/api/v1/search", true},
+	} {
+		if got := isPublic(httptest.NewRequest(tc.method, tc.target, nil)); got != tc.public {
+			t.Errorf("%s %s public = %v, want %v", tc.method, tc.target, got, tc.public)
+		}
+	}
+}
+
+// A download is attributed to who asked: the account, else the guest's member
+// id, else the address - so one listener's next song stops only their own last.
+func TestRequesterOfNamesWhoAsked(t *testing.T) {
+	guest := httptest.NewRequest("POST", "/api/v1/media/x/download", nil)
+	guest.Header.Set(memberHeader, "browser-1")
+	if got := requesterOf(guest); got != "member:browser-1" {
+		t.Errorf("guest = %q", got)
+	}
+	anonymous := httptest.NewRequest("POST", "/api/v1/media/x/download", nil)
+	anonymous.RemoteAddr = "192.0.2.4:5555"
+	if got := requesterOf(anonymous); got != "addr:192.0.2.4" {
+		t.Errorf("anonymous = %q", got)
+	}
+	user := &store.User{ID: uuid.New()}
+	signedIn := guest.WithContext(context.WithValue(guest.Context(), userKey, user))
+	if got := requesterOf(signedIn); got != "user:"+user.ID.String() {
+		t.Errorf("signed in = %q, want the account over the member header", got)
+	}
 }

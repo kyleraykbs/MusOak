@@ -446,3 +446,31 @@ func TestAttachAlbumVariantFillsWhatIsUnknown(t *testing.T) {
 		t.Errorf("title = %q", filled.Title)
 	}
 }
+
+// A tracklist can name one canonical track twice - a remaster beside the
+// original - and the album still gets its tracklist, with the song once.
+func TestAppendAlbumTracksTakesARepeatedTrackOnce(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	albumID, err := db.EnsureAlbum(ctx, "Record", []string{"Someone"})
+	if err != nil {
+		t.Fatalf("EnsureAlbum: %v", err)
+	}
+	first := mustTrack(t, db, "Song")
+	second := mustTrack(t, db, "Other Song")
+
+	added, err := db.AppendAlbumTracks(ctx, albumID, []uuid.UUID{first.ID, first.ID, second.ID})
+	if err != nil {
+		t.Fatalf("AppendAlbumTracks: %v", err)
+	}
+	if added != 2 {
+		t.Errorf("added = %d, want 2", added)
+	}
+	tracks, err := db.AlbumTracks(ctx, albumID)
+	if err != nil {
+		t.Fatalf("AlbumTracks: %v", err)
+	}
+	if len(tracks) != 2 || tracks[0].ID != first.ID || tracks[1].ID != second.ID {
+		t.Fatalf("album tracks = %+v, want the two songs in order", tracks)
+	}
+}

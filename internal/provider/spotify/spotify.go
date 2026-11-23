@@ -295,6 +295,7 @@ func (p *Provider) Playlist(ctx context.Context, providerPlaylistID string) (*pr
 	// No credentials, no API - but a public playlist is readable from its embed
 	// page, and its tracks are enough to find the same songs on a provider that
 	// can be played. That is what an import needs.
+	providerPlaylistID = spotifyID(providerPlaylistID)
 	if !p.configured() {
 		return p.publicPlaylist(ctx, providerPlaylistID)
 	}
@@ -310,11 +311,12 @@ func (p *Provider) Playlist(ctx context.Context, providerPlaylistID string) (*pr
 			DisplayName string `json:"display_name"`
 		} `json:"owner"`
 	}
-	if err := p.get(ctx, "/playlists/"+providerPlaylistID, &playlist); err != nil {
+	if err := p.get(ctx, "/playlists/"+url.PathEscape(providerPlaylistID), &playlist); err != nil {
 		return nil, err
 	}
 
-	var page struct {
+	type playlistPage struct {
+		Next  string `json:"next"`
 		Items []struct {
 			Track struct {
 				ID         string `json:"id"`
@@ -330,8 +332,21 @@ func (p *Provider) Playlist(ctx context.Context, providerPlaylistID string) (*pr
 			} `json:"track"`
 		} `json:"items"`
 	}
-	if err := p.get(ctx, "/playlists/"+providerPlaylistID+"/tracks?limit=100", &page); err != nil {
-		return nil, err
+	// A page is a hundred songs at most, and a playlist is often more: every
+	// page is read, or a long playlist imports as its first hundred and says
+	// nothing about the rest.
+	var page playlistPage
+	for offset, pages := 0, 0; pages < maxPages; pages++ {
+		var next playlistPage
+		path := "/playlists/" + url.PathEscape(providerPlaylistID) + "/tracks?limit=100&offset=" + strconv.Itoa(offset)
+		if err := p.get(ctx, path, &next); err != nil {
+			return nil, err
+		}
+		page.Items = append(page.Items, next.Items...)
+		offset += len(next.Items)
+		if next.Next == "" || len(next.Items) == 0 {
+			break
+		}
 	}
 
 	detail := &provider.PlaylistDetail{
@@ -374,12 +389,14 @@ func (p *Provider) Playlist(ctx context.Context, providerPlaylistID string) (*pr
 
 // Album implements provider.AlbumSearcher.
 func (p *Provider) Album(ctx context.Context, providerAlbumID string) (*provider.AlbumDetail, error) {
+	providerAlbumID = spotifyID(providerAlbumID)
 	var album spotifyAlbum
-	if err := p.get(ctx, "/albums/"+providerAlbumID, &album); err != nil {
+	if err := p.get(ctx, "/albums/"+url.PathEscape(providerAlbumID), &album); err != nil {
 		return nil, err
 	}
 
-	var tracks struct {
+	type albumPage struct {
+		Next  string `json:"next"`
 		Items []struct {
 			ID         string `json:"id"`
 			Name       string `json:"name"`
@@ -389,8 +406,19 @@ func (p *Provider) Album(ctx context.Context, providerAlbumID string) (*provider
 			} `json:"artists"`
 		} `json:"items"`
 	}
-	if err := p.get(ctx, "/albums/"+providerAlbumID+"/tracks?limit=50", &tracks); err != nil {
-		return nil, err
+	// Fifty songs a page; a box set or a long compilation is more.
+	var tracks albumPage
+	for offset, pages := 0, 0; pages < maxPages; pages++ {
+		var next albumPage
+		path := "/albums/" + url.PathEscape(providerAlbumID) + "/tracks?limit=50&offset=" + strconv.Itoa(offset)
+		if err := p.get(ctx, path, &next); err != nil {
+			return nil, err
+		}
+		tracks.Items = append(tracks.Items, next.Items...)
+		offset += len(next.Items)
+		if next.Next == "" || len(next.Items) == 0 {
+			break
+		}
 	}
 
 	detail := &provider.AlbumDetail{
@@ -432,15 +460,27 @@ func (p *Provider) Album(ctx context.Context, providerAlbumID string) (*provider
 
 // ArtistAlbums implements provider.ArtistSearcher.
 func (p *Provider) ArtistAlbums(ctx context.Context, providerArtistID string) ([]provider.Album, error) {
-	var page struct {
+	providerArtistID = spotifyID(providerArtistID)
+	type discographyPage struct {
+		Next  string         `json:"next"`
 		Items []spotifyAlbum `json:"items"`
 	}
-	path := "/artists/" + providerArtistID + "/albums?include_groups=album,single&limit=50"
-	if err := p.get(ctx, path, &page); err != nil {
-		return nil, err
+	// An artist with more than fifty records and singles has more pages.
+	var items []spotifyAlbum
+	for offset, pages := 0, 0; pages < maxPages; pages++ {
+		var next discographyPage
+		path := "/artists/" + url.PathEscape(providerArtistID) + "/albums?include_groups=album,single&limit=50&offset=" + strconv.Itoa(offset)
+		if err := p.get(ctx, path, &next); err != nil {
+			return nil, err
+		}
+		items = append(items, next.Items...)
+		offset += len(next.Items)
+		if next.Next == "" || len(next.Items) == 0 {
+			break
+		}
 	}
-	albums := make([]provider.Album, 0, len(page.Items))
-	for _, item := range page.Items {
+	albums := make([]provider.Album, 0, len(items))
+	for _, item := range items {
 		if item.ID == "" {
 			continue
 		}
@@ -630,6 +670,27 @@ func (p *Provider) get(ctx context.Context, path string, out any) error {
 		return fmt.Errorf("spotify %s: parse response: %w", path, err)
 	}
 	return nil
+}
+
+// maxPages bounds how many pages one list is read in: ten thousand songs of a
+// playlist, which is Spotify's own ceiling, and a loop that cannot run away if
+// the API keeps saying there is more.
+const maxPages = 100
+
+// spotifyID is the bare id out of whatever was pasted: a share link
+// (open.spotify.com/playlist/ID?si=...), a URI (spotify:playlist:ID) or the id
+// with a tracking query still on it. Sent as it was, `ID?si=...` became part of
+// the API path and Spotify answered that the id was empty.
+func spotifyID(raw string) string {
+	id := strings.TrimSpace(raw)
+	if cut := strings.IndexAny(id, "?#"); cut >= 0 {
+		id = id[:cut]
+	}
+	id = strings.TrimRight(id, "/")
+	if slash := strings.LastIndexAny(id, "/:"); slash >= 0 {
+		id = id[slash+1:]
+	}
+	return id
 }
 
 // errRadioGone marks Spotify's removed recommendation endpoint, so the message

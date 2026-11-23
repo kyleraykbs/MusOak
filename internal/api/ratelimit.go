@@ -136,18 +136,56 @@ func (s *Server) withRateLimits(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var limit *limiter
 		switch {
-		case s.searchLimiter != nil && r.URL.Path == "/api/v1/search":
+		case s.searchLimiter != nil && asksProviders(r):
 			limit = s.searchLimiter
-		case s.loginLimiter != nil && (r.URL.Path == "/api/v1/auth/login" || r.URL.Path == "/api/v1/auth/register"):
+		case s.loginLimiter != nil && hashesPasswords(r):
 			limit = s.loginLimiter
 		}
-		if limit != nil && !limit.allow(clientKey(r, limit.trusted)) {
+		if limit != nil && !limit.allow(rateKey(clientKey(r, limit.trusted))) {
 			w.Header().Set("Retry-After", "5")
 			writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// asksProviders reports whether a request puts a question to the providers: a
+// search of any kind, a provider's playlist, a station, a sync. Each of those
+// is a helper process or a provider call per request, and limiting only the
+// song search left every other way of starting one open.
+func asksProviders(r *http.Request) bool {
+	path := r.URL.Path
+	switch {
+	case path == "/api/v1/search", strings.HasSuffix(path, "/search") && strings.HasPrefix(path, "/api/v1/"):
+		return true
+	case strings.HasPrefix(path, "/api/v1/provider-playlists/"):
+		return true
+	case r.Method == http.MethodPost && (path == "/api/v1/radio" || strings.HasSuffix(path, "/sync")):
+		return true
+	}
+	return false
+}
+
+// hashesPasswords reports whether a request costs an argon2id hash: signing in
+// and up, and the account changes that check the current password.
+func hashesPasswords(r *http.Request) bool {
+	switch r.URL.Path {
+	case "/api/v1/auth/login", "/api/v1/auth/register", "/api/v1/me/password", "/api/v1/me/username":
+		return true
+	}
+	return false
+}
+
+// rateKey is the bucket a client address spends from. An IPv6 client is its
+// /64: one network is handed a whole /64 and can take a fresh address from it
+// for every request, so keyed by the full address it had a bucket per request.
+func rateKey(client string) string {
+	ip := net.ParseIP(client)
+	if ip == nil || ip.To4() != nil {
+		return client
+	}
+	return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
 }
 
 // clientKey identifies the caller for rate limiting. Normally that is the

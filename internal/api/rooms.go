@@ -63,12 +63,30 @@ func (s *Server) callerMember(r *http.Request, allowNew bool) (rooms.Member, boo
 		}, true
 	}
 	if id := r.Header.Get(memberHeader); id != "" {
+		// An account's member id is its user id, and every room snapshot
+		// publishes it. Claimed without that account's token it is somebody
+		// else's name, not a guest's: refused, rather than letting anybody who
+		// has seen a room skip, pause or empty the queue as its host.
+		if s.namesAccount(r, id) {
+			return rooms.Member{}, false
+		}
 		return rooms.Member{ID: id, Name: r.Header.Get("X-Member-Name")}, true
 	}
 	if allowNew {
 		return rooms.Member{ID: uuid.NewString(), Name: r.Header.Get("X-Member-Name")}, true
 	}
 	return rooms.Member{}, false
+}
+
+// namesAccount reports whether a member id is a registered account's: what a
+// guest may never present itself as.
+func (s *Server) namesAccount(r *http.Request, id string) bool {
+	userID, err := uuid.Parse(id)
+	if err != nil {
+		return false
+	}
+	_, err = s.store.User(r.Context(), userID)
+	return err == nil
 }
 
 // guestMemberID is the member a browser joined as, when this request is that
@@ -114,8 +132,26 @@ func (s *Server) handleRoomCreate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, roomResponse{Room: room, MemberID: member.ID})
 }
 
+// viewerID is who is asking about a room, for what a password room shows them:
+// the account, or the guest's own member id, or nobody.
+func (s *Server) viewerID(r *http.Request) string {
+	if member, ok := s.callerMember(r, false); ok {
+		return member.ID
+	}
+	return ""
+}
+
+// The list shows every room, and a password room shows outsiders only that it
+// is there: who is in it and what it is playing is for the people it let in.
 func (s *Server) handleRoomList(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"rooms": s.rooms.List()})
+	viewer := s.viewerID(r)
+	list := s.rooms.List()
+	for i := range list {
+		if !s.rooms.OpenTo(list[i].ID, viewer) {
+			list[i] = list[i].Redacted()
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"rooms": list})
 }
 
 func (s *Server) handleRoomGet(w http.ResponseWriter, r *http.Request) {
@@ -123,6 +159,10 @@ func (s *Server) handleRoomGet(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeRoomError(w, err)
 		return
+	}
+	if !s.rooms.OpenTo(room.ID, s.viewerID(r)) {
+		redacted := room.Redacted()
+		room = &redacted
 	}
 	writeJSON(w, http.StatusOK, room)
 }

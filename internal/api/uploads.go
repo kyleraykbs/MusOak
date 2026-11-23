@@ -77,6 +77,14 @@ const (
 	maxUploadBodyBytes = 96 << 20
 )
 
+// maxNameBytes is the longest a name a person typed may be - a title, an
+// album, an artist, a display name - and maxUploadArtists how many artists one
+// song may credit.
+const (
+	maxNameBytes     = 200
+	maxUploadArtists = 50
+)
+
 // maxImageBodyBytes bounds the envelope around an image: the decoded cap the
 // handlers enforce (maxArtworkBytes), base64's third again, and room for the
 // metadata beside it. An image endpoint that read through the small-body
@@ -152,6 +160,22 @@ func (s *Server) handleUploadCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	artists := cleanNames(req.Artists)
 	album := strings.TrimSpace(req.Album)
+	// The envelope is sized for the audio, so nothing else in it is bounded by
+	// that: a song's credits are stored, listed and sent to everybody.
+	if len(album) > maxNameBytes {
+		writeError(w, http.StatusBadRequest, "album is too long")
+		return
+	}
+	if len(artists) > maxUploadArtists {
+		writeError(w, http.StatusBadRequest, "too many artists")
+		return
+	}
+	for _, artist := range artists {
+		if len(artist) > maxNameBytes {
+			writeError(w, http.StatusBadRequest, "an artist's name is too long")
+			return
+		}
+	}
 
 	data, err := base64.StdEncoding.DecodeString(req.Data)
 	if err != nil {
@@ -264,6 +288,9 @@ func (s *Server) handleUploadCreate(w http.ResponseWriter, r *http.Request) {
 	s.releaseOtherAssociations(r.Context(), user.ID, target.ID, upload.ID)
 
 	s.storeUploadCover(r.Context(), upload.ID, target.ID, cover, coverExt)
+	// The variant the store made, which is not the name the file was written
+	// under: the row is what the measurement is recorded on.
+	s.media.MeasureStored(r.Context(), file.VariantID, path)
 
 	created, err := s.store.Upload(r.Context(), upload.ID)
 	if err != nil {
@@ -292,15 +319,25 @@ func decodeUploadCover(w http.ResponseWriter, req uploadCreateRequest) (data []b
 	if req.ArtworkData == "" {
 		return nil, "", true
 	}
-	contentType := artwork.ContentType(req.ArtworkContentType)
-	extension, known := artwork.ExtensionFor(contentType)
-	if !known {
+	return decodeImage(w, req.ArtworkContentType, req.ArtworkData, "artworkData")
+}
+
+// decodeImage reads an image a client sent as base64 beside the type it claims
+// to be: an icon, a playlist cover, a song's cover. ok is false and the request
+// is answered when it is not usable; field names the JSON key in what is said.
+//
+// The type that counts is the one the bytes show. The claim is only a claim,
+// and what is stored here is served back from this server's own origin to
+// everybody: markup filed under "image/png" is a page of somebody else's
+// script waiting for a browser to be told it is one.
+func decodeImage(w http.ResponseWriter, claimedType, encoded, field string) (data []byte, extension string, ok bool) {
+	if _, known := artwork.ExtensionFor(artwork.ContentType(claimedType)); !known {
 		writeError(w, http.StatusBadRequest, "an image is needed: png, jpeg, webp, gif or avif")
 		return nil, "", false
 	}
-	data, err := base64.StdEncoding.DecodeString(req.ArtworkData)
+	data, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "artworkData must be base64")
+		writeError(w, http.StatusBadRequest, field+" must be base64")
 		return nil, "", false
 	}
 	if len(data) == 0 {
@@ -311,7 +348,28 @@ func decodeUploadCover(w http.ResponseWriter, req uploadCreateRequest) (data []b
 		writeError(w, http.StatusRequestEntityTooLarge, "the image is too large")
 		return nil, "", false
 	}
+	extension, isImage := sniffImage(data)
+	if !isImage {
+		writeError(w, http.StatusBadRequest, "that file is not an image: png, jpeg, webp, gif or avif")
+		return nil, "", false
+	}
 	return data, extension, true
+}
+
+// sniffImage reports the suffix an image's own bytes say it is stored under,
+// and whether they are an image this server serves at all.
+func sniffImage(data []byte) (extension string, ok bool) {
+	if extension, ok := artwork.ExtensionFor(artwork.ContentType(http.DetectContentType(data))); ok {
+		return extension, true
+	}
+	// The standard sniffer predates AVIF: an ISO media file whose brand says
+	// so is the one format left to read by hand.
+	if len(data) >= 12 && string(data[4:8]) == "ftyp" {
+		if brand := string(data[8:12]); brand == "avif" || brand == "avis" {
+			return artwork.ExtensionFor("image/avif")
+		}
+	}
+	return "", false
 }
 
 // storeUploadCover files a cover the way the artwork cache files any other:

@@ -177,7 +177,7 @@ func (s *Server) handleMediaDownload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if boolParam(r, "wait") {
-		if _, err := s.ensureMedia(r.Context(), id, boolParam(r, "priority")); err != nil {
+		if _, err := s.ensureMedia(r.Context(), id, boolParam(r, "priority"), requesterOf(r)); err != nil {
 			writeError(w, http.StatusBadGateway, err.Error())
 			return
 		}
@@ -189,8 +189,9 @@ func (s *Server) handleMediaDownload(w http.ResponseWriter, r *http.Request) {
 	// deduplicates it with every other requester anyway.
 	ctx := context.WithoutCancel(r.Context())
 	priority := boolParam(r, "priority")
+	requester := requesterOf(r)
 	go func() {
-		if _, err := s.ensureMedia(ctx, id, priority); err != nil {
+		if _, err := s.ensureMedia(ctx, id, priority, requester); err != nil {
 			s.logger.Warn("media download failed", "variant", id, "error", err)
 		}
 	}()
@@ -205,7 +206,7 @@ func (s *Server) handleMediaCancel(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	s.media.Cancel(id)
+	s.media.CancelFor(id, requesterOf(r))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -213,11 +214,24 @@ func (s *Server) handleMediaCancel(w http.ResponseWriter, r *http.Request) {
 // hear - which takes the whole pipe: the downloads running for anything else
 // are cancelled and none starts until it has finished - or as background work,
 // which waits its turn.
-func (s *Server) ensureMedia(ctx context.Context, variantID uuid.UUID, priority bool) (string, error) {
+func (s *Server) ensureMedia(ctx context.Context, variantID uuid.UUID, priority bool, requester string) (string, error) {
 	if priority {
-		return s.media.EnsurePrimary(ctx, variantID)
+		return s.media.EnsurePrimaryFor(ctx, variantID, requester)
 	}
 	return s.media.Ensure(ctx, variantID)
+}
+
+// requesterOf names who a download is for, so one listener's next song stops
+// only that listener's last one: the account when there is one, else the
+// member id a guest's client carries, else the address it came from.
+func requesterOf(r *http.Request) string {
+	if user, _ := r.Context().Value(userKey).(*store.User); user != nil {
+		return "user:" + user.ID.String()
+	}
+	if id := strings.TrimSpace(r.Header.Get(memberHeader)); id != "" {
+		return "member:" + id
+	}
+	return "addr:" + peerHost(r.RemoteAddr)
 }
 
 // boolParam reads a flag the way the media routes are asked for one: absent is

@@ -3,6 +3,7 @@ package media
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -97,6 +98,10 @@ func TestSweepRetentionDeletesOnlyWhatHasExpired(t *testing.T) {
 	expiredVariant, expiredPath := seed("expired", old, nil)
 	freshVariant, freshPath := seed("fresh", time.Now(), nil)
 
+	if state := m.Status(ctx, expiredVariant).State; state != StateReady {
+		t.Fatalf("the song on disk reads %s before the sweep, want %s", state, StateReady)
+	}
+
 	freed := m.SweepNow(ctx)
 
 	if freed <= 0 {
@@ -107,6 +112,11 @@ func TestSweepRetentionDeletesOnlyWhatHasExpired(t *testing.T) {
 	}
 	if _, err := db.MediaFile(ctx, expiredVariant); err == nil {
 		t.Error("the expired song's row is still in the store")
+	}
+	// What the process remembers goes with the file: a status still saying
+	// "ready" sends a client to fetch a song that is no longer there.
+	if state := m.Status(ctx, expiredVariant).State; state != StateNone {
+		t.Errorf("the swept song's status = %s, want %s", state, StateNone)
 	}
 	if _, err := os.Stat(freshPath); err != nil {
 		t.Errorf("the song fetched just now was removed: %v", err)
@@ -310,4 +320,52 @@ func trackIDFor(t *testing.T, db *store.DB, variantID uuid.UUID) uuid.UUID {
 		t.Fatal(err)
 	}
 	return variant.TrackID
+}
+
+// A file stored before loudness was measured is measured by the hourly pass,
+// and one that cannot be read is left for the next.
+func TestTheSweepMeasuresTheLoudnessBacklog(t *testing.T) {
+	m, db := newTestManager(t, nil)
+	ctx := context.Background()
+	dir := m.Dir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	seed := func(title, path string) uuid.UUID {
+		track := &store.Track{Title: title}
+		if err := db.CreateTrack(ctx, track); err != nil {
+			t.Fatal(err)
+		}
+		variant := &store.Variant{TrackID: track.ID, Provider: "ytmusic", ProviderTrackID: "v-" + title}
+		if err := db.CreateVariant(ctx, variant); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.UpsertMediaFile(ctx, &store.MediaFile{VariantID: variant.ID, Path: path, Bytes: 1, DownloadedAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+		return variant.ID
+	}
+	real := seed("real", tone(t, dir, "real.opus", 1))
+	broken := filepath.Join(dir, "broken.opus")
+	if err := os.WriteFile(broken, []byte("not audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	notAudio := seed("broken", broken)
+
+	m.SweepNow(ctx)
+
+	file, err := db.MediaFile(ctx, real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !file.LoudnessKnown || file.LoudnessLUFS > 0 || file.LoudnessLUFS < -70 {
+		t.Errorf("the stored song = %+v, want a measured loudness", file)
+	}
+	file, err = db.MediaFile(ctx, notAudio)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file.LoudnessKnown {
+		t.Errorf("a file ffmpeg cannot read was given a loudness: %v", file.LoudnessLUFS)
+	}
 }

@@ -93,7 +93,7 @@ func (c *Client) Album(ctx context.Context, albumID string) (*Album, error) {
 func (c *Client) SyncAlbum(ctx context.Context, albumID string, opts SyncOptions) (*SyncResult, error) {
 	var out SyncResult
 	body := syncBody(opts)
-	if err := c.do(ctx, http.MethodPost, "/api/v1/albums/"+albumID+"/sync", body, &out); err != nil {
+	if err := c.do(long(ctx), http.MethodPost, "/api/v1/albums/"+albumID+"/sync", body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -125,7 +125,7 @@ func (c *Client) Artist(ctx context.Context, artistID string) (*Artist, error) {
 func (c *Client) SyncArtist(ctx context.Context, artistID string, opts SyncOptions) (*SyncResult, error) {
 	var out SyncResult
 	body := syncBody(opts)
-	if err := c.do(ctx, http.MethodPost, "/api/v1/artists/"+artistID+"/sync", body, &out); err != nil {
+	if err := c.do(long(ctx), http.MethodPost, "/api/v1/artists/"+artistID+"/sync", body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

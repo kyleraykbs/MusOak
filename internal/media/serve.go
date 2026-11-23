@@ -61,6 +61,13 @@ func (m *Manager) ServeFile(w http.ResponseWriter, r *http.Request, variantID uu
 	// minute late. Private, because a library is not a public cache's business.
 	w.Header().Set("Cache-Control", "private, max-age=604800")
 	w.Header().Set("X-Content-SHA256", file.SHA256)
+	// How loud the file is, for a player that levels one song against the next.
+	// A header rather than a field in some response: every way a client gets
+	// the file - a download into memory, a kept copy in a browser's cache, a
+	// stream - carries it with the bytes.
+	if file.LoudnessKnown {
+		w.Header().Set("X-Loudness-LUFS", strconv.FormatFloat(file.LoudnessLUFS, 'f', 1, 64))
+	}
 
 	// Serving a file is what keeps it in the cache; only refresh the record
 	// occasionally so a serve does not turn into a write per request. The row

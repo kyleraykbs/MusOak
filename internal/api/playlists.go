@@ -1,15 +1,14 @@
 package api
 
 import (
-	"encoding/base64"
 	"errors"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
 
-	"github.com/kyleraykbs/MusOak/internal/artwork"
 	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
@@ -139,23 +138,8 @@ func (s *Server) handlePlaylistArtwork(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	contentType := artwork.ContentType(req.ContentType)
-	extension, known := artwork.ExtensionFor(contentType)
-	if !known {
-		writeError(w, http.StatusBadRequest, "an image is needed: png, jpeg, webp, gif or avif")
-		return
-	}
-	data, err := base64.StdEncoding.DecodeString(req.Data)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "data must be base64")
-		return
-	}
-	if len(data) == 0 {
-		writeError(w, http.StatusBadRequest, "the image is empty")
-		return
-	}
-	if len(data) > maxArtworkBytes {
-		writeError(w, http.StatusRequestEntityTooLarge, "the image is too large")
+	data, extension, ok := decodeImage(w, req.ContentType, req.Data, "data")
+	if !ok {
 		return
 	}
 
@@ -572,17 +556,12 @@ func (s *Server) handlePlaylistReorder(w http.ResponseWriter, r *http.Request) {
 	s.writePlaylistDetail(w, r, playlist, user.ID)
 }
 
-// parsePathInt reads a non-negative integer path value.
+// parsePathInt reads a non-negative integer path value: digits only, and no
+// larger than fits.
 func parsePathInt(raw string) (int, error) {
-	value := 0
-	if raw == "" {
-		return 0, errors.New("empty")
+	value, err := strconv.ParseUint(raw, 10, 31)
+	if err != nil {
+		return 0, err
 	}
-	for _, r := range raw {
-		if r < '0' || r > '9' {
-			return 0, errors.New("not a number")
-		}
-		value = value*10 + int(r-'0')
-	}
-	return value, nil
+	return int(value), nil
 }

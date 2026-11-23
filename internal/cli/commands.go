@@ -1,12 +1,14 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"github.com/kyleraykbs/MusOak/internal/api"
 	"github.com/kyleraykbs/MusOak/pkg/client"
+	"io"
 	"math"
 	"math/rand/v2"
 	"os"
@@ -15,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/term"
 )
 
 func parseIndex(raw string) (int, error) {
@@ -362,13 +366,24 @@ func (a *App) cmdLogin(ctx context.Context, args []string) error {
 	return nil
 }
 
+// readPassword asks for a password without showing it. On a terminal the
+// keystrokes are not echoed; piped in, the whole line is the password - spaces
+// and all, which a word-at-a-time scan refused.
 func readPassword(out interface{ Write([]byte) (int, error) }) (string, error) {
 	fmt.Fprint(out, "password: ")
-	var line string
-	if _, err := fmt.Fscanln(os.Stdin, &line); err != nil {
+	if fd := int(os.Stdin.Fd()); term.IsTerminal(fd) {
+		raw, err := term.ReadPassword(fd)
+		fmt.Fprintln(out)
+		if err != nil {
+			return "", fmt.Errorf("musoak: read password: %w", err)
+		}
+		return string(raw), nil
+	}
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && (err != io.EOF || line == "") {
 		return "", fmt.Errorf("musoak: read password: %w", err)
 	}
-	return line, nil
+	return strings.TrimRight(line, "\r\n"), nil
 }
 
 func (a *App) cmdLogout(ctx context.Context, args []string) error {
@@ -705,5 +720,18 @@ func pausedSuffix(paused bool) string {
 }
 
 func (a *App) socketPath() string {
-	return filepath.Join(os.TempDir(), fmt.Sprintf("musoak-mpv-%d.sock", os.Getpid()))
+	// A shared temporary directory is the wrong place for it: anybody on the
+	// machine can make that name first and be handed every file mpv is asked to
+	// play. The runtime directory is this user's alone; the cache directory is
+	// the next best thing where there is none.
+	name := fmt.Sprintf("musoak-mpv-%d.sock", os.Getpid())
+	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
+		return filepath.Join(dir, name)
+	}
+	if dir, err := os.UserCacheDir(); err == nil {
+		if err := os.MkdirAll(filepath.Join(dir, "musoak"), 0o700); err == nil {
+			return filepath.Join(dir, "musoak", name)
+		}
+	}
+	return filepath.Join(os.TempDir(), name)
 }

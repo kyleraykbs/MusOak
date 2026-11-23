@@ -2,8 +2,14 @@ package media
 
 import (
 	"context"
+	"errors"
 	"os"
 	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/kyleraykbs/MusOak/internal/ffmpeg"
+	"github.com/kyleraykbs/MusOak/internal/store"
 )
 
 // How long a stored song stays, by what has been done with it.
@@ -87,6 +93,8 @@ func (m *Manager) sweepRetention(ctx context.Context) int64 {
 			m.logger.Warn("media: could not forget an expired file", "variant", row.VariantID, "error", err)
 			continue
 		}
+		// The remembered "ready" goes with the file (see sweepQuota).
+		m.setStatus(Status{VariantID: row.VariantID, State: StateNone})
 		freed += row.Bytes
 		m.logger.Info("media: removed a song whose retention ran out",
 			"variant", row.VariantID, "bytes", row.Bytes, "listeners", row.Listeners,
@@ -95,10 +103,65 @@ func (m *Manager) sweepRetention(ctx context.Context) int64 {
 	return freed
 }
 
+// loudnessBatch is how many files one hourly pass measures that were stored
+// before loudness was, or that could not be measured when they arrived: about
+// a second of ffmpeg each, so a library catches up over a few days without the
+// pass ever taking long.
+const loudnessBatch = 120
+
+// measure records a file's loudness on it before it is stored. Best effort: a
+// file that cannot be measured is stored all the same, unlevelled, and the
+// hourly pass tries it again.
+func (m *Manager) measure(ctx context.Context, file *store.MediaFile) {
+	lufs, err := ffmpeg.Loudness(ctx, file.Path)
+	if err != nil {
+		m.logger.Debug("media: could not measure loudness", "variant", file.VariantID, "error", err)
+		return
+	}
+	file.LoudnessLUFS, file.LoudnessKnown = lufs, true
+}
+
+// MeasureStored measures a file that was stored some other way than a download
+// or an import - an upload writes its own row - so it is levelled from its
+// first play rather than from the next hourly pass.
+func (m *Manager) MeasureStored(ctx context.Context, variantID uuid.UUID, path string) {
+	lufs, err := ffmpeg.Loudness(ctx, path)
+	if err != nil {
+		m.logger.Debug("media: could not measure loudness", "variant", variantID, "error", err)
+		return
+	}
+	if err := m.db.SetMediaLoudness(ctx, variantID, lufs); err != nil {
+		m.logger.Warn("media: record loudness", "variant", variantID, "error", err)
+	}
+}
+
+// measureBacklog measures up to limit stored files that have no loudness yet,
+// the most recently played first.
+func (m *Manager) measureBacklog(ctx context.Context, limit int) {
+	files, err := m.db.MediaWithoutLoudness(ctx, limit)
+	if err != nil {
+		m.logger.Warn("media: loudness backlog", "error", err)
+		return
+	}
+	for _, file := range files {
+		if ctx.Err() != nil {
+			return
+		}
+		lufs, err := ffmpeg.Loudness(ctx, file.Path)
+		if err != nil {
+			continue
+		}
+		if err := m.db.SetMediaLoudness(ctx, file.VariantID, lufs); err != nil && !errors.Is(err, store.ErrNotFound) {
+			m.logger.Warn("media: record loudness", "variant", file.VariantID, "error", err)
+		}
+	}
+}
+
 // SweepNow runs one full sweep - retention, then the quota - and answers how
 // many bytes it freed. It is what the hourly timer calls, and what a test calls
 // instead of waiting an hour.
 func (m *Manager) SweepNow(ctx context.Context) int64 {
+	m.measureBacklog(ctx, loudnessBatch)
 	freed := m.sweepRetention(ctx)
 	if m.quotaBytes <= 0 {
 		return freed

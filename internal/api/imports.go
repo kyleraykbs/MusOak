@@ -71,6 +71,11 @@ func (s *Server) handlePlaylistImportStart(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	if len(strings.TrimSpace(req.Name)) > maxNameBytes {
+		writeError(w, http.StatusBadRequest, "name is too long")
+		return
+	}
+
 	job := &playlistImport{state: "running"}
 	id := s.imports.add(job)
 	go s.runPlaylistImport(job, user.ID, providerName, providerPlaylistID, req.Name)
@@ -80,7 +85,10 @@ func (s *Server) handlePlaylistImportStart(w http.ResponseWriter, r *http.Reques
 // runPlaylistImport does the work the request could not wait for, reporting how
 // far it has got as it goes.
 func (s *Server) runPlaylistImport(job *playlistImport, userID uuid.UUID, providerName, providerPlaylistID, name string) {
-	ctx, cancel := context.WithTimeout(context.Background(), importTimeout)
+	// The server's own lifetime, not the background: an import still running
+	// when the server stops would go on searching providers and writing to a
+	// store that has been closed under it.
+	ctx, cancel := context.WithTimeout(s.ctx, importTimeout)
 	defer cancel()
 
 	result, err := s.library.ImportPlaylist(ctx, userID, providerName, providerPlaylistID, name, func(done, total int) {

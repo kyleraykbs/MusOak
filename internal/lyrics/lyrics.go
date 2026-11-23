@@ -163,16 +163,28 @@ func (s *Service) Resolve(ctx context.Context, trackID, variantID uuid.UUID) (*s
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, s.fetchTimeout)
-	defer cancel()
-	if !s.enter(ctx) {
+	// The wait for a slot and the fetch each get the whole timeout. Sharing one
+	// deadline, a burst of lookups spent it queueing, the fetch that finally
+	// ran timed out against a source that was fine, and the breaker counted it.
+	waitCtx, cancelWait := context.WithTimeout(ctx, s.fetchTimeout)
+	entered := s.enter(waitCtx)
+	cancelWait()
+	if !entered {
 		// No slot within the deadline: the answer is not worth waiting for.
 		return nil, nil
 	}
 	defer s.leave()
 
-	result, err := s.fetcher.Fetch(ctx, query)
+	fetchCtx, cancel := context.WithTimeout(ctx, s.fetchTimeout)
+	defer cancel()
+	result, err := s.fetcher.Fetch(fetchCtx, query)
 	if err != nil {
+		// A caller that went away - the song was skipped, the panel closed - is
+		// not the source failing, and two skips must not take lyrics away from
+		// everybody for the breaker's half minute.
+		if ctx.Err() != nil {
+			return nil, nil
+		}
 		s.failed()
 		s.warn("lyrics fetch failed", "track", trackID, "variant", variantID, "error", err)
 		return nil, nil
@@ -235,9 +247,18 @@ func (s *Service) query(ctx context.Context, trackID, variantID uuid.UUID) (Quer
 		q.Album = albums[0].Title
 	}
 	// Timings belong to the copy they were written for, so a named rendition's
-	// duration beats the track's; a copy whose length is unknown falls back.
+	// duration beats the track's; a copy whose length is unknown falls back. A
+	// rendition that is not this track's is no rendition of it: answered as
+	// unknown, so a made-up id costs neither a lookup nor a row in the cache.
 	if variantID != uuid.Nil {
-		if variant, err := s.store.Variant(ctx, variantID); err == nil && variant.DurationMs > 0 {
+		variant, err := s.store.Variant(ctx, variantID)
+		if err != nil {
+			return Query{}, err
+		}
+		if variant.TrackID != trackID {
+			return Query{}, store.ErrNotFound
+		}
+		if variant.DurationMs > 0 {
 			q.DurationMs = variant.DurationMs
 		}
 	}

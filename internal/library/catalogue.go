@@ -260,6 +260,14 @@ func (s *Service) artistReleases(ctx context.Context, variants []store.ArtistVar
 	return capReleases(newestFirst(albums)), capReleases(newestFirst(singles)), problems
 }
 
+// releaseRetry is how long an album the providers had no release for is left
+// before they are asked again.
+const releaseRetry = time.Hour
+
+// releaseFresh is how long a release read whole is taken as the album's
+// tracklist before it is read again.
+const releaseFresh = 7 * 24 * time.Hour
+
 // releaseComplete reports whether every release of an album has been read and
 // the album holds all of it. A release whose tracklist was never read is not
 // complete however much the album holds: nobody knows what is missing.
@@ -267,6 +275,20 @@ func (s *Service) releaseComplete(ctx context.Context, albumID uuid.UUID) bool {
 	variants, err := s.db.AlbumVariants(ctx, albumID)
 	if err != nil || len(variants) == 0 {
 		return false
+	}
+	// Every release read recently is as complete as it is going to get: what
+	// the provider had is in the album, and asking again on every view finds
+	// the same tracklist. A release can change - a deluxe edition, a track
+	// added - so the answer is trusted for releaseFresh and then read again.
+	fresh := true
+	for _, variant := range variants {
+		if variant.ReadAt.IsZero() || time.Since(variant.ReadAt) > releaseFresh {
+			fresh = false
+			break
+		}
+	}
+	if fresh {
+		return true
 	}
 	want := 0
 	for _, variant := range variants {
@@ -344,11 +366,16 @@ func (s *Service) EnsureAlbumTracks(ctx context.Context, albumID uuid.UUID) {
 		return
 	}
 	if len(variants) == 0 {
+		if missed, ok := s.releaseMisses.Load(albumID); ok && time.Since(missed.(time.Time)) < releaseRetry {
+			return
+		}
 		if _, err := s.attachAlbumRelease(budget, album); err != nil {
+			s.releaseMisses.Store(albumID, time.Now())
 			s.logger.Info("album has no release to read", "album", album.ID, "title", album.Title,
 				"error", err)
 			return
 		}
+		s.releaseMisses.Delete(albumID)
 	}
 	if s.releaseComplete(budget, albumID) {
 		return

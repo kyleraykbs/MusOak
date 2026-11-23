@@ -993,10 +993,19 @@ func (m *Matcher) Resolve(ctx context.Context, trackID uuid.UUID) ([]store.Varia
 	return variants, nil
 }
 
+// bestHit picks the hit most like want and answers with its own score.
+//
+// The provider's order breaks near-ties (rankBonus), but it is not evidence that
+// two recordings are the same: the score handed back is the hit's alone, so the
+// threshold the caller compares it with means what it says. Returned with the
+// bonus folded in, a first result passed at 0.74 against a threshold of 0.80 -
+// enough to attach "Song (Instrumental)" to "Song", and through Resolve to merge
+// two tracks for good.
 func bestHit(want Candidate, hits []provider.Track) (*provider.Track, float64) {
 	var (
 		best      *provider.Track
 		bestScore float64
+		bestRank  float64
 	)
 	for i := range hits {
 		hit := &hits[i]
@@ -1006,9 +1015,9 @@ func bestHit(want Candidate, hits []provider.Track) (*provider.Track, float64) {
 			Album:      hit.Album,
 			DurationMs: hit.DurationMs,
 			ISRC:       hit.ISRC,
-		}) + rankBonus(i)
-		if score > bestScore {
-			best, bestScore = hit, score
+		})
+		if ranked := score + rankBonus(i); best == nil || ranked > bestRank {
+			best, bestScore, bestRank = hit, score, ranked
 		}
 	}
 	return best, bestScore

@@ -303,6 +303,54 @@ func TestMediaEvictionCandidatesFreeTheExcess(t *testing.T) {
 	}
 }
 
+// A song in a playlist or a favourite is kept for ever, quota or not: it is not
+// offered for eviction, and it is not counted against the quota either.
+func TestMediaEvictionLeavesPinnedSongsAlone(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	user := mustUserNamed(t, db, "kyle")
+
+	base := time.UnixMilli(1_000_000)
+	put := func(title string, at time.Time) *Track {
+		tr := mustTrack(t, db, title)
+		v := mustVariant(t, db, tr.ID, "ytmusic", "yt-"+title)
+		if err := db.UpsertMediaFile(ctx, &MediaFile{
+			VariantID: v.ID, Path: "media/" + v.ID.String() + ".opus", SHA256: title,
+			Bytes: 100, DownloadedAt: at, AccessedAt: at,
+		}); err != nil {
+			t.Fatalf("UpsertMediaFile: %v", err)
+		}
+		return tr
+	}
+	// The two oldest are the pinned ones: least recently served, so first in
+	// line for an eviction that does not know better.
+	inPlaylist := put("in-playlist", base)
+	favourite := put("favourite", base.Add(time.Second))
+	put("loose", base.Add(2*time.Second))
+
+	playlist := &Playlist{UserID: user.ID, Name: "kept"}
+	if err := db.CreatePlaylist(ctx, playlist); err != nil {
+		t.Fatalf("CreatePlaylist: %v", err)
+	}
+	if err := db.AppendPlaylistItems(ctx, playlist.ID, []uuid.UUID{inPlaylist.ID}); err != nil {
+		t.Fatalf("AppendPlaylistItems: %v", err)
+	}
+	if err := db.AddFavorite(ctx, user.ID, favourite.ID); err != nil {
+		t.Fatalf("AddFavorite: %v", err)
+	}
+
+	got, err := db.MediaEvictionCandidates(ctx, 1000)
+	if err != nil {
+		t.Fatalf("MediaEvictionCandidates: %v", err)
+	}
+	if len(got) != 1 || got[0].SHA256 != "loose" {
+		t.Fatalf("candidates = %+v, want only the song nobody pinned", got)
+	}
+	if total, err := db.MediaBytes(ctx); err != nil || total != 100 {
+		t.Errorf("MediaBytes = (%d, %v), want the 100 bytes eviction may remove", total, err)
+	}
+}
+
 func TestMediaFileForeignKeyIsEnforced(t *testing.T) {
 	db := newTestDB(t)
 	m := &MediaFile{VariantID: uuid.New(), Path: "/x.opus"}
@@ -543,5 +591,26 @@ func TestPlaylistOrderMigrationIgnoresOrphanedPlaylists(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("playlist_order rows = %d, want no orphaned rows", count)
+	}
+}
+
+// Favouriting a song again without a rating keeps the rating it has.
+func TestAddFavoriteWithoutARatingKeepsTheRating(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	user := mustUserNamed(t, db, "kyle")
+	track := mustTrack(t, db, "Song")
+	if err := db.AddFavorite(ctx, user.ID, track.ID, 40); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddFavorite(ctx, user.ID, track.ID); err != nil {
+		t.Fatal(err)
+	}
+	ratings, err := db.FavoriteRatings(ctx, user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ratings[track.ID] != 40 {
+		t.Errorf("rating = %d, want 40", ratings[track.ID])
 	}
 }

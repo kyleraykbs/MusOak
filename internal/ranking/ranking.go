@@ -83,6 +83,11 @@ type Service struct {
 	enabled   []string
 	aggregate []string
 	dirty     bool
+	// gen counts the changes that make the aggregate stale. A recompute keeps
+	// its answer only when nothing changed while it was reading: one that read
+	// the rankings before a Set landed would otherwise store the old order and
+	// mark it fresh, and the new one would never be seen until the next Set.
+	gen uint64
 }
 
 // New returns a ranking service falling back to defaults when nobody has
@@ -106,6 +111,7 @@ func (s *Service) SetEnabledProviders(names []string) {
 	s.mu.Lock()
 	s.enabled = append([]string(nil), names...)
 	s.dirty = true
+	s.gen++
 	s.mu.Unlock()
 }
 
@@ -167,6 +173,7 @@ func (s *Service) Set(ctx context.Context, userID uuid.UUID, providers []string)
 	}
 	s.mu.Lock()
 	s.dirty = true
+	s.gen++
 	s.mu.Unlock()
 	return nil
 }
@@ -198,6 +205,7 @@ func (s *Service) Aggregate(ctx context.Context) ([]string, error) {
 		return out, nil
 	}
 	enabled := append([]string(nil), s.enabled...)
+	gen := s.gen
 	s.mu.RUnlock()
 
 	all, err := s.db.AllRankings(ctx)
@@ -264,8 +272,10 @@ func (s *Service) Aggregate(ctx context.Context) ([]string, error) {
 	order = withSlots(complete(enabled, order))
 
 	s.mu.Lock()
-	s.aggregate = append([]string(nil), order...)
-	s.dirty = false
+	if s.gen == gen {
+		s.aggregate = append([]string(nil), order...)
+		s.dirty = false
+	}
 	s.mu.Unlock()
 
 	s.logger.Debug("ranking: aggregate recomputed", "order", order, "users", contributing)

@@ -1,5 +1,59 @@
 # Decisions
 
+## 2026-11-20 A play stops only its own listener's last one
+- Decision: `EnsurePrimaryFor(ctx, variant, requester)` keeps, per variant, one
+  fetch and the requesters waiting on it (`playFetch.waiting`). A new play stops
+  only that requester's earlier one, and a fetch is cancelled when nobody is
+  left waiting (`CancelFor`). The API names the requester: the account, else
+  `X-Member-Id`, else the client address (`requesterOf`). Background fetches
+  still pause for any play. `EnsurePrimary` (no requester) keeps the old
+  one-listener behaviour.
+- Why: the gate assumed one listener, so two people starting songs cancelled
+  each other in turn, and somebody letting a shared song go took it from the
+  person beside them.
+- Reversible: yes.
+
+## 2026-11-20 A release read whole is complete for a week
+- Decision: a sync stamps each release it reads (`album_variants.tracks_read_at`,
+  migration 27), and `releaseComplete` is true while every release was read in
+  the last seven days; the count comparison is the fallback. An album with no
+  release found is not searched for again for an hour (`releaseMisses`).
+- Why: a listed count that was never met (unreadable entries, two that are one
+  song) left an album "incomplete" for ever, so every view of it read the
+  provider again.
+- Reversible: yes.
+
+## 2026-11-20 Busy is the driver's code, and transactions begin immediate
+- Decision: the DSN carries `_txlock=immediate`, and `isBusy` reads SQLITE_BUSY/
+  SQLITE_LOCKED from the error's code; the constraint check no longer falls
+  back to matching the message. The short retry loop stays as a backstop.
+- Why: a deferred transaction that reads then writes is refused outright under
+  WAL when another writer commits in between, which the busy timeout cannot
+  wait out; matching driver wording breaks on any rewording.
+- Reversible: yes.
+
+## 2026-11-20 Who may do what, without changing any client
+- Decision: a request without a token whose `X-Member-Id` (or socket `memberId`)
+  is a registered account's id is refused, and a socket naming an account counts
+  as that member only when authenticated as it. `Join` with `supersedes` replaces
+  only a guest member. Room passwords compare in constant time. A password room
+  shows non-members a redacted snapshot (name, count, hasPassword; no members,
+  queues or current song) and its events go only to member sockets
+  (`rooms.OpenTo`). With `requireLogin`, guests keep reading rooms, acting in
+  them and fetching media - plays and cancels reach only their own downloads -
+  but may not create rooms (`isPublic(r)` is method-aware). The search rate budget covers
+  every route that asks providers (`asksProviders`), the login budget covers
+  password changes, and IPv6 clients are keyed by /64. Cover fetches refuse
+  non-http(s) and any non-public address at dial time (`AllowPrivateHosts` is for
+  tests). Server-side import needs an account and a path inside
+  `media.importDirs`, except on the CLI's in-process server (`TrustLocalOwner`).
+- Why: account member ids are published in every snapshot, so anybody could
+  act as a host; password rooms leaked everything but the join; the defaults
+  listen on every interface with open registration. Guests posing as other
+  guests remain possible: that needs a per-member secret and a change in every
+  client (TODO in musoak-web).
+- Reversible: yes.
+
 ## [2026-10-15] Audio is served only from files this server holds
 - Decision: the provider-backed stream is gone — `Provider.Stream`, `Caps.Stream`, `GET /api/v1/tracks/{trackId}/stream`, the streaming branch of the media handler (`X-Musoak-Stream`), the `stream` capability in `/api/v1/providers`, and the client's stream surface. A request for a rendition that is not on disk is refused (`409`, naming the download to start) rather than answered with the provider's own fetch; a rendition on disk is served as before, with Range and `?start=`.
 - Why: a stream from a provider is audio of unknown length that cannot be seeked, it competes with the download for the same upstream, and it makes a listener's play depend on the provider being reachable that second; a download that lands is durable and seekable, which is what the room's join-at-position needs.

@@ -7,6 +7,7 @@
 package artwork
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -14,11 +15,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -110,6 +114,40 @@ type Fetcher struct {
 
 	mu     sync.Mutex
 	failed map[string]time.Time
+
+	// allowPrivate lets covers come from this machine and its network. Off,
+	// always, outside tests: see AllowPrivateHosts.
+	allowPrivate atomic.Bool
+}
+
+// AllowPrivateHosts lets this fetcher read covers from loopback and private
+// addresses, which it otherwise refuses. A cover's address can come from a
+// client (a source attached by hand), and a server that fetches whatever it is
+// handed is a way for anybody with an account to make requests from inside the
+// owner's network. Only tests, whose image servers listen on 127.0.0.1, turn
+// this on.
+func (f *Fetcher) AllowPrivateHosts() { f.allowPrivate.Store(true) }
+
+// refusePrivate is the dialer's last word on an address: it runs after the name
+// is resolved and once for every address tried, redirects included, so neither
+// a DNS name pointing inside nor a redirect to one gets past it.
+func (f *Fetcher) refusePrivate(_, address string, _ syscall.RawConn) error {
+	if f.allowPrivate.Load() {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return err
+	}
+	if zone := strings.IndexByte(host, '%'); zone >= 0 {
+		host = host[:zone]
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
+		return fmt.Errorf("artwork: refusing to fetch a cover from %s, which is not a public address", host)
+	}
+	return nil
 }
 
 // New returns a fetcher caching images under dir.
@@ -117,15 +155,31 @@ func New(dir string, db Store, logger *slog.Logger) *Fetcher {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Fetcher{
+	f := &Fetcher{
 		dir:    dir,
 		db:     db,
-		http:   &http.Client{Timeout: fetchTimeout},
 		logger: logger,
 		wait:   waitForImage,
 		slots:  make(chan struct{}, concurrentFetches),
 		failed: make(map[string]time.Time),
 	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil // a proxy would be dialled instead, and checked instead
+	transport.DialContext = (&net.Dialer{Timeout: 10 * time.Second, Control: f.refusePrivate}).DialContext
+	f.http = &http.Client{
+		Timeout:   fetchTimeout,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+				return fmt.Errorf("artwork: refusing a redirect to %s", req.URL.Scheme)
+			}
+			if len(via) >= 5 {
+				return errors.New("artwork: too many redirects")
+			}
+			return nil
+		},
+	}
+	return f
 }
 
 // Dir is where cached images live.
@@ -226,6 +280,15 @@ func (f *Fetcher) Store(source string, data []byte, extension string) error {
 	for _, ext := range storedExtensions {
 		_ = os.Remove(filepath.Join(f.dir, hex.EncodeToString(sum[:])+ext))
 	}
+	// The smaller copies were cut from the picture this replaces, and they are
+	// named for the source rather than for what it holds: an avatar or a
+	// playlist cover keeps its source for life, so left here they are the old
+	// picture served at every width for ever.
+	if stale, err := filepath.Glob(filepath.Join(f.dir, hex.EncodeToString(sum[:])+"@*.jpg")); err == nil {
+		for _, thumbnail := range stale {
+			_ = os.Remove(thumbnail)
+		}
+	}
 	if err := os.Rename(tmp.Name(), path); err != nil {
 		return err
 	}
@@ -287,6 +350,9 @@ func (f *Fetcher) cached(ctx context.Context, source string) (*Item, error) {
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
+	if err == nil && req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+		err = fmt.Errorf("artwork: %q is not a web address", req.URL.Scheme)
+	}
 	if err != nil {
 		f.rememberFailure(source)
 		return nil, fmt.Errorf("%w: %v", ErrFetch, err)
@@ -306,14 +372,17 @@ func (f *Fetcher) cached(ctx context.Context, source string) (*Item, error) {
 	}
 	f.forgetFailure(source)
 
-	contentType := normalizeContentType(resp.Header.Get("Content-Type"))
-	ext, ok := extensionFor(contentType)
+	// What is kept and served is decided by the bytes, not by what the far end
+	// calls them. A cover's address can be handed in by a client (a source
+	// attached by hand), and an answer that is not a picture - a page, a JSON
+	// document from something on this network - must not be stored and served
+	// back from this server's own origin under whatever type it claimed.
+	body := bufio.NewReader(io.LimitReader(resp.Body, maxImageBytes+1))
+	head, _ := body.Peek(512)
+	contentType, ext, ok := imageType(resp.Header.Get("Content-Type"), head, source)
 	if !ok {
-		// Some CDNs send a generic type; fall back to the URL's extension.
-		ext = extensionFromURL(source)
-		if contentType == "" {
-			contentType = "image/jpeg"
-		}
+		f.rememberFailure(source)
+		return nil, fmt.Errorf("%w: %s did not answer with an image", ErrFetch, source)
 	}
 
 	tmp, err := os.CreateTemp(f.dir, ".artwork-*")
@@ -322,7 +391,7 @@ func (f *Fetcher) cached(ctx context.Context, source string) (*Item, error) {
 		return nil, fmt.Errorf("%w: %v", ErrFetch, err)
 	}
 	tmpPath := tmp.Name()
-	written, err := io.Copy(tmp, io.LimitReader(resp.Body, maxImageBytes+1))
+	written, err := io.Copy(tmp, body)
 	closeErr := tmp.Close()
 	if err != nil || closeErr != nil {
 		_ = os.Remove(tmpPath)
@@ -423,6 +492,31 @@ var contentTypes = map[string]string{
 // A list rather than the map, because the map's order is random and this is an
 // order: "image/jpeg" has two suffixes and the first one wins.
 var storedExtensions = []string{".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".img"}
+
+// imageType decides what a fetched cover is: its type, the suffix it is stored
+// under, and whether it is an image at all.
+//
+// The bytes say so when they can - a CDN's generic "octet-stream" over a JPEG
+// is a JPEG. A format the sniffer does not know (AVIF) reads as unknown binary,
+// and only there is the far end's own word, or the address's suffix, taken.
+// Anything the bytes show to be something else - text, markup - is not a cover.
+func imageType(declared string, head []byte, source string) (contentType, ext string, ok bool) {
+	sniffed := normalizeContentType(http.DetectContentType(head))
+	if ext, ok := extensionFor(sniffed); ok {
+		return sniffed, ext, true
+	}
+	if sniffed != "application/octet-stream" {
+		return "", "", false
+	}
+	declared = normalizeContentType(declared)
+	if ext, ok := extensionFor(declared); ok {
+		return declared, ext, true
+	}
+	if ext := extensionFromURL(source); ext != ".img" {
+		return contentTypes[ext], ext, true
+	}
+	return "", "", false
+}
 
 func extensionFor(contentType string) (string, bool) {
 	for _, ext := range storedExtensions {

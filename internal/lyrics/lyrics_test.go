@@ -163,7 +163,7 @@ func TestResolveFetchesAndCachesOnAMiss(t *testing.T) {
 		Synced: []store.LyricLine{{AtMs: 1_000, Text: "words"}},
 		Plain:  "words\n",
 	}}
-	fs := &fakeStore{track: testTrack(trackID)}
+	fs := &fakeStore{track: testTrack(trackID), variant: &store.Variant{ID: variantID, TrackID: trackID}}
 	svc := New(fs, fetcher, nil)
 
 	got, err := svc.Resolve(context.Background(), trackID, variantID)
@@ -212,7 +212,7 @@ func TestResolveCachesAnEmptyAnswer(t *testing.T) {
 	trackID := uuid.New()
 	variantID := uuid.New()
 	fetcher := &fakeFetcher{result: Result{}}
-	fs := &fakeStore{track: testTrack(trackID)}
+	fs := &fakeStore{track: testTrack(trackID), variant: &store.Variant{ID: variantID, TrackID: trackID}}
 
 	got, err := New(fs, fetcher, nil).Resolve(context.Background(), trackID, variantID)
 	if err != nil {
@@ -241,7 +241,7 @@ func TestResolveCachesAnInstrumentalAsARealAnswer(t *testing.T) {
 	trackID := uuid.New()
 	variantID := uuid.New()
 	fetcher := &fakeFetcher{result: Result{Instrumental: true}}
-	fs := &fakeStore{track: testTrack(trackID), variant: &store.Variant{ID: variantID, DurationMs: 240_000}}
+	fs := &fakeStore{track: testTrack(trackID), variant: &store.Variant{ID: variantID, TrackID: trackID, DurationMs: 240_000}}
 
 	got, err := New(fs, fetcher, nil).Resolve(context.Background(), trackID, variantID)
 	if err != nil {
@@ -542,4 +542,20 @@ func TestResolveBoundsConcurrentLookups(t *testing.T) {
 
 	close(gate.release)
 	wg.Wait()
+}
+
+// A rendition id that is not the track's is not asked about: a made-up id must
+// cost neither a lookup at the source nor a row in the cache.
+func TestResolveRefusesAVariantOfAnotherTrack(t *testing.T) {
+	trackID := uuid.New()
+	variantID := uuid.New()
+	fetcher := &fakeFetcher{result: Result{Plain: "words"}}
+	fs := &fakeStore{track: testTrack(trackID), variant: &store.Variant{ID: variantID, TrackID: uuid.New()}}
+
+	if _, err := New(fs, fetcher, nil).Resolve(context.Background(), trackID, variantID); err == nil {
+		t.Fatal("a variant of another track was accepted")
+	}
+	if len(fetcher.calls) != 0 || len(fs.saves) != 0 {
+		t.Errorf("fetched %d times and saved %d rows, want neither", len(fetcher.calls), len(fs.saves))
+	}
 }

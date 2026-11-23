@@ -93,7 +93,13 @@ func startMpv(ctx context.Context, socketPath string, logger *slog.Logger) (*mpv
 		closed:  make(chan struct{}),
 	}
 
-	if err := waitForSocket(ctx, socketPath); err != nil {
+	// Waited on from the start, so an mpv that dies before it opens its socket
+	// - a bad option, a missing library - is reported as itself at once rather
+	// than as a socket that never appeared, ten seconds later.
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+
+	if err := waitForSocket(ctx, socketPath, exited); err != nil {
 		_ = cmd.Process.Kill()
 		return nil, err
 	}
@@ -106,13 +112,15 @@ func startMpv(ctx context.Context, socketPath string, logger *slog.Logger) (*mpv
 
 	go process.readLoop()
 	go func() {
-		_ = cmd.Wait()
+		<-exited
 		process.shutdown()
 	}()
 	return process, nil
 }
 
-func waitForSocket(ctx context.Context, path string) error {
+// waitForSocket waits for mpv's IPC socket, or for mpv to have exited first.
+// An exit is passed back into exited for whoever waits on it next.
+func waitForSocket(ctx context.Context, path string, exited chan error) error {
 	deadline := time.Now().Add(mpvSocketTimeout)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(path); err == nil {
@@ -121,6 +129,12 @@ func waitForSocket(ctx context.Context, path string) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case err := <-exited:
+			exited <- err
+			if err == nil {
+				return errors.New("musoak: mpv exited before it opened its IPC socket")
+			}
+			return fmt.Errorf("musoak: mpv exited before it opened its IPC socket: %w", err)
 		case <-time.After(20 * time.Millisecond):
 		}
 	}

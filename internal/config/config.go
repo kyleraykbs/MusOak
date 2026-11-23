@@ -102,6 +102,12 @@ type Media struct {
 	// anybody plays them, one at a time in the background. It is what makes a
 	// first play cost nothing, at the price of fetching songs nobody may reach.
 	PrefetchPlaylists bool `json:"prefetchPlaylists"`
+	// ImportDirs are the directories on the server's own disk that a signed-in
+	// user may import music from over the API. Empty means nobody can: the
+	// import reads whatever path it is handed, as the server's user, so which
+	// paths those may be is the owner's to say. The CLI's own in-process server
+	// is not bound by this - there the caller and the server are one person.
+	ImportDirs []string `json:"importDirs"`
 }
 
 // Client configures client-side behaviour (the CLI, or any other API client)

@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"regexp"
@@ -337,6 +338,38 @@ func parseProgressLine(line string) (value time.Duration, end bool, ok bool) {
 		return 0, strings.TrimSpace(raw) == "end", true
 	}
 	return 0, false, false
+}
+
+// Loudness is a file's integrated loudness in LUFS (EBU R128), read from
+// ffmpeg's ebur128 summary. It decodes the whole file once - about a second for
+// a song - and is what a player levels songs from different sources with.
+func Loudness(ctx context.Context, path string) (float64, error) {
+	out, err := runCombined(ctx, ffmpegName, "-hide_banner", "-nostats", "-i", path,
+		"-af", "ebur128=framelog=quiet", "-f", "null", "-")
+	if err != nil {
+		return 0, err
+	}
+	return parseIntegratedLoudness(out)
+}
+
+// parseIntegratedLoudness finds the "I: -12.3 LUFS" line of the summary that
+// follows "Integrated loudness:". Silence reads as -70, the meter's floor.
+func parseIntegratedLoudness(out string) (float64, error) {
+	at := strings.LastIndex(out, "Integrated loudness:")
+	if at < 0 {
+		return 0, errors.New("ffmpeg: no loudness summary in its output")
+	}
+	for _, line := range strings.Split(out[at:], "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 3 && fields[0] == "I:" && fields[2] == "LUFS" {
+			value, err := strconv.ParseFloat(fields[1], 64)
+			if err != nil {
+				return 0, fmt.Errorf("ffmpeg: read loudness %q: %w", fields[1], err)
+			}
+			return value, nil
+		}
+	}
+	return 0, errors.New("ffmpeg: no integrated loudness in its summary")
 }
 
 // runCombined runs a command and returns everything it said, whichever stream

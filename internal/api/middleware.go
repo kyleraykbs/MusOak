@@ -30,7 +30,7 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 			}
 		}
 
-		if s.cfg.RequireLogin && s.currentUser(r) == nil && !isPublic(r.URL.Path) {
+		if s.cfg.RequireLogin && s.currentUser(r) == nil && !isPublic(r) {
 			writeError(w, http.StatusUnauthorized, "login required")
 			return
 		}

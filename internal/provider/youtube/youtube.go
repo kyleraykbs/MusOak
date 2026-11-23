@@ -208,32 +208,7 @@ func (p *Provider) fetch(ctx context.Context, url, dir string, progress provider
 	args := p.ytdlpArgs(extra...)
 	args = append(args, "--newline", "--progress", "-o", filepath.Join(dir, "%(id)s.%(ext)s"), url)
 
-	cmd := exec.CommandContext(ctx, p.ytdlp, args...)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return "", fmt.Errorf("yt-dlp %s: %w", url, err)
-	}
-	// stderr is where a failure is reported, so it is kept whole for the error
-	// below even though progress is read off stdout.
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
-		return "", fmt.Errorf("yt-dlp %s: %w", url, err)
-	}
-
-	reporter := provider.NewYtdlpProgressReporter(progress)
-	scanner := bufio.NewScanner(stdout)
-	for scanner.Scan() {
-		reporter.Line(scanner.Text())
-	}
-	scanErr := scanner.Err()
-	if err := cmd.Wait(); err != nil {
-		return "", fmt.Errorf("yt-dlp %s: %w: %s", url, err, strings.TrimSpace(stderr.String()))
-	}
-	if scanErr != nil {
-		return "", fmt.Errorf("yt-dlp %s: read the progress it printed: %w", url, scanErr)
-	}
-	return firstAudioFile(dir)
+	return provider.YtdlpFetch(ctx, p.ytdlp, "youtube", url, dir, args, progress)
 }
 
 // appendCookies adds the configured cookie flags, if any, so a signed-in
@@ -318,19 +293,5 @@ func (e ytdlpEntry) artworkURL() string {
 // firstAudioFile returns the first real media file yt-dlp wrote, skipping the
 // thumbnails and partial downloads it can leave behind.
 func firstAudioFile(dir string) (string, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return "", fmt.Errorf("youtube download: read output dir: %w", err)
-	}
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		switch strings.ToLower(filepath.Ext(e.Name())) {
-		case "", ".part", ".ytdl", ".webp", ".jpg", ".jpeg", ".png":
-			continue
-		}
-		return filepath.Join(dir, e.Name()), nil
-	}
-	return "", fmt.Errorf("youtube download: yt-dlp wrote no audio file into %s", dir)
+	return provider.FirstAudioFile("youtube", dir)
 }

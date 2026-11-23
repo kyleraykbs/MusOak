@@ -130,9 +130,15 @@ func (d *DB) AddFavorite(ctx context.Context, userID, trackID uuid.UUID, ratings
 	if rating < 0 || rating > 50 {
 		return fmt.Errorf("store: favorite rating must be between 0 and 50")
 	}
+	// No rating given is "keep it a favourite", not "rate it zero": favouriting
+	// a song that is already rated leaves its rating where it was.
+	conflict := `DO UPDATE SET rating = excluded.rating`
+	if len(ratings) == 0 {
+		conflict = `DO NOTHING`
+	}
 	_, err := d.db.ExecContext(ctx, `
 		INSERT INTO favorites (user_id, track_id, created_at, rating) VALUES (?, ?, ?, ?)
-		ON CONFLICT (user_id, track_id) DO UPDATE SET rating = excluded.rating`,
+		ON CONFLICT (user_id, track_id) `+conflict,
 		userID.String(), trackID.String(), time.Now().UnixMilli(), rating)
 	return mapErr(err)
 }

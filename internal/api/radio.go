@@ -64,6 +64,20 @@ func (s *Server) handleRadio(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Saving is a convenience: radio + playlist is the useful pair. It needs an
+	// account, and that is settled before anything is built - a station is a
+	// provider call and a library write per song, and answering all of that
+	// with "sign in" is work done for nobody.
+	save := req.Save == nil || *req.Save
+	var saveFor uuid.UUID
+	if save {
+		user, ok := s.requireUser(w, r)
+		if !ok {
+			return
+		}
+		saveFor = user.ID
+	}
+
 	result, err := s.radio.Generate(r.Context(), seedID, req.Providers, req.Length)
 	switch {
 	case errors.Is(err, radio.ErrNoSeed):
@@ -112,14 +126,8 @@ func (s *Server) handleRadio(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// Saving is a convenience: radio + playlist is the useful pair.
-	save := req.Save == nil || *req.Save
 	if save {
-		user, ok := s.requireUser(w, r)
-		if !ok {
-			return
-		}
-		playlist, err := s.saveRadio(r, user.ID, req.Name, result)
+		playlist, err := s.saveRadio(r, saveFor, req.Name, result)
 		if err != nil {
 			writeStoreError(w, err, "could not save the radio")
 			return
@@ -140,7 +148,7 @@ func (s *Server) saveRadio(r *http.Request, userID uuid.UUID, name string, resul
 		}
 	}
 
-	playlist := &store.Playlist{UserID: userID, Name: name}
+	playlist := &store.Playlist{UserID: userID, Name: name, Public: true}
 	if err := s.store.CreatePlaylist(r.Context(), playlist); err != nil {
 		return nil, err
 	}

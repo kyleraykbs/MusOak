@@ -7,6 +7,7 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -259,7 +260,7 @@ func uniqueEntryName(used map[string]int, name string) string {
 		return name
 	}
 	stem := strings.TrimSuffix(name, ".opus")
-	return stem + " (" + itoa(count+1) + ").opus"
+	return stem + " (" + strconv.Itoa(count+1) + ").opus"
 }
 
 // zipFileName names the archive after the playlist, with an extension a file
@@ -280,14 +281,5 @@ func zipFileName(name string) string {
 	return out + ".zip"
 }
 
-func itoa(value int) string {
-	if value == 0 {
-		return "0"
-	}
-	var digits []byte
-	for value > 0 {
-		digits = append([]byte{byte('0' + value%10)}, digits...)
-		value /= 10
-	}
-	return string(digits)
-}
+// itoa is strconv's, kept under this name for the tests that spell it so.
+func itoa(value int) string { return strconv.Itoa(value) }

@@ -484,3 +484,23 @@ func TestUserUploadsListing(t *testing.T) {
 		t.Errorf("unknown user = %d, want 404", rec.Code)
 	}
 }
+
+// An upload is measured as it arrives, so it is levelled from its first play:
+// its file is served with its loudness.
+func TestAnUploadIsServedWithItsLoudness(t *testing.T) {
+	data, err := os.ReadFile(toneFile(t, t.TempDir(), "tone.opus"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newHTTPTestServer(t, nil)
+	token := c.register("kyle", "hunter2hunter2")
+	upload := createUpload(t, c, token, uploadRequest("Blue Horizon", data, 1))
+
+	rec := c.do(http.MethodGet, "/api/v1/media/"+upload.VariantID, token, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("media = %d", rec.Code)
+	}
+	if rec.Header().Get("X-Loudness-LUFS") == "" {
+		t.Error("an upload was served without its loudness")
+	}
+}

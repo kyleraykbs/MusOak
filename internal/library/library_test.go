@@ -965,3 +965,45 @@ func TestCatalogueReadsTheWholeDiscographyOnce(t *testing.T) {
 		t.Errorf("the provider was asked again: %d then %d", reads, len(ytmusic.artistCalls))
 	}
 }
+
+// A release whose listing promises more songs than its tracklist has is read
+// once: what was read is what the album holds, and the next view of it does not
+// ask the provider again.
+func TestAShortReleaseIsReadOnce(t *testing.T) {
+	ytmusic := &fakeProvider{name: "ytmusic"}
+	f := newFixture(t, ytmusic)
+	ctx := context.Background()
+
+	track, _, err := f.service.matcher.Attach(ctx, "ytmusic", provider.Track{
+		ProviderTrackID: "yt_one", Title: "One", Artists: []string{"Band"}, Album: "Record", DurationMs: 200_000,
+	})
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	albums, err := f.db.TrackAlbums(ctx, track.ID)
+	if err != nil || len(albums) != 1 {
+		t.Fatalf("albums = %v, %v", albums, err)
+	}
+	albumID := albums[0].ID
+
+	tracks := []provider.Track{
+		{ProviderTrackID: "yt_one_album", Title: "One", Artists: []string{"Band"}, Album: "Record", DurationMs: 200_000},
+		{ProviderTrackID: "yt_two", Title: "Two", Artists: []string{"Band"}, Album: "Record", DurationMs: 180_000},
+	}
+	// Listed as six: four of them have nothing behind them to read.
+	record := provider.Album{ProviderAlbumID: "MPREb_record", Title: "Record", Artists: []string{"Band"},
+		TrackCount: 6, Kind: store.ReleaseKindAlbum}
+	ytmusic.albums = []provider.Album{record}
+	ytmusic.details = map[string]*provider.AlbumDetail{"MPREb_record": {Album: record, Tracks: tracks}}
+
+	f.service.EnsureAlbumTracks(ctx, albumID)
+	read := len(ytmusic.albumCalls)
+	if read == 0 {
+		t.Fatal("the release was never read")
+	}
+	f.service.EnsureAlbumTracks(ctx, albumID)
+	f.service.EnsureAlbumTracks(ctx, albumID)
+	if len(ytmusic.albumCalls) != read {
+		t.Errorf("the release was read %d more times on later views", len(ytmusic.albumCalls)-read)
+	}
+}

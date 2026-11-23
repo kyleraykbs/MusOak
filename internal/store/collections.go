@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"strings"
 	"time"
 
@@ -128,6 +129,9 @@ type AlbumVariant struct {
 	// draws.
 	Kind      string
 	CreatedAt time.Time
+	// ReadAt is when this release's own tracklist was last read from its
+	// provider, or zero when it never has been.
+	ReadAt time.Time
 }
 
 // ArtistVariant is one provider's page for a canonical artist.
@@ -174,6 +178,8 @@ type AlbumRepo interface {
 	// SetAlbumVariantTrackCount records how many tracks a provider release
 	// holds, so a client can tell a partial album from a complete one.
 	SetAlbumVariantTrackCount(ctx context.Context, variantID uuid.UUID, count int) error
+	// MarkAlbumVariantRead records that a release's tracklist was just read.
+	MarkAlbumVariantRead(ctx context.Context, variantID uuid.UUID, at time.Time) error
 	AlbumTracks(ctx context.Context, albumID uuid.UUID) ([]Track, error)
 	AlbumsForArtist(ctx context.Context, artistID uuid.UUID) ([]Album, error)
 	// EnsureSinglesAlbum returns the container an artist's single releases are
@@ -256,6 +262,17 @@ func (d *DB) EnsureAlbum(ctx context.Context, title string, artists []string) (u
 		}
 		return attachAlbumArtists(ctx, tx, album.ID, artists)
 	})
+	if errors.Is(err, ErrConflict) {
+		// Another sync made the same album between the read and the insert:
+		// that one is the album, and this call answers with it.
+		var winner string
+		if readErr := d.db.QueryRowContext(ctx,
+			`SELECT id FROM albums WHERE title_key = ? AND artist_key = ?`, titleKey, artistKey).Scan(&winner); readErr == nil {
+			if id, parseErr := parseUUID(winner); parseErr == nil {
+				return id, d.attachAlbumArtists(ctx, id, artists)
+			}
+		}
+	}
 	if err != nil {
 		return uuid.Nil, err
 	}
@@ -398,15 +415,20 @@ func (d *DB) AlbumYearsFor(ctx context.Context, albumIDs []uuid.UUID) (map[uuid.
 
 const albumVariantColumns = `id, album_id, provider, provider_album_id, title, artists_json, year, track_count, kind, created_at`
 
+// albumVariantSelect is what a read of a release returns: its columns and when
+// its tracklist was last read.
+const albumVariantSelect = albumVariantColumns + `, tracks_read_at`
+
 func scanAlbumVariant(row rowScanner) (*AlbumVariant, error) {
 	var (
 		variant     AlbumVariant
 		id, albumID string
 		artistsJSON string
 		created     int64
+		readAt      int64
 	)
 	if err := row.Scan(&id, &albumID, &variant.Provider, &variant.ProviderAlbumID, &variant.Title,
-		&artistsJSON, &variant.Year, &variant.TrackCount, &variant.Kind, &created); err != nil {
+		&artistsJSON, &variant.Year, &variant.TrackCount, &variant.Kind, &created, &readAt); err != nil {
 		return nil, mapErr(err)
 	}
 	var err error
@@ -420,6 +442,9 @@ func scanAlbumVariant(row rowScanner) (*AlbumVariant, error) {
 		return nil, err
 	}
 	variant.CreatedAt = time.UnixMilli(created).UTC()
+	if readAt > 0 {
+		variant.ReadAt = time.UnixMilli(readAt).UTC()
+	}
 	return &variant, nil
 }
 
@@ -506,7 +531,7 @@ func (d *DB) fillAlbumVariant(ctx context.Context, stored, read *AlbumVariant) (
 
 func (d *DB) albumVariantByProviderID(ctx context.Context, provider, providerAlbumID string) (*AlbumVariant, error) {
 	row := d.db.QueryRowContext(ctx,
-		`SELECT `+albumVariantColumns+` FROM album_variants WHERE provider = ? AND provider_album_id = ?`,
+		`SELECT `+albumVariantSelect+` FROM album_variants WHERE provider = ? AND provider_album_id = ?`,
 		provider, providerAlbumID)
 	return scanAlbumVariant(row)
 }
@@ -514,7 +539,7 @@ func (d *DB) albumVariantByProviderID(ctx context.Context, provider, providerAlb
 // AlbumVariants lists a canonical album's provider releases.
 func (d *DB) AlbumVariants(ctx context.Context, id uuid.UUID) ([]AlbumVariant, error) {
 	rows, err := d.db.QueryContext(ctx,
-		`SELECT `+albumVariantColumns+` FROM album_variants WHERE album_id = ? ORDER BY created_at`, id.String())
+		`SELECT `+albumVariantSelect+` FROM album_variants WHERE album_id = ? ORDER BY created_at`, id.String())
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -552,6 +577,14 @@ func (d *DB) SetAlbumVariantTrackCount(ctx context.Context, variantID uuid.UUID,
 	return mapErr(err)
 }
 
+// MarkAlbumVariantRead records when a release's tracklist was read whole from
+// its provider.
+func (d *DB) MarkAlbumVariantRead(ctx context.Context, variantID uuid.UUID, at time.Time) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE album_variants SET tracks_read_at = ? WHERE id = ?`, at.UnixMilli(), variantID.String())
+	return mapErr(err)
+}
+
 // SetAlbumTracks replaces an album's tracklist.
 func (d *DB) SetAlbumTracks(ctx context.Context, albumID uuid.UUID, trackIDs []uuid.UUID) error {
 	return d.withTx(ctx, func(tx *sql.Tx) error {
@@ -580,9 +613,15 @@ func (d *DB) AppendAlbumTracks(ctx context.Context, albumID uuid.UUID, trackIDs 
 		if err != nil {
 			return err
 		}
+		// Two entries of one tracklist can be the same canonical track - a
+		// remaster beside the original, a clean cut beside the explicit one -
+		// and the second is as much "already there" as one from an earlier
+		// call. Inserted twice it breaks the key, and the album gets no
+		// tracklist at all.
 		fresh := make([]uuid.UUID, 0, len(trackIDs))
 		for _, trackID := range trackIDs {
 			if !existing[trackID] {
+				existing[trackID] = true
 				fresh = append(fresh, trackID)
 			}
 		}

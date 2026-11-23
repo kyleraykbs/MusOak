@@ -135,8 +135,8 @@ func (d *DB) CreatePlaylist(ctx context.Context, p *Playlist) error {
 	p.UpdatedAt = p.CreatedAt
 
 	_, err := d.db.ExecContext(ctx,
-		`INSERT INTO playlists (id, user_id, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
-		p.ID.String(), p.UserID.String(), p.Name, p.CreatedAt.UnixMilli(), p.UpdatedAt.UnixMilli())
+		`INSERT INTO playlists (id, user_id, name, public, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		p.ID.String(), p.UserID.String(), p.Name, p.Public, p.CreatedAt.UnixMilli(), p.UpdatedAt.UnixMilli())
 	return mapErr(err)
 }
 
